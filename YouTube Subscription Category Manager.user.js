@@ -56,26 +56,26 @@ function injectStyles() {
         .yt-context-menu-item{padding:8px 16px;color:#fff;cursor:pointer;font-size:13px;transition:background-color 0.2s;user-select:none;}
         .yt-context-menu-item:hover{background-color:#3f3f3f;}
         .yt-context-menu-divider{height:1px;background-color:#3f3f3f;margin:4px 0;}
-        .yt-dialog-overlay{position:fixed;inset:0;background-color:rgba(0,0,0,0.75);z-index:10001;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}
-        .yt-dialog{background-color:#282828;border-radius:12px;padding:24px;min-width:400px;max-width:520px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,0.65);box-sizing:border-box;}
-        .yt-dialog-title{font-size:18px;font-weight:500;color:#fff;margin-bottom:16px;}
-        .yt-dialog-input{width:100%;padding:10px 12px;background-color:#121212;border:1px solid #3f3f3f;border-radius:8px;color:#fff;font-size:14px;box-sizing:border-box;}
-        .yt-dialog-buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}
-        .yt-dialog-btn{padding:8px 16px;border-radius:999px;border:none;cursor:pointer;font-size:14px;font-weight:500;transition:all 0.2s;}
-        .yt-dialog-btn-primary{background-color:#065fd4;color:#fff;}
-        .yt-dialog-btn-secondary{background-color:#3f3f3f;color:#fff;}
-        .yt-category-list{margin-bottom:16px;max-height:320px;overflow-y:auto;}
-        .yt-category-list-item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background-color:#121212;border-radius:8px;margin-bottom:8px;transition:opacity 0.2s,border 0.2s;gap:10px;}
-        .yt-category-list-item[draggable="true"]{cursor:move;}
-        .yt-category-list-item.dragging{opacity:0.5;}
-        .yt-category-list-item.drag-over-bottom{border-bottom:2px solid #065fd4;}
-        .yt-category-list-item.drag-over-top{border-top:2px solid #065fd4;}
-        .yt-category-list-item-name{color:#fff;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-        .yt-category-list-item-actions{display:flex;align-items:center;gap:6px;}
-        .yt-category-list-item-btn{padding:4px 8px;background-color:transparent;border:1px solid #555;color:#aaa;border-radius:999px;cursor:pointer;font-size:12px;transition:all 0.2s;}
-        .yt-category-list-item-btn:hover{background-color:#3f3f3f;color:#fff;}
-        .yt-category-list-item-delete{border-color:#f44336;color:#f44336;}
-        .yt-category-list-item-delete:hover{background-color:#f44336;color:#fff;}
+        .ytscm-dialog-overlay{position:fixed;inset:0;background-color:rgba(0,0,0,0.75);z-index:10001;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}
+        .ytscm-dialog{background-color:#282828;border-radius:12px;padding:24px;min-width:400px;max-width:520px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,0.65);box-sizing:border-box;}
+        .ytscm-dialog-title{font-size:18px;font-weight:500;color:#fff;margin-bottom:16px;}
+        .ytscm-dialog-input{width:100%;padding:10px 12px;background-color:#121212;border:1px solid #3f3f3f;border-radius:8px;color:#fff;font-size:14px;box-sizing:border-box;}
+        .ytscm-dialog-buttons{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}
+        .ytscm-dialog-btn{padding:8px 16px;border-radius:999px;border:none;cursor:pointer;font-size:14px;font-weight:500;transition:all 0.2s;}
+        .ytscm-dialog-btn-primary{background-color:#065fd4;color:#fff;}
+        .ytscm-dialog-btn-secondary{background-color:#3f3f3f;color:#fff;}
+        .ytscm-category-list{margin-bottom:16px;max-height:320px;overflow-y:auto;}
+        .ytscm-category-list-item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;background-color:#121212;border-radius:8px;margin-bottom:8px;transition:opacity 0.2s,border 0.2s;gap:10px;}
+        .ytscm-category-list-item[draggable="true"]{cursor:move;}
+        .ytscm-category-list-item.dragging{opacity:0.5;}
+        .ytscm-category-list-item.drag-over-bottom{border-bottom:2px solid #065fd4;}
+        .ytscm-category-list-item.drag-over-top{border-top:2px solid #065fd4;}
+        .ytscm-category-list-item-name{color:#fff;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .ytscm-category-list-item-actions{display:flex;align-items:center;gap:6px;}
+        .ytscm-category-list-item-btn{padding:4px 8px;background-color:transparent;border:1px solid #555;color:#aaa;border-radius:999px;cursor:pointer;font-size:12px;transition:all 0.2s;}
+        .ytscm-category-list-item-btn:hover{background-color:#3f3f3f;color:#fff;}
+        .ytscm-category-list-item-delete{border-color:#f44336;color:#f44336;}
+        .ytscm-category-list-item-delete:hover{background-color:#f44336;color:#fff;}
     `;
 
     if (typeof GM_addStyle !== 'undefined') {
@@ -421,30 +421,21 @@ function getRenderedSubscriptionEntryCount() {
 }
 
 function getSubscriptionsExpander(section) {
-    const scopes = [
-        section,
-        document
-    ].filter(Boolean);
+    if (!(section instanceof Element)) return null;
 
-    for (const scope of scopes) {
-        const expanderItem = scope.querySelector('ytd-guide-entry-renderer#expander-item');
-        if (expanderItem) return expanderItem;
+    const expanderItem = section.querySelector('ytd-guide-entry-renderer#expander-item');
+    if (expanderItem) return expanderItem;
 
-        const candidates = Array.from(scope.querySelectorAll('#expander-item, button, a, tp-yt-paper-item'));
-        const fallback = candidates.find((element) => {
-            const text = (element.getAttribute('title') || element.getAttribute('aria-label') || element.textContent || '')
-                .replace(/\s+/g, ' ')
-                .trim();
+    const candidates = Array.from(section.querySelectorAll('#expander-item, button, a, tp-yt-paper-item'));
+    return candidates.find((element) => {
+        const text = (element.getAttribute('title') || element.getAttribute('aria-label') || element.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
 
-            if (!text) return false;
-            if (/隐藏|收起|Hide/i.test(text)) return false;
-            return /展开|更多|Show more/i.test(text);
-        }) || null;
-
-        if (fallback) return fallback;
-    }
-
-    return null;
+        if (!text) return false;
+        if (/隐藏|收起|Hide/i.test(text)) return false;
+        return /展开|更多|Show more/i.test(text);
+    }) || null;
 }
 
 async function ensureSubscriptionsExpanded() {
@@ -645,32 +636,32 @@ async function showContextMenu(x, y, channelInfo) {
 }
 
 function showAddCategoryDialog() {
-    if (document.querySelector('.yt-dialog-overlay')) return;
+    if (document.querySelector('.ytscm-dialog-overlay')) return;
 
     const overlay = document.createElement('div');
-    overlay.className = 'yt-dialog-overlay';
+    overlay.className = 'ytscm-dialog-overlay';
 
     const dialog = document.createElement('div');
-    dialog.className = 'yt-dialog';
+    dialog.className = 'ytscm-dialog';
 
     const title = document.createElement('div');
-    title.className = 'yt-dialog-title';
+    title.className = 'ytscm-dialog-title';
     title.textContent = '添加新分类';
 
     const input = document.createElement('input');
     input.type = 'text';
-    input.className = 'yt-dialog-input';
+    input.className = 'ytscm-dialog-input';
     input.placeholder = '输入分类名称';
 
     const buttons = document.createElement('div');
-    buttons.className = 'yt-dialog-buttons';
+    buttons.className = 'ytscm-dialog-buttons';
 
     const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'yt-dialog-btn yt-dialog-btn-secondary';
+    cancelBtn.className = 'ytscm-dialog-btn ytscm-dialog-btn-secondary';
     cancelBtn.textContent = '取消';
 
     const addBtn = document.createElement('button');
-    addBtn.className = 'yt-dialog-btn yt-dialog-btn-primary';
+    addBtn.className = 'ytscm-dialog-btn ytscm-dialog-btn-primary';
     addBtn.textContent = '添加';
 
     const closeDialog = () => overlay.remove();
@@ -712,33 +703,33 @@ function showAddCategoryDialog() {
 }
 
 async function showManageCategoriesDialog() {
-    if (document.querySelector('.yt-dialog-overlay')) return;
+    if (document.querySelector('.ytscm-dialog-overlay')) return;
 
     let categories = await getCategoriesList();
 
     const overlay = document.createElement('div');
-    overlay.className = 'yt-dialog-overlay';
+    overlay.className = 'ytscm-dialog-overlay';
 
     const dialog = document.createElement('div');
-    dialog.className = 'yt-dialog';
+    dialog.className = 'ytscm-dialog';
 
     const title = document.createElement('div');
-    title.className = 'yt-dialog-title';
+    title.className = 'ytscm-dialog-title';
     title.textContent = '管理分类（拖拽排序）';
 
     const listEl = document.createElement('div');
-    listEl.className = 'yt-category-list';
+    listEl.className = 'ytscm-category-list';
 
     const inputEl = document.createElement('input');
     inputEl.type = 'text';
-    inputEl.className = 'yt-dialog-input';
+    inputEl.className = 'ytscm-dialog-input';
     inputEl.placeholder = '添加新分类...（回车确认）';
 
     const buttons = document.createElement('div');
-    buttons.className = 'yt-dialog-buttons';
+    buttons.className = 'ytscm-dialog-buttons';
 
     const closeBtn = document.createElement('button');
-    closeBtn.className = 'yt-dialog-btn yt-dialog-btn-primary';
+    closeBtn.className = 'ytscm-dialog-btn ytscm-dialog-btn-primary';
     closeBtn.textContent = '关闭';
 
     buttons.appendChild(closeBtn);
@@ -755,25 +746,25 @@ async function showManageCategoriesDialog() {
 
         categories.forEach((category, index) => {
             const item = document.createElement('div');
-            item.className = 'yt-category-list-item';
+            item.className = 'ytscm-category-list-item';
             item.dataset.categoryName = category;
             item.dataset.index = String(index);
             item.draggable = true;
 
             const name = document.createElement('span');
-            name.className = 'yt-category-list-item-name';
+            name.className = 'ytscm-category-list-item-name';
             name.textContent = category;
 
             const actions = document.createElement('div');
-            actions.className = 'yt-category-list-item-actions';
+            actions.className = 'ytscm-category-list-item-actions';
 
             const renameBtn = document.createElement('button');
-            renameBtn.className = 'yt-category-list-item-btn';
+            renameBtn.className = 'ytscm-category-list-item-btn';
             renameBtn.textContent = '重命名';
             renameBtn.dataset.action = 'rename';
 
             const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'yt-category-list-item-btn yt-category-list-item-delete';
+            deleteBtn.className = 'ytscm-category-list-item-btn ytscm-category-list-item-delete';
             deleteBtn.textContent = '删除';
             deleteBtn.dataset.action = 'delete';
 
@@ -792,7 +783,7 @@ async function showManageCategoriesDialog() {
     };
 
     listEl.addEventListener('dragstart', (event) => {
-        const target = event.target.closest('.yt-category-list-item');
+        const target = event.target.closest('.ytscm-category-list-item');
         if (!target) return;
 
         draggedItem = target;
@@ -801,7 +792,7 @@ async function showManageCategoriesDialog() {
     });
 
     listEl.addEventListener('dragend', () => {
-        listEl.querySelectorAll('.yt-category-list-item').forEach((item) => {
+        listEl.querySelectorAll('.ytscm-category-list-item').forEach((item) => {
             item.classList.remove('dragging', 'drag-over-top', 'drag-over-bottom');
         });
         draggedItem = null;
@@ -809,13 +800,13 @@ async function showManageCategoriesDialog() {
 
     listEl.addEventListener('dragover', (event) => {
         event.preventDefault();
-        const target = event.target.closest('.yt-category-list-item');
+        const target = event.target.closest('.ytscm-category-list-item');
         if (!target || target === draggedItem) return;
 
         const rect = target.getBoundingClientRect();
         const before = event.clientY < rect.top + rect.height / 2;
 
-        listEl.querySelectorAll('.yt-category-list-item').forEach((item) => {
+        listEl.querySelectorAll('.ytscm-category-list-item').forEach((item) => {
             item.classList.remove('drag-over-top', 'drag-over-bottom');
         });
 
@@ -824,7 +815,7 @@ async function showManageCategoriesDialog() {
 
     listEl.addEventListener('drop', async (event) => {
         event.preventDefault();
-        const target = event.target.closest('.yt-category-list-item');
+        const target = event.target.closest('.ytscm-category-list-item');
         if (!draggedItem || !target || target === draggedItem) return;
 
         const fromIndex = Number(draggedItem.dataset.index);
@@ -843,10 +834,10 @@ async function showManageCategoriesDialog() {
     });
 
     listEl.addEventListener('click', async (event) => {
-        const button = event.target.closest('.yt-category-list-item-btn');
+        const button = event.target.closest('.ytscm-category-list-item-btn');
         if (!button) return;
 
-        const item = button.closest('.yt-category-list-item');
+        const item = button.closest('.ytscm-category-list-item');
         if (!item) return;
 
         const oldName = item.dataset.categoryName;
