@@ -29,6 +29,7 @@ These notes capture the working pattern used for testing Tampermonkey userscript
 ### Browser Testing On Protected Sites
 
 - For sites that block F12 or DevTools, use Chrome MCP page reads and JavaScript evaluation instead of opening DevTools.
+- When adding or changing page UI, first reuse or mirror the target page's existing styles: nearby classes, spacing, button sizes, borders, colors, hover/disabled states, and placement patterns. Add only the minimum custom CSS needed for the userscript-specific controls.
 - If normal DOM clicks do not trigger site behavior, inspect page-owned framework state from the page context. On BOSS Zhipin, job cards expose Vue instances through `card.__vue__` in the page world.
 - Prefer the site's own framework methods over untrusted synthetic events. For BOSS Zhipin, activating a job card worked reliably through Vue methods such as `clickJobCardAction(jobData)`, `clickJobCard(jobData)`, or `loadJobDetail(jobData)`.
 - Tampermonkey runs in an isolated userscript world. Page-owned objects such as Vue `__vue__` may not be directly usable from the userscript. Add `@grant unsafeWindow` when page-world access is needed.
