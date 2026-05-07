@@ -19,9 +19,11 @@ These notes capture the working pattern used for testing Tampermonkey userscript
   ```
 
 - Use `localhost` in Chrome MCP navigation. In this environment, `127.0.0.1` may be rewritten into an invalid browser URL pattern by the MCP navigation layer.
+- If the Codex sandbox prevents the browser or Tampermonkey from reaching the local server, start the HTTP server outside the sandbox through the approval flow. Keep it read-only, bound to `127.0.0.1`, and scoped to the project directory.
 - Tampermonkey extension pages such as `chrome-extension://.../ask.html` cannot be read, clicked, or screenshotted by Chrome MCP because content-script injection is blocked on another extension's page.
-- For Tampermonkey's install/update confirmation page, use an OS-level screenshot and a narrowly targeted coordinate click when MCP cannot access the page. Reconfirm button coordinates from a fresh screenshot before clicking if the browser window may have moved.
+- For Tampermonkey's install/update confirmation page, prefer Windows UI Automation or another OS-level UI automation approach to find and click the visible Install/Update button. If that is not available, use an OS-level screenshot and a narrowly targeted coordinate click. Reconfirm button coordinates from a fresh screenshot before clicking if the browser window may have moved.
 - Do not edit Tampermonkey's extension storage files, LevelDB, IndexedDB, or browser profile state while the browser is running. Treat that as high-risk browser application state.
+- Directly patching Tampermonkey LevelDB/IndexedDB is usually the wrong automation path: Edge may already have the profile open, the storage format is not a normal script file, and forced writes risk corrupting extension data. A temporary localhost `.user.js` install flow plus OS-level confirmation is safer and easier to audit.
 - Stop the temporary HTTP server and remove screenshots/logs after installation testing.
 
 ### Browser Testing On Protected Sites
