@@ -2,8 +2,8 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.6
-// @description  在 BOSS 直聘职位列表详情区添加忽略职位按钮，并支持按发布者活跃时间排序当前已加载职位。
+// @version      0.1.11
+// @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
 // @match        https://www.zhipin.com/web/geek/jobs*
@@ -19,8 +19,10 @@
     'use strict';
 
     const APP_ID = 'bzjt';
+    const SCRIPT_VERSION = '0.1.11';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
+    const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
     const PAGE_SORT_EVENT = `${APP_ID}:sort-job-list`;
     const PAGE_SORT_RESULT_EVENT = `${APP_ID}:sort-job-list-result`;
     const SCAN_DELAY_MS = 650;
@@ -35,6 +37,9 @@
         scanning: false,
         scanToken: 0,
         showIgnored: false,
+        settingsOpen: false,
+        hiddenFilters: { keywords: [], minSalaryMaxK: 0 },
+        lastSortedCount: 0,
         lastStatusText: ''
     };
 
@@ -56,7 +61,7 @@
         if (/昨天/.test(value)) return 24 * 60;
         if (/前天/.test(value)) return 2 * 24 * 60;
 
-        const match = value.match(/(\d+)\s*(分钟|小时|天|周|个月|月|年)/);
+        const match = value.match(/(\d+)\s*(分钟|小时|天|日|周|个月|月|年)/);
         if (!match) return UNKNOWN_ACTIVE_RANK;
 
         const amount = Number(match[1]);
@@ -65,7 +70,7 @@
         const unit = match[2];
         if (unit === '分钟') return amount;
         if (unit === '小时') return amount * 60;
-        if (unit === '天') return amount * 24 * 60;
+        if (unit === '天' || unit === '日') return amount * 24 * 60;
         if (unit === '周') return amount * 7 * 24 * 60;
         if (unit === '个月' || unit === '月') return amount * 30 * 24 * 60;
         if (unit === '年') return amount * 365 * 24 * 60;
@@ -92,6 +97,72 @@
     function getJobDataId(jobData) {
         if (!jobData || typeof jobData !== 'object') return '';
         return normalizeSpace(jobData.encryptJobId || jobData.jobId || jobData.id || '');
+    }
+
+    function normalizeBossSalaryDigits(text) {
+        return String(text || '').replace(/[\uE031-\uE03A]/g, (char) => {
+            const digit = char.charCodeAt(0) - 0xE031;
+            return digit >= 0 && digit <= 9 ? String(digit) : char;
+        });
+    }
+
+    function parseBossSalaryMaxK(text) {
+        const value = normalizeSpace(normalizeBossSalaryDigits(text));
+        if (!value) return 0;
+
+        const salaries = [];
+        for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*[kKＫｋ]/g)) {
+            salaries.push(Number(match[1]));
+        }
+        for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*千/g)) {
+            salaries.push(Number(match[1]));
+        }
+        for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*万/g)) {
+            salaries.push(Number(match[1]) * 10);
+        }
+
+        const finite = salaries.filter(Number.isFinite);
+        return finite.length ? Math.max(...finite) : 0;
+    }
+
+    function normalizeHiddenFilterKeywords(keywords) {
+        const values = Array.isArray(keywords)
+            ? keywords
+            : String(keywords || '').split(/\r?\n/);
+        const seen = new Set();
+        return values
+            .map((value) => normalizeSpace(value).toLowerCase())
+            .filter((value) => {
+                if (!value || seen.has(value)) return false;
+                seen.add(value);
+                return true;
+            });
+    }
+
+    function normalizeHiddenFilterSettings(settings = {}) {
+        const minSalaryMaxK = Number(settings.minSalaryMaxK);
+        return {
+            keywords: normalizeHiddenFilterKeywords(settings.keywords),
+            minSalaryMaxK: Number.isFinite(minSalaryMaxK) && minSalaryMaxK > 0
+                ? Math.round(minSalaryMaxK / 5) * 5
+                : 0
+        };
+    }
+
+    function jobMatchesHiddenFilters(record, settings) {
+        const filters = normalizeHiddenFilterSettings(settings);
+        const searchableText = normalizeSpace([
+            record && record.title,
+            record && record.keywordText
+        ].filter(Boolean).join(' ')).toLowerCase();
+        if (searchableText && filters.keywords.some((keyword) => searchableText.includes(keyword))) return true;
+
+        if (filters.minSalaryMaxK > 0) {
+            const salaryMaxK = parseBossSalaryMaxK(record && record.salaryText);
+            if (salaryMaxK > 0 && salaryMaxK < filters.minSalaryMaxK) return true;
+        }
+
+        return false;
     }
 
     function findNextVisibleJobIndex(records, currentIndex) {
@@ -198,6 +269,14 @@
         safeSetValue(ACTIVE_TIME_CACHE_STORAGE_KEY, serializeRecordMap(state.activeTimeCache));
     }
 
+    function loadHiddenFilterSettings() {
+        state.hiddenFilters = normalizeHiddenFilterSettings(safeGetValue(HIDDEN_FILTER_SETTINGS_STORAGE_KEY, {}));
+    }
+
+    function saveHiddenFilterSettings() {
+        safeSetValue(HIDDEN_FILTER_SETTINGS_STORAGE_KEY, state.hiddenFilters);
+    }
+
     function addStyle(css) {
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
@@ -216,6 +295,7 @@
 
         addStyle(`
             .${APP_ID}-toolbar {
+                position: relative;
                 display: inline-flex;
                 align-items: center;
                 gap: 8px;
@@ -248,6 +328,16 @@
                 color: #00a57f;
                 border-color: #00bebd;
             }
+            .${APP_ID}-ignore-btn {
+                border-color: #ffccc7;
+                background: #fff1f0;
+                color: #cf1322;
+            }
+            .${APP_ID}-ignore-btn:hover {
+                border-color: #ff4d4f;
+                background: #fff5f5;
+                color: #a8071a;
+            }
             .${APP_ID}-toolbar button:disabled,
             .${APP_ID}-ignore-btn:disabled {
                 cursor: not-allowed;
@@ -275,6 +365,64 @@
             }
             .${APP_ID}-ignored-job {
                 display: none !important;
+            }
+            .${APP_ID}-filtered-job {
+                display: none !important;
+            }
+            .${APP_ID}-settings-panel {
+                position: absolute;
+                top: 46px;
+                right: 0;
+                z-index: 2147483646;
+                width: 286px;
+                padding: 12px;
+                border: 1px solid #d8dde6;
+                border-radius: 6px;
+                background: #fff;
+                color: #1f2d3d;
+                box-shadow: 0 10px 28px rgba(20, 29, 40, 0.16);
+                box-sizing: border-box;
+            }
+            .${APP_ID}-settings-panel[hidden] {
+                display: none;
+            }
+            .${APP_ID}-settings-field {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin: 0 0 12px;
+                color: #4e5969;
+                font-size: 13px;
+            }
+            .${APP_ID}-settings-field textarea {
+                width: 100%;
+                min-height: 96px;
+                resize: vertical;
+                border: 1px solid #d8dde6;
+                border-radius: 4px;
+                padding: 8px;
+                color: #1f2d3d;
+                font-size: 13px;
+                line-height: 1.45;
+                box-sizing: border-box;
+            }
+            .${APP_ID}-settings-range-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+            }
+            .${APP_ID}-settings-range-value {
+                color: #00a57f;
+                font-weight: 600;
+                white-space: nowrap;
+            }
+            .${APP_ID}-settings-field input[type="range"] {
+                width: 100%;
+                accent-color: #00bebd;
+            }
+            .${APP_ID}-settings-clear {
+                width: 100%;
             }
             .${APP_ID}-active-badge {
                 display: inline-flex;
@@ -499,6 +647,55 @@
         return normalizeSpace(card?.querySelector('.boss-name')?.textContent || '');
     }
 
+    function getCardSalaryText(card) {
+        return normalizeSpace(card?.querySelector('.salary, .job-salary, [class*="salary"]')?.textContent || '');
+    }
+
+    function getTextFromElements(elements) {
+        return normalizeSpace(Array.from(elements || [])
+            .map((element) => normalizeSpace(element.textContent))
+            .filter(Boolean)
+            .join(' '));
+    }
+
+    function getCardKeywordText(card) {
+        if (!card) return '';
+
+        const containers = card.querySelectorAll([
+            '.tag-list',
+            '.job-tag-list',
+            '.job-card-tag-list',
+            '.job-card-tags',
+            '.job-tags',
+            '[class*="tag-list"]',
+            '[class*="job-tags"]'
+        ].join(','));
+        const containerText = getTextFromElements(containers);
+        if (containerText) return containerText;
+
+        return getTextFromElements(card.querySelectorAll([
+            '.job-info .tag',
+            '.job-info .label',
+            '.job-info li',
+            '.job-card-body .tag',
+            '.job-card-body .label',
+            '.job-card-body li'
+        ].join(',')));
+    }
+
+    function getDetailKeywordText() {
+        return getTextFromElements(document.querySelectorAll([
+            '.job-keyword-list',
+            '.job-tags',
+            '.job-labels',
+            '.job-detail-tags',
+            '.job-detail-section .tag-list',
+            '.job-detail-section [class*="tag-list"]',
+            '.job-detail-container [class*="keyword"]',
+            '.job-detail-container [class*="tag-list"]'
+        ].join(',')));
+    }
+
     function getActiveJobCard() {
         const activeCard = document.querySelector('.job-card-wrap.active');
         if (activeCard && getJobIdFromCard(activeCard)) return activeCard;
@@ -526,6 +723,8 @@
             id,
             title: getCardTitle(card),
             company: getCardCompany(card),
+            salaryText: getCardSalaryText(card),
+            keywordText: getCardKeywordText(card) || getDetailKeywordText(),
             href: getJobHrefFromCard(card),
             card
         };
@@ -574,7 +773,22 @@
             toolbar.innerHTML = `
                 <button type="button" class="${APP_ID}-sort-btn">按活跃排序</button>
                 <button type="button" class="${APP_ID}-show-all-btn">显示已忽略</button>
+                <button type="button" class="${APP_ID}-settings-btn" aria-expanded="false">设置</button>
                 <span class="${APP_ID}-status"></span>
+                <div class="${APP_ID}-settings-panel" hidden>
+                    <label class="${APP_ID}-settings-field">
+                        <span>职位关键词</span>
+                        <textarea class="${APP_ID}-keyword-input" placeholder="每行一个关键词"></textarea>
+                    </label>
+                    <label class="${APP_ID}-settings-field">
+                        <span class="${APP_ID}-settings-range-row">
+                            <span>最高薪资门槛</span>
+                            <span class="${APP_ID}-settings-range-value"></span>
+                        </span>
+                        <input class="${APP_ID}-salary-range" type="range" min="0" max="100" step="5">
+                    </label>
+                    <button type="button" class="${APP_ID}-settings-clear">清空设置</button>
+                </div>
             `;
 
             toolbar.querySelector(`.${APP_ID}-sort-btn`).addEventListener('click', () => {
@@ -583,13 +797,38 @@
             toolbar.querySelector(`.${APP_ID}-show-all-btn`).addEventListener('click', () => {
                 toggleIgnoredVisibility();
             });
+            toolbar.querySelector(`.${APP_ID}-settings-btn`).addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                state.settingsOpen = !state.settingsOpen;
+                updateSettingsPanel();
+            });
+
+            const panel = toolbar.querySelector(`.${APP_ID}-settings-panel`);
+            panel.addEventListener('click', (event) => event.stopPropagation());
+            panel.querySelector(`.${APP_ID}-keyword-input`).addEventListener('input', () => {
+                commitSettingsFromPanel(panel);
+            });
+            panel.querySelector(`.${APP_ID}-salary-range`).addEventListener('input', () => {
+                commitSettingsFromPanel(panel);
+            });
+            panel.querySelector(`.${APP_ID}-settings-clear`).addEventListener('click', () => {
+                state.hiddenFilters = { keywords: [], minSalaryMaxK: 0 };
+                saveHiddenFilterSettings();
+                updateSettingsPanel();
+                applyIgnoredJobs();
+                void ensureActiveJobIsVisible();
+            });
         }
+        toolbar.dataset.version = SCRIPT_VERSION;
 
         const next = anchor.nextSibling;
         if (toolbar.parentElement !== host || toolbar.previousSibling !== anchor) {
             host.insertBefore(toolbar, next);
         }
+        updateSortButtonLabel();
         updateIgnoredToggleButton();
+        updateSettingsPanel();
         updateToolbarStatus(state.lastStatusText);
     }
 
@@ -598,22 +837,73 @@
         const status = document.querySelector(`.${APP_ID}-status`);
         if (!status) return;
 
-        const ignoredCount = state.ignoredJobs.size;
-        const cacheCount = state.activeTimeCache.size;
-        status.textContent = state.lastStatusText || `已忽略 ${ignoredCount} 个，已读取 ${cacheCount} 个活跃时间`;
+        status.textContent = state.lastStatusText;
+    }
+
+    function formatButtonCount(value, showZero = false) {
+        return showZero || value ? ` (${value})` : '';
+    }
+
+    function updateSortButtonLabel() {
+        const button = document.querySelector(`.${APP_ID}-sort-btn`);
+        if (!button || button.disabled) return;
+        button.textContent = `按活跃排序${formatButtonCount(state.lastSortedCount)}`;
     }
 
     function updateIgnoredToggleButton() {
         const button = document.querySelector(`.${APP_ID}-show-all-btn`);
         if (!button) return;
-        button.textContent = state.showIgnored ? '隐藏已忽略' : '显示已忽略';
+        const label = state.showIgnored ? '隐藏已忽略' : '显示已忽略';
+        button.textContent = `${label}${formatButtonCount(state.ignoredJobs.size, true)}`;
+    }
+
+    function updateSettingsPanel() {
+        const button = document.querySelector(`.${APP_ID}-settings-btn`);
+        const panel = document.querySelector(`.${APP_ID}-settings-panel`);
+        if (!button || !panel) return;
+
+        button.setAttribute('aria-expanded', String(state.settingsOpen));
+        panel.hidden = !state.settingsOpen;
+
+        const keywordsInput = panel.querySelector(`.${APP_ID}-keyword-input`);
+        const salaryRange = panel.querySelector(`.${APP_ID}-salary-range`);
+        const salaryValue = panel.querySelector(`.${APP_ID}-settings-range-value`);
+
+        if (keywordsInput && document.activeElement !== keywordsInput) {
+            keywordsInput.value = state.hiddenFilters.keywords.join('\n');
+        }
+        if (salaryRange && document.activeElement !== salaryRange) {
+            salaryRange.value = String(state.hiddenFilters.minSalaryMaxK);
+        }
+        if (salaryValue) {
+            salaryValue.textContent = state.hiddenFilters.minSalaryMaxK > 0
+                ? `${state.hiddenFilters.minSalaryMaxK}K 以下隐藏`
+                : '不限';
+        }
+    }
+
+    function commitSettingsFromPanel(panel) {
+        const keywordsInput = panel.querySelector(`.${APP_ID}-keyword-input`);
+        const salaryRange = panel.querySelector(`.${APP_ID}-salary-range`);
+        state.hiddenFilters = normalizeHiddenFilterSettings({
+            keywords: keywordsInput ? keywordsInput.value : '',
+            minSalaryMaxK: salaryRange ? salaryRange.value : 0
+        });
+        saveHiddenFilterSettings();
+        updateSettingsPanel();
+        applyIgnoredJobs();
+        void ensureActiveJobIsVisible();
     }
 
     function setSortButtonBusy(busy, label = '') {
         const button = document.querySelector(`.${APP_ID}-sort-btn`);
         if (!button) return;
         button.disabled = Boolean(busy);
-        button.textContent = label || (busy ? '排序中' : '按活跃排序');
+        if (busy) {
+            button.textContent = label ? `按活跃排序 (${label})` : '排序中';
+        } else {
+            updateSortButtonLabel();
+        }
     }
 
     function renderCardActiveBadge(card, activeTimeText) {
@@ -634,12 +924,31 @@
         badge.textContent = text;
     }
 
+    function isCardHiddenByFilters(card) {
+        return jobMatchesHiddenFilters({
+            title: getCardTitle(card),
+            keywordText: getCardKeywordText(card),
+            salaryText: getCardSalaryText(card)
+        }, state.hiddenFilters);
+    }
+
+    function isCardHiddenByIgnored(card, extraIgnoredId = '') {
+        const id = getJobIdFromCard(card);
+        return Boolean(id && ((extraIgnoredId && id === extraIgnoredId) || (!state.showIgnored && state.ignoredJobs.has(id))));
+    }
+
+    function isCardVisibleByRules(card, extraIgnoredId = '') {
+        const id = getJobIdFromCard(card);
+        return Boolean(id && !isCardHiddenByIgnored(card, extraIgnoredId) && !isCardHiddenByFilters(card));
+    }
+
     function applyIgnoredJobs() {
         for (const card of getJobCards()) {
-            const id = getJobIdFromCard(card);
-            card.classList.toggle(`${APP_ID}-ignored-job`, Boolean(id && state.ignoredJobs.has(id) && !state.showIgnored));
+            card.classList.toggle(`${APP_ID}-ignored-job`, isCardHiddenByIgnored(card));
+            card.classList.toggle(`${APP_ID}-filtered-job`, isCardHiddenByFilters(card));
         }
         updateIgnoredToggleButton();
+        updateSettingsPanel();
         updateToolbarStatus(state.lastStatusText);
     }
 
@@ -715,10 +1024,9 @@
 
         const nextIndex = findNextVisibleJobIndex(
             allCards.map((card) => {
-                const id = getJobIdFromCard(card);
                 return {
-                    id,
-                    ignored: Boolean(id && (id === ignoredId || state.ignoredJobs.has(id)))
+                    id: getJobIdFromCard(card),
+                    ignored: !isCardVisibleByRules(card, ignoredId)
                 };
             }),
             fromIndex
@@ -727,18 +1035,15 @@
     }
 
     function getFirstNonIgnoredJobCard() {
-        return getJobCards().find((card) => {
-            const id = getJobIdFromCard(card);
-            return Boolean(id && !state.ignoredJobs.has(id));
-        }) || null;
+        return getJobCards().find((card) => isCardVisibleByRules(card)) || null;
     }
 
     async function ensureActiveJobIsVisible() {
-        if (state.showIgnored) return;
-
         const current = getCurrentJobCard();
-        const currentId = current ? getJobIdFromCard(current) : '';
-        if (!currentId || !state.ignoredJobs.has(currentId)) return;
+        if (!current) return;
+
+        const currentId = getJobIdFromCard(current);
+        if (isCardVisibleByRules(current)) return;
 
         const nextCard = getNextVisibleJobAfterIgnore(current, currentId) || getFirstNonIgnoredJobCard();
         if (nextCard) await activateJobCard(nextCard);
@@ -790,6 +1095,8 @@
             card,
             jobData,
             title: getCardTitle(card),
+            keywordText: getCardKeywordText(card),
+            salaryText: getCardSalaryText(card),
             originalIndex,
             activeTimeText: cached?.text || getActiveTimeTextFromJobData(jobData),
             activeRank: cached?.rank
@@ -850,7 +1157,7 @@
             if (!record.id || state.activeTimeCache.has(record.id)) continue;
 
             setSortButtonBusy(true, `${index + 1}/${records.length}`);
-            updateToolbarStatus(`读取活跃时间 ${index + 1}/${records.length}`);
+            updateToolbarStatus('读取活跃时间');
             await activateJobCard(record.card);
             const detailReady = await waitForDetailForCard(record);
             await sleep(SCAN_DELAY_MS);
@@ -960,7 +1267,7 @@
         const records = getJobCards()
             .filter((card) => {
                 const id = getJobIdFromCard(card);
-                return Boolean(id && !state.ignoredJobs.has(id));
+                return Boolean(id && !state.ignoredJobs.has(id) && !isCardHiddenByFilters(card));
             })
             .map(makeJobRecord);
 
@@ -991,9 +1298,10 @@
             }
 
             const sorted = await sortRecordsOnPage(records);
+            state.lastSortedCount = sorted.length;
             await sleep(250);
             refreshUi();
-            updateToolbarStatus(`已按活跃时间排序 ${sorted.length} 个职位`);
+            updateToolbarStatus('');
             if (sorted[0]) await activateJobCard(findJobCardById(sorted[0].id) || sorted[0].card);
         } finally {
             if (token === state.scanToken) {
@@ -1050,6 +1358,7 @@
     function init() {
         loadIgnoredJobs();
         loadActiveTimeCache();
+        loadHiddenFilterSettings();
         installStyles();
         registerMenus();
         refreshUi();

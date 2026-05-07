@@ -1,17 +1,26 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
     compareJobRecordsByActiveTime,
     extractJobIdFromHref,
     findNextVisibleJobIndex,
     getActiveTimeTextFromJobData,
     getJobDataId,
+    jobMatchesHiddenFilters,
     normalizeStoredRecordMap,
+    parseBossSalaryMaxK,
     parseBossActiveTimeRank,
     reorderJobDataListBySortedRecords,
     serializeRecordMap,
     sortJobRecordsByActiveTime
 } = require('./boss-zhipin-job-tools-core.cjs');
+
+test('userscript metadata is bumped for keyword filter delivery', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /\/\/ @version\s+0\.1\.11\b/);
+});
 
 test('extracts BOSS Zhipin job ID from detail links', () => {
     assert.equal(
@@ -32,6 +41,7 @@ test('ranks boss active time with smaller values first', () => {
     assert.equal(parseBossActiveTimeRank('2小时前活跃'), 120);
     assert.equal(parseBossActiveTimeRank('昨天活跃'), 1440);
     assert.equal(parseBossActiveTimeRank('3天前活跃'), 4320);
+    assert.equal(parseBossActiveTimeRank('3日内活跃'), 4320);
     assert.equal(parseBossActiveTimeRank('2周前活跃'), 20160);
     assert.equal(parseBossActiveTimeRank('1个月前活跃'), 43200);
     assert.equal(parseBossActiveTimeRank('未知'), Number.MAX_SAFE_INTEGER);
@@ -42,6 +52,50 @@ test('uses loaded job data online flag as an active-time hint', () => {
     assert.equal(getActiveTimeTextFromJobData({ bossOnline: false }), '');
     assert.equal(getActiveTimeTextFromJobData(null), '');
     assert.equal(getJobDataId({ encryptJobId: ' job-a ' }), 'job-a');
+});
+
+test('parses BOSS salary text maximum value in K units', () => {
+    assert.equal(parseBossSalaryMaxK('2-29K'), 29);
+    assert.equal(parseBossSalaryMaxK('29-30k·13薪'), 30);
+    assert.equal(parseBossSalaryMaxK('\uE033\uE031-\uE035\uE031K·\uE032\uE037薪'), 40);
+    assert.equal(parseBossSalaryMaxK('15K以上'), 15);
+    assert.equal(parseBossSalaryMaxK('300-500元/天'), 0);
+    assert.equal(parseBossSalaryMaxK('面议'), 0);
+});
+
+test('matches hidden filters by title keyword and salary maximum threshold', () => {
+    assert.equal(jobMatchesHiddenFilters({
+        title: '高级前端开发工程师',
+        salaryText: '25-29K'
+    }, {
+        keywords: ['后端', '产品'],
+        minSalaryMaxK: 30
+    }), true);
+
+    assert.equal(jobMatchesHiddenFilters({
+        title: '后端开发工程师',
+        salaryText: '35-45K'
+    }, {
+        keywords: ['后端'],
+        minSalaryMaxK: 30
+    }), true);
+
+    assert.equal(jobMatchesHiddenFilters({
+        title: '前端开发工程师',
+        salaryText: '29-30K'
+    }, {
+        keywords: ['后端'],
+        minSalaryMaxK: 30
+    }), false);
+
+    assert.equal(jobMatchesHiddenFilters({
+        title: '在研项目-技术美术',
+        keywordText: '3-5年 学历不限 计算机图形学',
+        salaryText: '35-45K'
+    }, {
+        keywords: ['计算机图形学'],
+        minSalaryMaxK: 30
+    }), true);
 });
 
 test('selects the next visible job after ignoring the current one', () => {

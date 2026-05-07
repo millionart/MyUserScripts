@@ -4,6 +4,12 @@
 
 These notes capture the working pattern used for testing Tampermonkey userscripts against sites that block DevTools or synthetic browser behavior.
 
+### MCP Tool Restrictions
+
+- This project should use Chrome MCP for browser automation, browser DOM reads, page evaluation, navigation, screenshots, clicks, and Tampermonkey installation/testing workflows.
+- Do not use Windows MCP, Edge automation, Playwright, generic desktop automation, or any other MCP as a substitute for Chrome MCP browser/site verification.
+- The only allowed fallback is the narrow OS-level Tampermonkey confirmation-page exception below. If Chrome MCP is not available for the browser/site verification itself, stop and report that the required verification cannot be completed. Do not claim Chrome MCP verification was done through another tool.
+
 ### Installing Or Updating Userscripts
 
 - Prefer serving the `.user.js` file from a temporary local HTTP server, then navigate Chrome MCP to the localhost URL:
@@ -20,8 +26,8 @@ These notes capture the working pattern used for testing Tampermonkey userscript
 
 - Use `localhost` in Chrome MCP navigation. In this environment, `127.0.0.1` may be rewritten into an invalid browser URL pattern by the MCP navigation layer.
 - If the Codex sandbox prevents the browser or Tampermonkey from reaching the local server, start the HTTP server outside the sandbox through the approval flow. Keep it read-only, bound to `127.0.0.1`, and scoped to the project directory.
-- Tampermonkey extension pages such as `chrome-extension://.../ask.html` cannot be read, clicked, or screenshotted by Chrome MCP because content-script injection is blocked on another extension's page.
-- For Tampermonkey's install/update confirmation page, prefer Windows UI Automation or another OS-level UI automation approach to find and click the visible Install/Update button. If that is not available, use an OS-level screenshot and a narrowly targeted coordinate click. Reconfirm button coordinates from a fresh screenshot before clicking if the browser window may have moved.
+- Tampermonkey extension pages such as `chrome-extension://.../ask.html` usually block content-script DOM reads, page JavaScript injection, and selector/ref clicks from Chrome MCP because another extension's page is protected.
+- For Tampermonkey's install/update confirmation page, first try Chrome MCP tab-level interaction paths: `chrome_computer` with `action="screenshot"`, `chrome_screenshot` without full-page/selector options, and coordinate clicks. If those cannot access or operate the confirmation page, use OS-level UI automation or an OS-level screenshot with a narrowly targeted coordinate click as the only fallback exception. Reconfirm button coordinates from a fresh screenshot before clicking if the browser window may have moved, and report that this confirmation click used the OS fallback rather than Chrome MCP.
 - Do not edit Tampermonkey's extension storage files, LevelDB, IndexedDB, or browser profile state while the browser is running. Treat that as high-risk browser application state.
 - Directly patching Tampermonkey LevelDB/IndexedDB is usually the wrong automation path: Edge may already have the profile open, the storage format is not a normal script file, and forced writes risk corrupting extension data. A temporary localhost `.user.js` install flow plus OS-level confirmation is safer and easier to audit.
 - Stop the temporary HTTP server and remove screenshots/logs after installation testing.
@@ -44,6 +50,7 @@ These notes capture the working pattern used for testing Tampermonkey userscript
 
 ### Verification Pattern
 
+- For this BOSS Zhipin userscript, do not finish after static tests only. Before declaring the task complete, actually install or update `BOSS Zhipin Job Tools.user.js` through Tampermonkey using Chrome MCP, then refresh the BOSS Zhipin page and verify the requested behavior with Chrome MCP.
 - Extract pure logic into a small CommonJS helper when practical, and cover it with `node --test`.
 - At minimum, test:
   - ID extraction from page URLs.
