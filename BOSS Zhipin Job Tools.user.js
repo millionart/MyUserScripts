@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.11
+// @version      0.1.16
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -19,7 +19,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.11';
+    const SCRIPT_VERSION = '0.1.16';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -298,70 +298,86 @@
                 position: relative;
                 display: inline-flex;
                 align-items: center;
-                gap: 8px;
-                min-height: 40px;
+                gap: 10px;
+                min-height: var(--bzjt-filter-height, 40px);
                 margin: 0;
                 padding: 0;
                 border: 0;
                 border-radius: 0;
                 background: transparent;
-                color: #4e5969;
-                font-size: 13px;
+                color: #414a60;
+                font-size: 14px;
                 box-sizing: border-box;
             }
-            .${APP_ID}-toolbar button,
-            .${APP_ID}-ignore-btn {
-                height: 40px;
-                border: 1px solid #d8dde6;
-                border-radius: 4px;
-                background: #fff;
-                color: #1f2d3d;
-                font-size: 13px;
-                line-height: 38px;
-                padding: 0 12px;
+            .${APP_ID}-toolbar button {
+                appearance: none;
+                height: var(--bzjt-filter-height, 40px);
+                border: var(--bzjt-filter-border, 0);
+                border-radius: var(--bzjt-filter-radius, 6px);
+                background: var(--bzjt-filter-bg, #fff);
+                color: var(--bzjt-filter-color, #414a60);
+                font-family: inherit;
+                font-size: var(--bzjt-filter-font-size, 14px);
+                line-height: var(--bzjt-filter-line-height, 40px);
+                min-width: var(--bzjt-filter-min-width, 68px);
+                padding: var(--bzjt-filter-padding, 0 16px);
+                text-align: center;
                 cursor: pointer;
                 white-space: nowrap;
                 box-sizing: border-box;
             }
-            .${APP_ID}-toolbar button:hover,
-            .${APP_ID}-ignore-btn:hover {
-                color: #00a57f;
-                border-color: #00bebd;
+            .${APP_ID}-toolbar button:hover {
+                color: #00a6a7;
+                background: var(--bzjt-filter-hover-bg, var(--bzjt-filter-bg, #fff));
             }
             .${APP_ID}-ignore-btn {
-                border-color: #ffccc7;
-                background: #fff1f0;
-                color: #cf1322;
+                appearance: none;
+                height: var(--bzjt-detail-button-height, 36px);
+                border: 1px solid #ff5a5f;
+                border-radius: var(--bzjt-detail-button-radius, 8px);
+                background: #ff5a5f;
+                color: #fff;
+                font-family: inherit;
+                font-size: var(--bzjt-detail-button-font-size, 14px);
+                line-height: var(--bzjt-detail-button-line-height, 34px);
+                padding: var(--bzjt-detail-button-padding, 0 16px);
+                margin-left: var(--bzjt-detail-button-gap, 12px);
+                vertical-align: middle;
+                cursor: pointer;
+                white-space: nowrap;
+                box-sizing: border-box;
             }
             .${APP_ID}-ignore-btn:hover {
-                border-color: #ff4d4f;
-                background: #fff5f5;
-                color: #a8071a;
+                border-color: #f04449;
+                background: #f04449;
+                color: #fff;
+            }
+            .${APP_ID}-ignore-btn.${APP_ID}-ignore-btn-active {
+                border-color: #00bebd;
+                background: #f0fffe;
+                color: #00a6a7;
+            }
+            .${APP_ID}-ignore-btn.${APP_ID}-ignore-btn-active:hover {
+                background: #e5fffc;
+                color: #00a6a7;
             }
             .${APP_ID}-toolbar button:disabled,
             .${APP_ID}-ignore-btn:disabled {
                 cursor: not-allowed;
-                color: #9aa3ad;
-                border-color: #e5e8ef;
-                background: #f5f7fa;
+                color: #b8bdc7;
+                border-color: #edf0f5;
+                background: #f8f9fb;
             }
             .${APP_ID}-status {
                 display: inline-flex;
                 align-items: center;
-                height: 40px;
+                height: var(--bzjt-filter-height, 40px);
                 min-width: 0;
                 max-width: 190px;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
-                color: #6b7785;
-            }
-            .${APP_ID}-ignore-btn {
-                height: 30px;
-                line-height: 28px;
-                padding: 0 10px;
-                margin-left: 8px;
-                vertical-align: middle;
+                color: #8d92a1;
             }
             .${APP_ID}-ignored-job {
                 display: none !important;
@@ -391,20 +407,24 @@
                 flex-direction: column;
                 gap: 6px;
                 margin: 0 0 12px;
-                color: #4e5969;
+                color: #414a60;
                 font-size: 13px;
             }
             .${APP_ID}-settings-field textarea {
                 width: 100%;
                 min-height: 96px;
                 resize: vertical;
-                border: 1px solid #d8dde6;
+                border: 1px solid #e3e7ed;
                 border-radius: 4px;
                 padding: 8px;
-                color: #1f2d3d;
+                color: #414a60;
                 font-size: 13px;
                 line-height: 1.45;
                 box-sizing: border-box;
+            }
+            .${APP_ID}-settings-field textarea:focus {
+                border-color: #00bebd;
+                outline: 0;
             }
             .${APP_ID}-settings-range-row {
                 display: flex;
@@ -420,9 +440,6 @@
             .${APP_ID}-settings-field input[type="range"] {
                 width: 100%;
                 accent-color: #00bebd;
-            }
-            .${APP_ID}-settings-clear {
-                width: 100%;
             }
             .${APP_ID}-active-badge {
                 display: inline-flex;
@@ -454,6 +471,20 @@
                 font-size: 13px;
                 line-height: 1.5;
                 box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+            }
+            .${APP_ID}-toast-action {
+                margin-left: 10px;
+                border: 0;
+                border-radius: 4px;
+                background: #fff;
+                color: #00a6a7;
+                font-size: 13px;
+                line-height: 24px;
+                padding: 0 8px;
+                cursor: pointer;
+            }
+            .${APP_ID}-toast-action:hover {
+                color: #008f91;
             }
         `);
     }
@@ -738,6 +769,55 @@
         return document.querySelector('.job-detail-header .job-detail-op, .job-detail-op, .job-detail-header');
     }
 
+    function isVisibleElement(element) {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    }
+
+    function getReadableBorder(style) {
+        return style.borderTopWidth === '0px' || style.borderTopStyle === 'none'
+            ? '0'
+            : style.borderTop;
+    }
+
+    function syncToolbarButtonStyle(toolbar, anchor) {
+        if (!toolbar || !anchor || !isVisibleElement(anchor)) return;
+
+        const style = getComputedStyle(anchor);
+        const rect = anchor.getBoundingClientRect();
+        toolbar.style.setProperty('--bzjt-filter-height', `${Math.round(rect.height)}px`);
+        toolbar.style.setProperty('--bzjt-filter-border', getReadableBorder(style));
+        toolbar.style.setProperty('--bzjt-filter-radius', style.borderRadius);
+        toolbar.style.setProperty('--bzjt-filter-bg', style.backgroundColor);
+        toolbar.style.setProperty('--bzjt-filter-hover-bg', style.backgroundColor);
+        toolbar.style.setProperty('--bzjt-filter-color', style.color);
+        toolbar.style.setProperty('--bzjt-filter-font-size', style.fontSize);
+        toolbar.style.setProperty('--bzjt-filter-line-height', style.lineHeight);
+        toolbar.style.setProperty('--bzjt-filter-padding', `${style.paddingTop} ${style.paddingRight} ${style.paddingBottom} ${style.paddingLeft}`);
+    }
+
+    function findDetailButtonPeer(target) {
+        const peers = Array.from(target.querySelectorAll('a, button'))
+            .filter((element) => !element.classList.contains(`${APP_ID}-ignore-btn`) && isVisibleElement(element));
+        return peers.find((element) => /立即沟通|沟通/.test(normalizeSpace(element.textContent || ''))) || peers[0] || null;
+    }
+
+    function syncIgnoreButtonStyle(button, target) {
+        const peer = findDetailButtonPeer(target);
+        if (!button || !peer) return;
+
+        const style = getComputedStyle(peer);
+        const rect = peer.getBoundingClientRect();
+        button.style.setProperty('--bzjt-detail-button-height', `${Math.round(rect.height)}px`);
+        button.style.setProperty('--bzjt-detail-button-radius', style.borderRadius);
+        button.style.setProperty('--bzjt-detail-button-font-size', style.fontSize);
+        button.style.setProperty('--bzjt-detail-button-line-height', style.lineHeight);
+        button.style.setProperty('--bzjt-detail-button-padding', `${style.paddingTop} ${style.paddingRight} ${style.paddingBottom} ${style.paddingLeft}`);
+        button.style.setProperty('--bzjt-detail-button-gap', style.marginLeft && style.marginLeft !== '0px' ? style.marginLeft : '12px');
+    }
+
     function ensureIgnoreButton() {
         const target = findDetailButtonTarget();
         if (!target) return;
@@ -750,15 +830,17 @@
             button.addEventListener('click', (event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                ignoreCurrentJob();
+                toggleCurrentJobIgnored();
             });
             target.appendChild(button);
         }
 
         const record = getCurrentJobRecord();
         const ignored = Boolean(record && state.ignoredJobs.has(record.id));
-        button.textContent = ignored ? '已忽略' : '忽略该职位';
-        button.disabled = !record || ignored;
+        button.textContent = ignored ? '取消忽略' : '忽略该职位';
+        button.classList.toggle(`${APP_ID}-ignore-btn-active`, ignored);
+        button.disabled = !record;
+        syncIgnoreButtonStyle(button, target);
     }
 
     function mountToolbar() {
@@ -777,7 +859,7 @@
                 <span class="${APP_ID}-status"></span>
                 <div class="${APP_ID}-settings-panel" hidden>
                     <label class="${APP_ID}-settings-field">
-                        <span>职位关键词</span>
+                        <span>职位忽略关键词</span>
                         <textarea class="${APP_ID}-keyword-input" placeholder="每行一个关键词"></textarea>
                     </label>
                     <label class="${APP_ID}-settings-field">
@@ -787,7 +869,6 @@
                         </span>
                         <input class="${APP_ID}-salary-range" type="range" min="0" max="100" step="5">
                     </label>
-                    <button type="button" class="${APP_ID}-settings-clear">清空设置</button>
                 </div>
             `;
 
@@ -812,14 +893,8 @@
             panel.querySelector(`.${APP_ID}-salary-range`).addEventListener('input', () => {
                 commitSettingsFromPanel(panel);
             });
-            panel.querySelector(`.${APP_ID}-settings-clear`).addEventListener('click', () => {
-                state.hiddenFilters = { keywords: [], minSalaryMaxK: 0 };
-                saveHiddenFilterSettings();
-                updateSettingsPanel();
-                applyIgnoredJobs();
-                void ensureActiveJobIsVisible();
-            });
         }
+        syncToolbarButtonStyle(toolbar, anchor);
         toolbar.dataset.version = SCRIPT_VERSION;
 
         const next = anchor.nextSibling;
@@ -952,13 +1027,30 @@
         updateToolbarStatus(state.lastStatusText);
     }
 
-    function showToast(message) {
+    function showToast(message, action = null) {
         const oldToast = document.querySelector(`.${APP_ID}-toast`);
         oldToast?.remove();
 
         const toast = document.createElement('div');
         toast.className = `${APP_ID}-toast`;
-        toast.textContent = message;
+        const text = document.createElement('span');
+        text.textContent = message;
+        toast.appendChild(text);
+
+        if (action && typeof action.onClick === 'function') {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = `${APP_ID}-toast-action`;
+            button.textContent = action.label || '撤销';
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                toast.remove();
+                action.onClick();
+            });
+            toast.appendChild(button);
+        }
+
         document.body.appendChild(toast);
         window.setTimeout(() => toast.remove(), 2400);
     }
@@ -1049,10 +1141,20 @@
         if (nextCard) await activateJobCard(nextCard);
     }
 
-    async function ignoreCurrentJob() {
+    async function toggleCurrentJobIgnored() {
         const record = getCurrentJobRecord();
         if (!record) {
             showToast('未找到当前职位');
+            return;
+        }
+
+        if (state.ignoredJobs.has(record.id)) {
+            state.ignoredJobs.delete(record.id);
+            saveIgnoredJobs();
+            applyIgnoredJobs();
+            ensureIgnoreButton();
+            updateToolbarStatus('');
+            showToast(`已取消忽略：${record.title || record.id}`);
             return;
         }
 
@@ -1070,7 +1172,19 @@
         applyIgnoredJobs();
         ensureIgnoreButton();
         updateToolbarStatus('');
-        showToast(`已忽略：${record.title || record.id}`);
+        showToast(`已忽略：${record.title || record.id}`, {
+            label: '撤销',
+            onClick: async () => {
+                state.ignoredJobs.delete(record.id);
+                saveIgnoredJobs();
+                applyIgnoredJobs();
+                const restoredCard = findJobCardById(record.id);
+                if (restoredCard && isCardVisibleByRules(restoredCard)) await activateJobCard(restoredCard);
+                ensureIgnoreButton();
+                updateToolbarStatus('');
+                showToast(`已取消忽略：${record.title || record.id}`);
+            }
+        });
     }
 
     function toggleIgnoredVisibility() {
@@ -1337,12 +1451,6 @@
         GM_registerMenuCommand('显示 BOSS 直聘已忽略职位', () => {
             state.showIgnored = true;
             applyIgnoredJobs();
-        });
-        GM_registerMenuCommand('清空 BOSS 直聘活跃时间缓存', () => {
-            state.activeTimeCache.clear();
-            saveActiveTimeCache();
-            document.querySelectorAll(`.${APP_ID}-active-badge`).forEach((badge) => badge.remove());
-            updateToolbarStatus('已清空活跃时间缓存');
         });
     }
 

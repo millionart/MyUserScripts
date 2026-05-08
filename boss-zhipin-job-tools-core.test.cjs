@@ -17,9 +17,14 @@ const {
     sortJobRecordsByActiveTime
 } = require('./boss-zhipin-job-tools-core.cjs');
 
-test('userscript metadata is bumped for keyword filter delivery', () => {
+test('userscript metadata is bumped for readable toolbar button width delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.11\b/);
+    assert.match(script, /\/\/ @version\s+0\.1\.16\b/);
+});
+
+test('toolbar script buttons keep a readable minimum width', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /\.\$\{APP_ID\}-toolbar button \{[\s\S]*min-width:\s*var\(--bzjt-filter-min-width,\s*68px\);/);
 });
 
 test('extracts BOSS Zhipin job ID from detail links', () => {
