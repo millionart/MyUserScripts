@@ -425,6 +425,26 @@ test('stores crawled queue while preserving imported completed items', () => {
   assert.equal(updated.characterId, 'char-1');
 });
 
+test('merges multiple crawl passes by stable key and sorts deterministically', () => {
+  const helpers = loadHelpers();
+  const merged = helpers.mergeQueuePasses([
+    [
+      { key: 'standalone/b', packName: 'Standalone', motionName: 'Bravo', downloadName: 'Standalone__Bravo' },
+      { key: 'packs/p/a', packId: 'p', packName: 'Pack', motionName: 'Alpha', downloadName: 'Pack__Alpha' },
+    ],
+    [
+      { key: 'standalone/b', packName: 'Standalone', motionName: 'Bravo', downloadName: 'Standalone__Bravo' },
+      { key: 'standalone/a', packName: 'Standalone', motionName: 'Alpha', downloadName: 'Standalone__Alpha' },
+    ],
+  ]);
+
+  assert.deepEqual(plain(merged.map((entry) => entry.key)), [
+    'packs/p/a',
+    'standalone/a',
+    'standalone/b',
+  ]);
+});
+
 test('summarizes crawled queue pack and standalone counts', () => {
   const helpers = loadHelpers();
   const summary = helpers.summarizeQueue([

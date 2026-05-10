@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mixamo Download All With Resume
 // @namespace    local.codex.mixamo
-// @version      0.1.3
+// @version      0.1.5
 // @description  Download all Mixamo motions and motion packs with the currently selected uploaded character.
 // @match        https://www.mixamo.com/*
 // @connect      *
@@ -15,10 +15,11 @@
   'use strict';
 
   const STATE_KEY = 'codex.mixamoDownloadAll.v1';
-  const SCRIPT_VERSION = '0.1.3';
+  const SCRIPT_VERSION = '0.1.5';
   const MAX_RETRIES = 4;
   const MONITOR_DELAY_MS = 2500;
   const PAGE_LIMIT = 96;
+  const CRAWL_PASSES = 10;
   const DEFAULT_CONCURRENCY = 2;
   const MIN_CONCURRENCY = 1;
   const MAX_CONCURRENCY = 8;
@@ -496,6 +497,27 @@
     return nextState;
   }
 
+  function getQueueSortKey(entry) {
+    return [
+      sanitizeName(entry.packName || '').toLowerCase(),
+      sanitizeName(entry.motionName || '').toLowerCase(),
+      entry.key || '',
+    ].join('\u0000');
+  }
+
+  function mergeQueuePasses(queuePasses) {
+    const entriesByKey = new Map();
+    for (const queue of queuePasses || []) {
+      for (const entry of queue || []) {
+        if (!entry || !entry.key || entriesByKey.has(entry.key)) {
+          continue;
+        }
+        entriesByKey.set(entry.key, entry);
+      }
+    }
+    return Array.from(entriesByKey.values()).sort((left, right) => getQueueSortKey(left).localeCompare(getQueueSortKey(right)));
+  }
+
   function summarizeQueue(queue) {
     const packIds = new Set();
     let packAnimations = 0;
@@ -737,12 +759,12 @@
     return motions.map((motion) => createPackEntry(product, motion));
   }
 
-  async function buildQueue(characterId) {
+  async function buildQueuePass(characterId, pass, totalPasses) {
     const queue = [];
     let page = 1;
     let totalPages = 1;
     do {
-      setStatus(`Fetching product page ${page}/${totalPages}`);
+      setStatus(`Crawl pass ${pass}/${totalPasses}: fetching product page ${page}/${totalPages}`);
       const json = await getAnimationList(page);
       totalPages = Number(json.pagination && json.pagination.num_pages) || totalPages;
       const products = Array.isArray(json.results) ? json.results : [];
@@ -756,6 +778,17 @@
       page += 1;
     } while (page <= totalPages);
     return queue;
+  }
+
+  async function buildQueue(characterId) {
+    const queuePasses = [];
+    for (let pass = 1; pass <= CRAWL_PASSES; pass += 1) {
+      const queue = await buildQueuePass(characterId, pass, CRAWL_PASSES);
+      queuePasses.push(queue);
+      const uniqueCount = mergeQueuePasses(queuePasses).length;
+      setStatus(`Crawl pass ${pass}/${CRAWL_PASSES} found ${queue.length}; unique ${uniqueCount}.`);
+    }
+    return mergeQueuePasses(queuePasses);
   }
 
   function getSavedCharacterId() {
@@ -1076,6 +1109,7 @@
     importDownloadedFilesIntoState,
     planImportDoneFlow,
     formatDownloadButtonLabel,
+    mergeQueuePasses,
     getDownloadConcurrency,
     runConcurrentQueue,
     applyCrawledQueueToState,
