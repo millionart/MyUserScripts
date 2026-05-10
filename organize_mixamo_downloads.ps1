@@ -1,6 +1,6 @@
 param(
-    [Parameter(Mandatory = $false)]
-    [string]$Source = "$env:USERPROFILE\Downloads",
+    [Parameter(Mandatory = $true)]
+    [string]$Source,
 
     [Parameter(Mandatory = $false)]
     [string]$Destination = ".\mixamo_downloads"

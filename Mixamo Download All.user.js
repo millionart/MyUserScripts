@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mixamo Download All With Resume
 // @namespace    local.codex.mixamo
-// @version      0.1.0
+// @version      0.1.3
 // @description  Download all Mixamo motions and motion packs with the currently selected uploaded character.
 // @match        https://www.mixamo.com/*
 // @connect      *
@@ -15,6 +15,7 @@
   'use strict';
 
   const STATE_KEY = 'codex.mixamoDownloadAll.v1';
+  const SCRIPT_VERSION = '0.1.3';
   const MAX_RETRIES = 4;
   const MONITOR_DELAY_MS = 2500;
   const PAGE_LIMIT = 96;
@@ -42,6 +43,14 @@
     return sanitizeName(product.description || product.name || product.label || product.id);
   }
 
+  function motionName(product) {
+    return sanitizeName(product.name || product.label || product.description || product.id || product.product_id || product.motion_id);
+  }
+
+  function packName(product) {
+    return sanitizeName(product.name || product.label || product.description || product.id);
+  }
+
   function createStandaloneEntry(product) {
     const motionName = productName(product);
     return {
@@ -57,8 +66,8 @@
   }
 
   function createPackEntry(pack, motion) {
-    const packName = productName(pack);
-    const motionName = productName(motion);
+    const packNameValue = packName(pack);
+    const motionNameValue = motionName(motion);
     const productId = motion.product_id || motion.productId || motion.id || motion.motion_id;
     const motionId = motion.motion_id || motion.motionId || motion.id || productId;
     return {
@@ -67,10 +76,17 @@
       productId,
       productType: 'Motion',
       packId: pack.id,
-      packName,
-      motionName,
-      downloadName: `${packName}__${motionName}`,
+      packName: packNameValue,
+      motionName: motionNameValue,
+      downloadName: `${packNameValue}__${motionNameValue}`,
     };
+  }
+
+  function resolveEntryDownloadName(entry, product) {
+    if (entry && entry.packId && product) {
+      return `${entry.packName}__${motionName(product)}`;
+    }
+    return entry.downloadName;
   }
 
   function filterPendingQueue(queue, state) {
@@ -804,9 +820,11 @@
     if (!gmsHash) {
       throw new Error(`Product ${entry.productId} did not include a gms_hash.`);
     }
-    await exportAnimation(characterId, [normalizeGmsHash(gmsHash)], entry.downloadName, state.preferences);
+    const downloadName = resolveEntryDownloadName(entry, product);
+    await exportAnimation(characterId, [normalizeGmsHash(gmsHash)], downloadName, state.preferences);
     const url = await monitorAnimation(characterId);
-    await triggerDownload(url, entry.downloadName);
+    await triggerDownload(url, downloadName);
+    return downloadName;
   }
 
   async function runWithRetries(entry, characterId, state) {
@@ -816,12 +834,12 @@
         throw new Error('Paused');
       }
       try {
-        await downloadEntry(entry, characterId, state);
+        const downloadName = await downloadEntry(entry, characterId, state);
         delete state.failed[entry.key];
         delete state.retryCounts[entry.key];
         state.completed[entry.key] = {
           at: new Date().toISOString(),
-          downloadName: entry.downloadName,
+          downloadName,
           packName: entry.packName,
           motionName: entry.motionName,
         };
@@ -953,6 +971,7 @@
 
     const root = document.createElement('div');
     root.id = 'codex-mixamo-download-all';
+    root.dataset.version = SCRIPT_VERSION;
     root.style.cssText = [
       'position:absolute',
       'z-index:10000',
@@ -980,7 +999,7 @@
     const downloadButton = document.createElement('button');
     downloadButton.type = 'button';
     downloadButton.textContent = formatDownloadButtonLabel(loadState());
-    downloadButton.title = 'Download all Mixamo motions and packs using the current uploaded character.';
+    downloadButton.title = `Download all Mixamo motions and packs using the current uploaded character. Script ${SCRIPT_VERSION}.`;
     downloadButton.style.cssText = 'height:30px;min-width:128px;padding:0 10px;cursor:pointer;background:#1f1f1f;color:#eee;border:1px solid #867b67;line-height:14px;';
 
     const pauseButton = document.createElement('button');
@@ -1044,6 +1063,7 @@
     sanitizeName,
     createStandaloneEntry,
     createPackEntry,
+    resolveEntryDownloadName,
     isPackProduct,
     filterPendingQueue,
     getRetryDelayMs,

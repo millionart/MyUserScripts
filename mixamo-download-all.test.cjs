@@ -93,6 +93,56 @@ test('builds pack entries from Mixamo motion pack product_id fields', () => {
   assert.equal(entry.downloadName, 'Longbow Locomotion Pack__standing run forward');
 });
 
+test('prefers pack motion names over long pack descriptions for download names', () => {
+  const helpers = loadHelpers();
+  const entry = helpers.createPackEntry(
+    { id: 'pack-1', name: 'Longbow Locomotion Pack' },
+    {
+      id: 'motion-1',
+      name: 'standing walk forward',
+      description: 'standing run forward stop, standing idle, standing run back, standing run forward, standing run left, standing run right, standing turn 90 left, standing turn 90 right, standing walk back, standing walk forward',
+    },
+  );
+
+  assert.equal(entry.motionName, 'standing walk forward');
+  assert.equal(entry.downloadName, 'Longbow Locomotion Pack__standing walk forward');
+});
+
+test('prefers pack names over long pack descriptions for download names', () => {
+  const helpers = loadHelpers();
+  const entry = helpers.createPackEntry(
+    {
+      id: 'pack-1',
+      name: 'Longbow Locomotion Pack',
+      description: 'crouch idle, crouch to standing idle, standing block idle, standing block react large, standing disarm underarm, standing disarm over shoulder',
+    },
+    {
+      id: 'motion-1',
+      name: 'standing block idle',
+    },
+  );
+
+  assert.equal(entry.packName, 'Longbow Locomotion Pack');
+  assert.equal(entry.downloadName, 'Longbow Locomotion Pack__standing block idle');
+});
+
+test('repairs stale pack queue download names from product details at download time', () => {
+  const helpers = loadHelpers();
+  const downloadName = helpers.resolveEntryDownloadName(
+    {
+      packId: 'pack-1',
+      packName: 'Longbow Locomotion Pack',
+      downloadName: 'Longbow Locomotion Pack__standing run forward stop, standing idle, standing run back',
+    },
+    {
+      name: 'standing walk forward',
+      description: 'standing run forward stop, standing idle, standing run back',
+    },
+  );
+
+  assert.equal(downloadName, 'Longbow Locomotion Pack__standing walk forward');
+});
+
 test('detects motion packs from Mixamo product metadata variants', () => {
   const helpers = loadHelpers();
 
