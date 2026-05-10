@@ -312,6 +312,42 @@ test('download button label shows remaining over total', () => {
   assert.equal(helpers.formatDownloadButtonLabel({ queue: [], completed: {} }), 'Download All');
 });
 
+test('uses default download concurrency of two and clamps custom values', () => {
+  const helpers = loadHelpers();
+
+  assert.equal(helpers.getDownloadConcurrency({}), 2);
+  assert.equal(helpers.getDownloadConcurrency({ concurrency: 1 }), 1);
+  assert.equal(helpers.getDownloadConcurrency({ concurrency: 3 }), 3);
+  assert.equal(helpers.getDownloadConcurrency({ concurrency: 0 }), 1);
+  assert.equal(helpers.getDownloadConcurrency({ concurrency: 99 }), 8);
+  assert.equal(helpers.getDownloadConcurrency({ concurrency: 'bad' }), 2);
+});
+
+test('runs queue entries with bounded concurrency', async () => {
+  const helpers = loadHelpers();
+  const activeCounts = [];
+  let active = 0;
+  const completed = [];
+
+  await helpers.runConcurrentQueue({
+    entries: [{ key: 'a' }, { key: 'b' }, { key: 'c' }, { key: 'd' }],
+    concurrency: 2,
+    isPaused: () => false,
+    onProgress() {},
+    runEntry: async (entry) => {
+      active += 1;
+      activeCounts.push(active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      completed.push(entry.key);
+      active -= 1;
+    },
+    onEntryError() {},
+  });
+
+  assert.equal(Math.max(...activeCounts), 2);
+  assert.deepEqual(completed.sort(), ['a', 'b', 'c', 'd']);
+});
+
 test('import flow requires a crawled queue before matching files', async () => {
   const helpers = loadHelpers();
   await assert.rejects(

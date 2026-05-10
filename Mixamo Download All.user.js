@@ -7,6 +7,7 @@
 // @connect      *
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @run-at       document-start
 // ==/UserScript==
 
@@ -17,6 +18,9 @@
   const MAX_RETRIES = 4;
   const MONITOR_DELAY_MS = 2500;
   const PAGE_LIMIT = 96;
+  const DEFAULT_CONCURRENCY = 2;
+  const MIN_CONCURRENCY = 1;
+  const MAX_CONCURRENCY = 8;
   const globalObject = typeof window !== 'undefined' ? window : globalThis;
 
   let paused = false;
@@ -191,8 +195,17 @@
       queue: [],
       characterId: '',
       preferences: { format: 'fbx7', skin: 'false', fps: '30', reducekf: '0' },
+      concurrency: DEFAULT_CONCURRENCY,
       updatedAt: null,
     };
+  }
+
+  function getDownloadConcurrency(state) {
+    const value = Number(state && state.concurrency);
+    if (!Number.isFinite(value)) {
+      return DEFAULT_CONCURRENCY;
+    }
+    return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(value)));
   }
 
   function loadState() {
@@ -248,6 +261,27 @@
     if (ui && ui.downloadButton) {
       ui.downloadButton.textContent = formatDownloadButtonLabel(state || loadState());
     }
+  }
+
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== 'function') {
+      return;
+    }
+    GM_registerMenuCommand('Set Mixamo Download Concurrency', () => {
+      const state = loadState();
+      const current = getDownloadConcurrency(state);
+      const input = globalObject.prompt(
+        `How many Mixamo files should download at the same time? (${MIN_CONCURRENCY}-${MAX_CONCURRENCY})`,
+        String(current),
+      );
+      if (input === null) {
+        return;
+      }
+      const next = getDownloadConcurrency({ concurrency: input });
+      state.concurrency = next;
+      saveState(state);
+      setStatus(`Download concurrency set to ${next}.`);
+    });
   }
 
   function authHeaders() {
@@ -812,6 +846,34 @@
     }
   }
 
+  async function runConcurrentQueue(options) {
+    const entries = Array.isArray(options.entries) ? options.entries : [];
+    const concurrency = getDownloadConcurrency({ concurrency: options.concurrency });
+    let nextIndex = 0;
+    let finished = 0;
+    let started = 0;
+
+    async function worker() {
+      while (nextIndex < entries.length && !options.isPaused()) {
+        const entry = entries[nextIndex];
+        nextIndex += 1;
+        started += 1;
+        options.onProgress(entry, started, entries.length);
+        try {
+          await options.runEntry(entry);
+        } catch (error) {
+          options.onEntryError(entry, error);
+        } finally {
+          finished += 1;
+        }
+      }
+    }
+
+    const workerCount = Math.min(concurrency, entries.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return { finished, total: entries.length };
+  }
+
   async function startDownloadAll() {
     if (running) {
       return;
@@ -833,21 +895,23 @@
         saveState(state);
       }
       const pending = filterPendingQueue(state.queue, state);
-      for (let index = 0; index < pending.length; index += 1) {
-        if (paused) {
-          setStatus(`Paused at ${index}/${pending.length}`);
-          break;
-        }
-        const entry = pending[index];
-        setStatus(`Downloading ${index + 1}/${pending.length}: ${entry.downloadName}`);
-        try {
-          await runWithRetries(entry, characterId, state);
-        } catch (error) {
-          if (paused) {
-            break;
+      const concurrency = getDownloadConcurrency(state);
+      const result = await runConcurrentQueue({
+        entries: pending,
+        concurrency,
+        isPaused: () => paused,
+        onProgress: (entry, started, total) => {
+          setStatus(`Downloading ${started}/${total} (${concurrency} parallel): ${entry.downloadName}`);
+        },
+        runEntry: (entry) => runWithRetries(entry, characterId, state),
+        onEntryError: (entry, error) => {
+          if (!paused) {
+            console.warn('[Mixamo Download All] Skipping after retries:', entry, error);
           }
-          console.warn('[Mixamo Download All] Skipping after retries:', entry, error);
-        }
+        },
+      });
+      if (paused) {
+        setStatus(`Paused after ${result.finished}/${pending.length}`);
       }
       if (!paused) {
         setStatus('Finished queue. Check failed records before resetting.');
@@ -992,12 +1056,15 @@
     importDownloadedFilesIntoState,
     planImportDoneFlow,
     formatDownloadButtonLabel,
+    getDownloadConcurrency,
+    runConcurrentQueue,
     applyCrawledQueueToState,
     summarizeQueue,
     formatCrawlStatus,
   };
 
   installCharacterIdCapture();
+  registerMenuCommands();
 
   if (typeof document !== 'undefined' && document.addEventListener) {
     if (document.readyState === 'loading') {
