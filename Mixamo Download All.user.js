@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Mixamo Download All With Resume
 // @namespace    local.codex.mixamo
-// @version      0.1.5
+// @version      0.1.8
 // @description  Download all Mixamo motions and motion packs with the currently selected uploaded character.
 // @match        https://www.mixamo.com/*
 // @connect      *
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @run-at       document-start
 // ==/UserScript==
 
@@ -15,7 +17,8 @@
   'use strict';
 
   const STATE_KEY = 'codex.mixamoDownloadAll.v1';
-  const SCRIPT_VERSION = '0.1.5';
+  const SCRIPT_VERSION = '0.1.8';
+  const CONCURRENCY_KEY = 'codex.mixamoDownloadAll.concurrency';
   const MAX_RETRIES = 4;
   const MONITOR_DELAY_MS = 2500;
   const PAGE_LIMIT = 96;
@@ -225,12 +228,35 @@
     return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(value)));
   }
 
+  function readSavedConcurrency(fallbackState) {
+    if (typeof GM_getValue === 'function') {
+      return getDownloadConcurrency({ concurrency: GM_getValue(CONCURRENCY_KEY, getDownloadConcurrency(fallbackState)) });
+    }
+    return getDownloadConcurrency(fallbackState);
+  }
+
+  function writeSavedConcurrency(value) {
+    const concurrency = getDownloadConcurrency({ concurrency: value });
+    if (typeof GM_setValue === 'function') {
+      GM_setValue(CONCURRENCY_KEY, concurrency);
+    }
+    return concurrency;
+  }
+
+  function applySavedConcurrency(state, savedConcurrency) {
+    const nextState = Object.assign(defaultState(), state || {});
+    nextState.concurrency = getDownloadConcurrency({ concurrency: savedConcurrency });
+    return nextState;
+  }
+
   function loadState() {
     try {
-      return Object.assign(defaultState(), JSON.parse(localStorage.getItem(STATE_KEY) || '{}'));
+      const state = Object.assign(defaultState(), JSON.parse(localStorage.getItem(STATE_KEY) || '{}'));
+      return applySavedConcurrency(state, readSavedConcurrency(state));
     } catch (error) {
       console.warn('[Mixamo Download All] Failed to read state; starting clean.', error);
-      return defaultState();
+      const state = defaultState();
+      return applySavedConcurrency(state, readSavedConcurrency(state));
     }
   }
 
@@ -286,7 +312,7 @@
     }
     GM_registerMenuCommand('Set Mixamo Download Concurrency', () => {
       const state = loadState();
-      const current = getDownloadConcurrency(state);
+      const current = readSavedConcurrency(state);
       const input = globalObject.prompt(
         `How many Mixamo files should download at the same time? (${MIN_CONCURRENCY}-${MAX_CONCURRENCY})`,
         String(current),
@@ -294,10 +320,10 @@
       if (input === null) {
         return;
       }
-      const next = getDownloadConcurrency({ concurrency: input });
+      const next = writeSavedConcurrency(input);
       state.concurrency = next;
       saveState(state);
-      setStatus(`Download concurrency set to ${next}.`);
+      setStatus(running ? `Download concurrency set to ${next}; restart download to apply.` : `Download concurrency set to ${next}.`);
     });
   }
 
@@ -952,7 +978,7 @@
         concurrency,
         isPaused: () => paused,
         onProgress: (entry, started, total) => {
-          setStatus(`Downloading ${started}/${total} (${concurrency} parallel): ${entry.downloadName}`);
+          setStatus(`Downloading ${started}/${total} (x${concurrency}): ${entry.downloadName}`);
         },
         runEntry: (entry) => runWithRetries(entry, characterId, state),
         onEntryError: (entry, error) => {
@@ -1109,6 +1135,7 @@
     importDownloadedFilesIntoState,
     planImportDoneFlow,
     formatDownloadButtonLabel,
+    applySavedConcurrency,
     mergeQueuePasses,
     getDownloadConcurrency,
     runConcurrentQueue,

@@ -373,6 +373,14 @@ test('uses default download concurrency of two and clamps custom values', () => 
   assert.equal(helpers.getDownloadConcurrency({ concurrency: 'bad' }), 2);
 });
 
+test('syncs saved concurrency into state while preserving other fields', () => {
+  const helpers = loadHelpers();
+  const state = helpers.applySavedConcurrency({ queue: [{ key: 'a' }], concurrency: 2 }, 5);
+
+  assert.equal(state.concurrency, 5);
+  assert.deepEqual(plain(state.queue), [{ key: 'a' }]);
+});
+
 test('runs queue entries with bounded concurrency', async () => {
   const helpers = loadHelpers();
   const activeCounts = [];
