@@ -262,6 +262,31 @@ test('builds manifest export with expected missing entries', () => {
   assert.deepEqual(plain(manifest.missingFromCompleted).map((item) => item.key), ['standalone/b']);
 });
 
+test('formats failed record summaries by status and reason', () => {
+  const helpers = loadHelpers();
+
+  assert.equal(helpers.formatFailureSummary({ failed: {} }), '');
+  assert.equal(
+    helpers.formatFailureSummary({
+      failed: {
+        a: { status: 404, reason: 'Mixamo API returned HTTP 404' },
+        b: { reason: 'GM_xmlhttpRequest download returned HTTP 404' },
+        c: { status: 404, reason: 'Mixamo API returned HTTP 404' },
+      },
+    }),
+    'Failed 3: HTTP 404 x3. Mixamo returned 404 for every failed item; those products or generated files are likely unavailable on the site.',
+  );
+  assert.equal(
+    helpers.formatFailureSummary({
+      failed: {
+        a: { status: 429, reason: 'Mixamo API returned HTTP 429' },
+        b: { reason: 'GM_download failed: not_whitelisted' },
+      },
+    }),
+    'Failed 2: HTTP 429 x1; GM_download failed: not_whitelisted x1.',
+  );
+});
+
 test('matches downloaded file names to queue entries for skip import', () => {
   const helpers = loadHelpers();
   const queue = [
@@ -404,6 +429,58 @@ test('runs queue entries with bounded concurrency', async () => {
 
   assert.equal(Math.max(...activeCounts), 2);
   assert.deepEqual(completed.sort(), ['a', 'b', 'c', 'd']);
+});
+
+test('retries exhausted failures on a later run', async () => {
+  const helpers = loadHelpers();
+  const state = {
+    completed: {},
+    failed: { a: { attempts: 4, reason: 'old failure' } },
+    retryCounts: { a: 4 },
+  };
+  const attempts = [];
+
+  await helpers.runWithRetriesForTest(
+    { key: 'a', downloadName: 'Standalone__A' },
+    'character-1',
+    state,
+    async (entry) => {
+      attempts.push(entry.key);
+      return entry.downloadName;
+    },
+  );
+
+  assert.deepEqual(attempts, ['a']);
+  assert.equal(Boolean(state.failed.a), false);
+  assert.equal(Boolean(state.retryCounts.a), false);
+  assert.equal(state.completed.a.downloadName, 'Standalone__A');
+});
+
+test('rate limits lower concurrency and stop the current run', async () => {
+  const helpers = loadHelpers();
+  const state = {
+    completed: {},
+    failed: {},
+    retryCounts: {},
+    concurrency: 6,
+  };
+
+  await assert.rejects(
+    () => helpers.runWithRetriesForTest(
+      { key: 'a', downloadName: 'Standalone__A' },
+      'character-1',
+      state,
+      async () => {
+        const error = new Error('Mixamo API returned HTTP 429');
+        error.status = 429;
+        throw error;
+      },
+    ),
+    /Concurrency reduced to 1/,
+  );
+
+  assert.equal(state.concurrency, 1);
+  assert.equal(state.failed.a.status, 429);
 });
 
 test('import flow requires a crawled queue before matching files', async () => {

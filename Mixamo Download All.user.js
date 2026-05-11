@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mixamo Download All With Resume
 // @namespace    local.codex.mixamo
-// @version      0.1.8
+// @version      0.1.11
 // @description  Download all Mixamo motions and motion packs with the currently selected uploaded character.
 // @match        https://www.mixamo.com/*
 // @connect      *
@@ -17,7 +17,7 @@
   'use strict';
 
   const STATE_KEY = 'codex.mixamoDownloadAll.v1';
-  const SCRIPT_VERSION = '0.1.8';
+  const SCRIPT_VERSION = '0.1.11';
   const CONCURRENCY_KEY = 'codex.mixamoDownloadAll.concurrency';
   const MAX_RETRIES = 4;
   const MONITOR_DELAY_MS = 2500;
@@ -30,6 +30,7 @@
 
   let paused = false;
   let running = false;
+  let pauseReason = '';
   let ui = null;
   let uiSearch = null;
   let capturedCharacterId = '';
@@ -300,9 +301,52 @@
     return `Download All (${remaining}/${queue.length})`;
   }
 
+  function getFailureBucket(failure) {
+    const status = failure && failure.status;
+    if (status) {
+      return `HTTP ${status}`;
+    }
+    const reason = String((failure && failure.reason) || 'unknown error');
+    const statusMatch = reason.match(/\bHTTP\s+(\d{3})\b/i);
+    if (statusMatch) {
+      return `HTTP ${statusMatch[1]}`;
+    }
+    return reason.replace(/\s+/g, ' ').trim() || 'unknown error';
+  }
+
+  function formatFailureSummary(state) {
+    const failures = Object.values((state && state.failed) || {});
+    if (!failures.length) {
+      return '';
+    }
+    const buckets = new Map();
+    for (const failure of failures) {
+      const bucket = getFailureBucket(failure);
+      buckets.set(bucket, (buckets.get(bucket) || 0) + 1);
+    }
+    const parts = Array.from(buckets.entries())
+      .sort((left, right) => {
+        const leftIsHttp = /^HTTP \d{3}$/.test(left[0]);
+        const rightIsHttp = /^HTTP \d{3}$/.test(right[0]);
+        if (leftIsHttp !== rightIsHttp) {
+          return leftIsHttp ? -1 : 1;
+        }
+        return right[1] - left[1] || left[0].localeCompare(right[0]);
+      })
+      .map(([bucket, count]) => `${bucket} x${count}`);
+    const summary = `Failed ${failures.length}: ${parts.join('; ')}.`;
+    if (buckets.size === 1 && buckets.get('HTTP 404') === failures.length) {
+      return `${summary} Mixamo returned 404 for every failed item; those products or generated files are likely unavailable on the site.`;
+    }
+    return summary;
+  }
+
   function refreshUiCounts(state) {
     if (ui && ui.downloadButton) {
-      ui.downloadButton.textContent = formatDownloadButtonLabel(state || loadState());
+      const nextState = state || loadState();
+      const failureSummary = formatFailureSummary(nextState);
+      ui.downloadButton.textContent = formatDownloadButtonLabel(nextState);
+      ui.downloadButton.title = failureSummary || `Download all Mixamo motions and packs using the current uploaded character. Script ${SCRIPT_VERSION}.`;
     }
   }
 
@@ -653,6 +697,17 @@
     return `Retrying ${downloadName} in ${Math.round(delayMs / 1000)}s: ${formatError(error)}`;
   }
 
+  function isRateLimitError(error) {
+    const status = error && (error.status || error.statusCode);
+    return status === 429 || /\bHTTP\s+429\b/i.test(formatError(error));
+  }
+
+  function applyRateLimitThrottle(state) {
+    const concurrency = writeSavedConcurrency(MIN_CONCURRENCY);
+    state.concurrency = concurrency;
+    return `Mixamo rate limited downloads (HTTP 429). Concurrency reduced to ${concurrency}; wait a few minutes, then click Download All again.`;
+  }
+
   function downloadWithAnchor(request) {
     const anchor = document.createElement('a');
     anchor.href = request.url;
@@ -886,14 +941,16 @@
     return downloadName;
   }
 
-  async function runWithRetries(entry, characterId, state) {
-    const previousAttempts = state.retryCounts[entry.key] || 0;
+  async function runWithRetries(entry, characterId, state, options) {
+    const runDownloadEntry = options && options.downloadEntry ? options.downloadEntry : downloadEntry;
+    const savedAttempts = state.retryCounts[entry.key] || 0;
+    const previousAttempts = savedAttempts >= MAX_RETRIES ? 0 : savedAttempts;
     for (let attempt = previousAttempts; attempt < MAX_RETRIES; attempt += 1) {
       if (paused) {
         throw new Error('Paused');
       }
       try {
-        const downloadName = await downloadEntry(entry, characterId, state);
+        const downloadName = await runDownloadEntry(entry, characterId, state);
         delete state.failed[entry.key];
         delete state.retryCounts[entry.key];
         state.completed[entry.key] = {
@@ -913,6 +970,16 @@
           status: error.status || null,
         };
         saveState(state);
+        if (isRateLimitError(error)) {
+          const message = applyRateLimitThrottle(state);
+          saveState(state);
+          if (options && typeof options.onRateLimit === 'function') {
+            options.onRateLimit(message);
+          }
+          const rateLimitError = new Error(message);
+          rateLimitError.status = 429;
+          throw rateLimitError;
+        }
         if (attempt + 1 >= MAX_RETRIES) {
           throw error;
         }
@@ -957,6 +1024,7 @@
     }
     running = true;
     paused = false;
+    pauseReason = '';
     if (!downloadWindow || downloadWindow.closed) {
       downloadWindow = window.open('', 'mixamo-download-all');
     }
@@ -980,7 +1048,13 @@
         onProgress: (entry, started, total) => {
           setStatus(`Downloading ${started}/${total} (x${concurrency}): ${entry.downloadName}`);
         },
-        runEntry: (entry) => runWithRetries(entry, characterId, state),
+        runEntry: (entry) => runWithRetries(entry, characterId, state, {
+          onRateLimit: (message) => {
+            paused = true;
+            pauseReason = message;
+            setStatus(message);
+          },
+        }),
         onEntryError: (entry, error) => {
           if (!paused) {
             console.warn('[Mixamo Download All] Skipping after retries:', entry, error);
@@ -988,7 +1062,7 @@
         },
       });
       if (paused) {
-        setStatus(`Paused after ${result.finished}/${pending.length}`);
+        setStatus(pauseReason || `Paused after ${result.finished}/${pending.length}`);
       }
       if (!paused) {
         setStatus('Finished queue. Check failed records before resetting.');
@@ -1090,11 +1164,16 @@
     ui = { root, characterInput, crawlButton, downloadButton, pauseButton, resetButton, importDoneButton, status };
     uiSearch = search;
     positionUi();
+    const initialFailureSummary = formatFailureSummary(loadState());
+    if (initialFailureSummary) {
+      setStatus(initialFailureSummary);
+    }
     globalObject.addEventListener('resize', positionUi);
     crawlButton.addEventListener('click', crawlAllAnimations);
     downloadButton.addEventListener('click', startDownloadAll);
     pauseButton.addEventListener('click', () => {
       paused = true;
+      pauseReason = '';
       setStatus('Pausing after current request finishes...');
     });
     resetButton.addEventListener('click', () => {
@@ -1130,7 +1209,10 @@
     extractCharacterIdFromText,
     createDownloadRequest,
     formatRetryStatus,
+    isRateLimitError,
+    applyRateLimitThrottle,
     buildManifestExport,
+    formatFailureSummary,
     matchDownloadedFilesToQueue,
     importDownloadedFilesIntoState,
     planImportDoneFlow,
@@ -1139,6 +1221,7 @@
     mergeQueuePasses,
     getDownloadConcurrency,
     runConcurrentQueue,
+    runWithRetriesForTest: (entry, characterId, state, downloadEntryForTest) => runWithRetries(entry, characterId, state, { downloadEntry: downloadEntryForTest }),
     applyCrawledQueueToState,
     summarizeQueue,
     formatCrawlStatus,
