@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.16
+// @version      0.1.28
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -19,28 +19,33 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.16';
+    const SCRIPT_VERSION = '0.1.28';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
+    const CUSTOM_TAG_STORAGE_KEY = 'boss-zhipin-job-tools:custom-tags';
     const PAGE_SORT_EVENT = `${APP_ID}:sort-job-list`;
     const PAGE_SORT_RESULT_EVENT = `${APP_ID}:sort-job-list-result`;
-    const SCAN_DELAY_MS = 650;
-    const DETAIL_WAIT_MS = 2500;
+    const LOAD_MORE_SCROLL_PASSES = 6;
+    const LOAD_MORE_SCROLL_DELAY_MS = 850;
+    const LOAD_MORE_MAX_CARDS = 80;
     const UNKNOWN_ACTIVE_RANK = Number.MAX_SAFE_INTEGER;
 
     const state = {
         ignoredJobs: new Map(),
         activeTimeCache: new Map(),
+        customTags: new Map(),
         mutationObserver: null,
         refreshTimer: null,
         scanning: false,
         scanToken: 0,
+        filtersSuspendedForLoading: false,
         showIgnored: false,
         settingsOpen: false,
         hiddenFilters: { keywords: [], minSalaryMaxK: 0 },
         lastSortedCount: 0,
-        lastStatusText: ''
+        lastStatusText: '',
+        chatNewTabHandlerInstalled: false
     };
 
     function normalizeSpace(value) {
@@ -120,6 +125,15 @@
         for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*万/g)) {
             salaries.push(Number(match[1]) * 10);
         }
+        for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)\/\s*(?:时|小时)/g)) {
+            salaries.push(Number(match[1]) * 8 * 30 / 1000);
+        }
+        if (!/[元块]\/\s*(?:天|日)/.test(value)) {
+            for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)(?:\/\s*(?:月|每月))?/g)) {
+                const amount = Number(match[1]);
+                if (amount >= 1000) salaries.push(amount / 1000);
+            }
+        }
 
         const finite = salaries.filter(Number.isFinite);
         return finite.length ? Math.max(...finite) : 0;
@@ -147,6 +161,46 @@
                 ? Math.round(minSalaryMaxK / 5) * 5
                 : 0
         };
+    }
+
+    function normalizeCustomTagList(tags) {
+        const values = Array.isArray(tags)
+            ? tags
+            : String(tags || '').split(/\r?\n/);
+        const seen = new Set();
+        return values
+            .map(normalizeSpace)
+            .filter((value) => {
+                const key = value.toLowerCase();
+                if (!value || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+    }
+
+    function normalizeCustomTagRecords(stored) {
+        const entries = Array.isArray(stored)
+            ? stored.map((record) => [record && record.id, record])
+            : Object.entries(stored || {});
+
+        return new Map(
+            entries
+                .map(([key, record]) => {
+                    const id = normalizeSpace(key);
+                    if (!id || !record || typeof record !== 'object') return null;
+
+                    const tags = normalizeCustomTagList(record.tags);
+                    if (!tags.length) return null;
+
+                    const updatedAt = Number(record.updatedAt);
+                    return [id, {
+                        id,
+                        tags,
+                        ...(Number.isFinite(updatedAt) ? { updatedAt } : {})
+                    }];
+                })
+                .filter(Boolean)
+        );
     }
 
     function jobMatchesHiddenFilters(record, settings) {
@@ -275,6 +329,14 @@
 
     function saveHiddenFilterSettings() {
         safeSetValue(HIDDEN_FILTER_SETTINGS_STORAGE_KEY, state.hiddenFilters);
+    }
+
+    function loadCustomTags() {
+        state.customTags = normalizeCustomTagRecords(safeGetValue(CUSTOM_TAG_STORAGE_KEY, {}));
+    }
+
+    function saveCustomTags() {
+        safeSetValue(CUSTOM_TAG_STORAGE_KEY, serializeRecordMap(state.customTags));
     }
 
     function addStyle(css) {
@@ -458,6 +520,70 @@
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
+            .${APP_ID}-custom-tag-wrap {
+                display: inline-flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 12px;
+                margin-left: 12px;
+                vertical-align: middle;
+            }
+            .${APP_ID}-custom-tag-row {
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 12px;
+                min-height: 42px;
+                margin: 10px 0 18px;
+            }
+            .${APP_ID}-custom-tag-row .${APP_ID}-custom-tag-wrap {
+                margin-left: 0;
+            }
+            .${APP_ID}-custom-tag,
+            .${APP_ID}-custom-tag-add {
+                display: inline-flex;
+                align-items: center;
+                max-width: 130px;
+                height: 42px;
+                padding: 0 18px;
+                border: 0;
+                border-radius: 4px;
+                background: #f8f8f8;
+                color: #414a60;
+                font-size: 16px;
+                line-height: 42px;
+                white-space: nowrap;
+                box-sizing: border-box;
+            }
+            .${APP_ID}-custom-tag-text {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .${APP_ID}-custom-tag-remove {
+                appearance: none;
+                border: 0;
+                background: transparent;
+                color: #8d92a1;
+                font-family: inherit;
+                cursor: pointer;
+                box-sizing: border-box;
+                width: 16px;
+                height: 16px;
+                margin-left: 8px;
+                padding: 0;
+                font-size: 14px;
+                line-height: 14px;
+            }
+            .${APP_ID}-custom-tag-add {
+                appearance: none;
+                cursor: pointer;
+                font-family: inherit;
+            }
+            .${APP_ID}-custom-tag-add:hover,
+            .${APP_ID}-custom-tag-remove:hover {
+                color: #00a6a7;
+            }
             .${APP_ID}-toast {
                 position: fixed;
                 right: 22px;
@@ -497,6 +623,7 @@
 
                 const SORT_EVENT = 'bzjt:sort-job-list';
                 const SORT_RESULT_EVENT = 'bzjt:sort-job-list-result';
+                const CHAT_RESULT_EVENT = 'bzjt:chat-new-tab-result';
 
                 function normalizeSpace(value) {
                     return String(value || '').replace(/\\s+/g, ' ').trim();
@@ -520,6 +647,106 @@
                         }
                     }
                     return null;
+                }
+
+                function normalizeNavigableUrl(url) {
+                    const value = normalizeSpace(url);
+                    if (!value || value === '#' || /^javascript:/i.test(value) || /^about:blank$/i.test(value)) return '';
+
+                    try {
+                        return new URL(value, location.href).href;
+                    } catch (error) {
+                        return '';
+                    }
+                }
+
+                function sendChatResult(ok, url, message) {
+                    window.dispatchEvent(new CustomEvent(CHAT_RESULT_EVENT, {
+                        detail: JSON.stringify({ ok, url: url || '', message: message || '' })
+                    }));
+                }
+
+                function getChatActionFromEventTarget(target) {
+                    if (!(target instanceof Element)) return null;
+
+                    const element = target.closest('a, button, [role="button"]');
+                    if (!element) return null;
+
+                    const detailTarget = element.closest('.job-detail-header, .job-detail-op, .job-detail-container, .job-detail-box, .job-detail-section');
+                    if (!detailTarget) return null;
+
+                    return /立即沟通|继续沟通|沟通/.test(normalizeSpace(element.textContent || '')) ? element : null;
+                }
+
+                function getDirectChatHref(element) {
+                    const anchor = element && element.matches && element.matches('a[href]') ? element : element && element.closest && element.closest('a[href]');
+                    return normalizeNavigableUrl(anchor ? anchor.getAttribute('href') : '');
+                }
+
+                function openChatTarget(url, popup) {
+                    const targetUrl = normalizeNavigableUrl(url);
+                    if (!targetUrl || targetUrl === location.href) return false;
+
+                    if (popup && !popup.closed) {
+                        try {
+                            popup.opener = null;
+                        } catch (error) {
+                            // Best effort only.
+                        }
+                        popup.location.href = targetUrl;
+                    } else {
+                        window.open(targetUrl, '_blank', 'noopener,noreferrer');
+                    }
+                    sendChatResult(true, targetUrl, '');
+                    return true;
+                }
+
+                function handleChatActionClick(event) {
+                    const action = getChatActionFromEventTarget(event.target);
+                    if (!action) return;
+
+                    const directHref = getDirectChatHref(action);
+                    if (directHref) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        openChatTarget(directHref);
+                        return;
+                    }
+
+                    event.preventDefault();
+                    const originalPushState = history.pushState;
+                    const originalReplaceState = history.replaceState;
+                    const popup = window.open('about:blank', '_blank', 'noopener,noreferrer');
+                    let diverted = false;
+
+                    function restoreHistory() {
+                        if (history.pushState === interceptPushState) history.pushState = originalPushState;
+                        if (history.replaceState === interceptReplaceState) history.replaceState = originalReplaceState;
+                    }
+
+                    function makeHistoryRouteInterceptor(originalMethod) {
+                        return function interceptedHistoryRoute(stateValue, title, url) {
+                            if (openChatTarget(url, popup)) {
+                                diverted = true;
+                                window.setTimeout(restoreHistory, 0);
+                                return undefined;
+                            }
+                            return originalMethod.apply(this, arguments);
+                        };
+                    }
+
+                    const interceptPushState = makeHistoryRouteInterceptor(originalPushState);
+                    const interceptReplaceState = makeHistoryRouteInterceptor(originalReplaceState);
+                    history.pushState = interceptPushState;
+                    history.replaceState = interceptReplaceState;
+
+                    window.setTimeout(() => {
+                        restoreHistory();
+                        if (!diverted && popup && !popup.closed) {
+                            popup.close();
+                            sendChatResult(false, '', 'no route captured');
+                        }
+                    }, 1200);
                 }
 
                 function sendResult(requestId, ok, count, message) {
@@ -580,6 +807,8 @@
                         sendResult(requestId, false, 0, error && error.message ? error.message : String(error));
                     }
                 });
+
+                window.addEventListener('click', handleChatActionClick, true);
             })();
         `;
 
@@ -714,6 +943,22 @@
         ].join(',')));
     }
 
+    function getCardActiveTimeText(card) {
+        if (!card) return '';
+
+        const preferredText = getTextFromElements(card.querySelectorAll([
+            `.${APP_ID}-active-badge`,
+            '.boss-active-time',
+            '[class*="active-time"]',
+            '[class*="activeTime"]',
+            '[class*="online"]',
+            '.job-card-footer',
+            '.job-info',
+            '.info-public'
+        ].join(',')));
+        return extractBossActiveTimeText(preferredText) || extractBossActiveTimeText(card.textContent || '');
+    }
+
     function getDetailKeywordText() {
         return getTextFromElements(document.querySelectorAll([
             '.job-keyword-list',
@@ -725,6 +970,82 @@
             '.job-detail-container [class*="keyword"]',
             '.job-detail-container [class*="tag-list"]'
         ].join(',')));
+    }
+
+    function getCustomTagsForJob(id) {
+        return normalizeCustomTagList(state.customTags.get(normalizeSpace(id))?.tags || []);
+    }
+
+    function getCustomTagTextForJob(id) {
+        return getCustomTagsForJob(id).join(' ');
+    }
+
+    function getCardFilterKeywordText(card) {
+        const id = getJobIdFromCard(card);
+        return normalizeSpace([getCardKeywordText(card), getCustomTagTextForJob(id)].filter(Boolean).join(' '));
+    }
+
+    function findJobDescriptionHeading() {
+        return Array.from(document.querySelectorAll([
+            '.job-detail-section h2',
+            '.job-detail-section h3',
+            '.job-detail-box h2',
+            '.job-detail-box h3',
+            '.job-detail-container h2',
+            '.job-detail-container h3',
+            '[class*="title"]'
+        ].join(','))).find((element) => normalizeSpace(element.textContent) === '职位描述') || null;
+    }
+
+    function isElementAfter(element, anchor) {
+        return Boolean(element && anchor && (anchor.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING));
+    }
+
+    function findDetailTagHost() {
+        const selectors = [
+            '.job-keyword-list',
+            '.job-tags',
+            '.job-labels',
+            '.job-detail-tags',
+            '.tag-list',
+            '[class*="tag-list"]'
+        ].join(',');
+        const heading = findJobDescriptionHeading();
+
+        if (heading) {
+            const scope = heading.closest('.job-detail-section, .job-detail-box, .job-detail-container, .detail-section, .job-sec')
+                || heading.parentElement
+                || document;
+            const candidates = Array.from(scope.querySelectorAll(selectors))
+                .filter((candidate) => isVisibleElement(candidate) && isElementAfter(candidate, heading));
+            if (candidates.length) {
+                return candidates.sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)[0];
+            }
+        }
+
+        return Array.from(document.querySelectorAll([
+            '.job-detail-section .tag-list',
+            '.job-detail-section [class*="tag-list"]',
+            '.job-detail-container .job-keyword-list',
+            '.job-detail-container .job-detail-tags'
+        ].join(','))).find(isVisibleElement) || null;
+    }
+
+    function ensureDetailTagHost() {
+        const existing = findDetailTagHost();
+        if (existing) return existing;
+
+        const heading = findJobDescriptionHeading();
+        if (!heading || !heading.parentElement) return null;
+
+        let host = heading.parentElement.querySelector(`.${APP_ID}-custom-tag-row`);
+        if (!host) {
+            const container = heading.parentElement;
+            host = document.createElement('div');
+            host.className = `${APP_ID}-custom-tag-row`;
+            container.insertBefore(host, heading.nextSibling);
+        }
+        return host;
     }
 
     function getActiveJobCard() {
@@ -755,7 +1076,10 @@
             title: getCardTitle(card),
             company: getCardCompany(card),
             salaryText: getCardSalaryText(card),
-            keywordText: getCardKeywordText(card) || getDetailKeywordText(),
+            keywordText: normalizeSpace([
+                getCardKeywordText(card) || getDetailKeywordText(),
+                getCustomTagTextForJob(id)
+            ].filter(Boolean).join(' ')),
             href: getJobHrefFromCard(card),
             card
         };
@@ -767,6 +1091,14 @@
 
     function findDetailButtonTarget() {
         return document.querySelector('.job-detail-header .job-detail-op, .job-detail-op, .job-detail-header');
+    }
+
+    function extractBossActiveTimeText(text) {
+        const value = normalizeSpace(text);
+        if (!value) return '';
+
+        const match = value.match(/((?:刚刚|当前|今日|今天|昨天|前天)活跃|在线|(?:\d+\s*(?:分钟|小时|天|日|周|个月|月|年)(?:内|前)?活跃))/);
+        return match ? normalizeSpace(match[1]) : '';
     }
 
     function isVisibleElement(element) {
@@ -802,6 +1134,119 @@
         const peers = Array.from(target.querySelectorAll('a, button'))
             .filter((element) => !element.classList.contains(`${APP_ID}-ignore-btn`) && isVisibleElement(element));
         return peers.find((element) => /立即沟通|沟通/.test(normalizeSpace(element.textContent || ''))) || peers[0] || null;
+    }
+
+    function findChatActionElements() {
+        const target = findDetailButtonTarget();
+        if (!target) return [];
+
+        return Array.from(target.querySelectorAll('a, button, [role="button"]'))
+            .filter((element) => {
+                if (element.classList.contains(`${APP_ID}-ignore-btn`)) return false;
+                if (!isVisibleElement(element)) return false;
+                return /立即沟通|沟通/.test(normalizeSpace(element.textContent || ''));
+            });
+    }
+
+    function getPageWindow() {
+        return typeof unsafeWindow === 'object' && unsafeWindow ? unsafeWindow : window;
+    }
+
+    function getChatActionFromEventTarget(target) {
+        const detailTarget = findDetailButtonTarget();
+        if (!detailTarget || !(target instanceof Element)) return null;
+
+        const element = target.closest('a, button, [role="button"]');
+        if (!element || !detailTarget.contains(element)) return null;
+        if (element.classList.contains(`${APP_ID}-ignore-btn`)) return null;
+        return /立即沟通|沟通/.test(normalizeSpace(element.textContent || '')) ? element : null;
+    }
+
+    function normalizeNavigableUrl(url) {
+        const value = normalizeSpace(url);
+        if (!value || value === '#' || /^javascript:/i.test(value) || /^about:blank$/i.test(value)) return '';
+
+        try {
+            return new URL(value, location.href).href;
+        } catch (error) {
+            return '';
+        }
+    }
+
+    function getDirectChatHref(element) {
+        const anchor = element?.matches?.('a[href]') ? element : element?.closest?.('a[href]');
+        return normalizeNavigableUrl(anchor?.getAttribute('href') || '');
+    }
+
+    function openChatUrlInNewTab(url) {
+        const targetUrl = normalizeNavigableUrl(url);
+        if (!targetUrl || targetUrl === location.href) return false;
+
+        const opened = window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        return Boolean(opened);
+    }
+
+    function handleChatActionClick(event) {
+        const action = getChatActionFromEventTarget(event.target);
+        if (!action) return;
+
+        event.preventDefault();
+
+        const directHref = getDirectChatHref(action);
+        if (directHref) {
+            event.stopImmediatePropagation();
+            openChatUrlInNewTab(directHref);
+            return;
+        }
+
+        const pageWindow = getPageWindow();
+        const pageHistory = pageWindow.history;
+        const originalPushState = pageHistory.pushState;
+        const originalReplaceState = pageHistory.replaceState;
+        let diverted = false;
+
+        const restoreHistory = () => {
+            if (pageHistory.pushState === makeHistoryRouteInterceptor.currentPushState) pageHistory.pushState = originalPushState;
+            if (pageHistory.replaceState === makeHistoryRouteInterceptor.currentReplaceState) pageHistory.replaceState = originalReplaceState;
+        };
+
+        function makeHistoryRouteInterceptor(originalMethod) {
+            return function interceptedHistoryRoute(stateValue, title, url) {
+                const targetUrl = normalizeNavigableUrl(url);
+                if (targetUrl && targetUrl !== location.href && openChatUrlInNewTab(targetUrl)) {
+                    diverted = true;
+                    window.setTimeout(restoreHistory, 0);
+                    return undefined;
+                }
+                return originalMethod.apply(this, arguments);
+            };
+        }
+
+        pageHistory.pushState = makeHistoryRouteInterceptor(originalPushState);
+        makeHistoryRouteInterceptor.currentPushState = pageHistory.pushState;
+        pageHistory.replaceState = makeHistoryRouteInterceptor(originalReplaceState);
+        makeHistoryRouteInterceptor.currentReplaceState = pageHistory.replaceState;
+
+        window.setTimeout(() => {
+            restoreHistory();
+            if (diverted) showToast('已在新标签打开沟通页');
+        }, 1000);
+    }
+
+    function installChatNewTabClickHandler() {
+        if (state.chatNewTabHandlerInstalled) return;
+        document.addEventListener('click', handleChatActionClick, true);
+        state.chatNewTabHandlerInstalled = true;
+    }
+
+    function ensureChatButtonsOpenInNewTabs() {
+        for (const element of findChatActionElements()) {
+            const anchor = element.matches('a[href]') ? element : element.closest('a[href]');
+            if (!anchor) continue;
+
+            anchor.target = '_blank';
+            anchor.rel = 'noopener noreferrer';
+        }
     }
 
     function syncIgnoreButtonStyle(button, target) {
@@ -1002,9 +1447,18 @@
     function isCardHiddenByFilters(card) {
         return jobMatchesHiddenFilters({
             title: getCardTitle(card),
-            keywordText: getCardKeywordText(card),
+            keywordText: getCardFilterKeywordText(card),
             salaryText: getCardSalaryText(card)
         }, state.hiddenFilters);
+    }
+
+    function isFilterHidingSuspended() {
+        return Boolean(state.filtersSuspendedForLoading);
+    }
+
+    function setFiltersSuspendedForLoading(suspended) {
+        state.filtersSuspendedForLoading = Boolean(suspended);
+        applyIgnoredJobs();
     }
 
     function isCardHiddenByIgnored(card, extraIgnoredId = '') {
@@ -1019,8 +1473,8 @@
 
     function applyIgnoredJobs() {
         for (const card of getJobCards()) {
-            card.classList.toggle(`${APP_ID}-ignored-job`, isCardHiddenByIgnored(card));
-            card.classList.toggle(`${APP_ID}-filtered-job`, isCardHiddenByFilters(card));
+            card.classList.toggle(`${APP_ID}-ignored-job`, !isFilterHidingSuspended() && isCardHiddenByIgnored(card));
+            card.classList.toggle(`${APP_ID}-filtered-job`, !isFilterHidingSuspended() && isCardHiddenByFilters(card));
         }
         updateIgnoredToggleButton();
         updateSettingsPanel();
@@ -1053,6 +1507,111 @@
 
         document.body.appendChild(toast);
         window.setTimeout(() => toast.remove(), 2400);
+    }
+
+    function setCustomTagsForJob(id, tags) {
+        const normalizedId = normalizeSpace(id);
+        if (!normalizedId) return;
+
+        const normalizedTags = normalizeCustomTagList(tags);
+        if (normalizedTags.length) {
+            state.customTags.set(normalizedId, {
+                id: normalizedId,
+                tags: normalizedTags,
+                updatedAt: Date.now()
+            });
+        } else {
+            state.customTags.delete(normalizedId);
+        }
+        saveCustomTags();
+    }
+
+    function addCustomTagForCurrentJob() {
+        const record = getCurrentJobRecord();
+        if (!record) {
+            showToast('未找到当前职位');
+            return;
+        }
+
+        const tag = normalizeSpace(window.prompt('添加自定义标签', '') || '');
+        if (!tag) return;
+
+        const tags = normalizeCustomTagList([...getCustomTagsForJob(record.id), tag]);
+        setCustomTagsForJob(record.id, tags);
+        renderDetailCustomTags();
+        applyIgnoredJobs();
+        void ensureActiveJobIsVisible();
+        showToast(`已添加标签：${tag}`);
+    }
+
+    function removeCustomTagForCurrentJob(tag) {
+        const record = getCurrentJobRecord();
+        if (!record) return;
+
+        const removeKey = normalizeSpace(tag).toLowerCase();
+        const tags = getCustomTagsForJob(record.id).filter((value) => value.toLowerCase() !== removeKey);
+        setCustomTagsForJob(record.id, tags);
+        renderDetailCustomTags();
+        applyIgnoredJobs();
+        void ensureActiveJobIsVisible();
+        showToast(`已移除标签：${tag}`);
+    }
+
+    function renderDetailCustomTags() {
+        const host = ensureDetailTagHost();
+        if (!host) return;
+
+        const record = getCurrentJobRecord();
+        let wrap = host.querySelector(`.${APP_ID}-custom-tag-wrap`);
+        if (!record) {
+            wrap?.remove();
+            return;
+        }
+
+        if (!wrap) {
+            wrap = document.createElement('span');
+            wrap.className = `${APP_ID}-custom-tag-wrap`;
+            host.appendChild(wrap);
+        }
+
+        const tags = getCustomTagsForJob(record.id);
+        const signature = JSON.stringify({ id: record.id, tags });
+        if (wrap.dataset.signature === signature) return;
+        wrap.dataset.signature = signature;
+        wrap.textContent = '';
+        for (const tag of tags) {
+            const item = document.createElement('span');
+            item.className = `${APP_ID}-custom-tag`;
+
+            const label = document.createElement('span');
+            label.className = `${APP_ID}-custom-tag-text`;
+            label.textContent = tag;
+            item.appendChild(label);
+
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = `${APP_ID}-custom-tag-remove`;
+            remove.textContent = '×';
+            remove.title = `移除标签 ${tag}`;
+            remove.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                removeCustomTagForCurrentJob(tag);
+            });
+            item.appendChild(remove);
+            wrap.appendChild(item);
+        }
+
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.className = `${APP_ID}-custom-tag-add`;
+        add.textContent = '+ 标签';
+        add.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            addCustomTagForCurrentJob();
+        });
+        wrap.appendChild(add);
     }
 
     function clickCard(card) {
@@ -1204,16 +1763,17 @@
         const id = getJobIdFromCard(card);
         const cached = id ? state.activeTimeCache.get(id) : null;
         const jobData = getCardJobData(card);
+        const cardActiveTimeText = getCardActiveTimeText(card);
         return {
             id,
             card,
             jobData,
             title: getCardTitle(card),
-            keywordText: getCardKeywordText(card),
+            keywordText: getCardFilterKeywordText(card),
             salaryText: getCardSalaryText(card),
             originalIndex,
-            activeTimeText: cached?.text || getActiveTimeTextFromJobData(jobData),
-            activeRank: cached?.rank
+            activeTimeText: cardActiveTimeText || cached?.text || getActiveTimeTextFromJobData(jobData),
+            activeRank: cardActiveTimeText ? parseBossActiveTimeRank(cardActiveTimeText) : cached?.rank
         };
     }
 
@@ -1249,35 +1809,45 @@
         return new Promise((resolve) => window.setTimeout(resolve, ms));
     }
 
-    async function waitForDetailForCard(record) {
-        const startedAt = Date.now();
-        while (Date.now() - startedAt < DETAIL_WAIT_MS) {
-            const current = getCurrentJobRecord();
-            if (current && current.id === record.id) return true;
+    function getJobListScrollTarget() {
+        const parent = getJobListParent();
+        const candidates = [
+            parent,
+            parent?.parentElement,
+            document.querySelector('.job-list-container'),
+            document.querySelector('.rec-job-list')
+        ].filter(Boolean);
 
-            const detailText = normalizeSpace(document.querySelector('.job-detail-header')?.textContent || '');
-            if (record.title && detailText.includes(record.title)) return true;
-
-            await sleep(100);
-        }
-        return false;
+        return candidates.find((element) => element.scrollHeight > element.clientHeight + 20) || document.scrollingElement || document.documentElement;
     }
 
-    async function scanMissingActiveTimes(records, token) {
-        for (let index = 0; index < records.length; index += 1) {
-            if (token !== state.scanToken) return false;
+    async function loadMoreVisibleJobCardsBeforeSort() {
+        setFiltersSuspendedForLoading(true);
+        try {
+            await sleep(180);
+            const target = getJobListScrollTarget();
+            if (!target) return;
 
-            const record = records[index];
-            if (!record.id || state.activeTimeCache.has(record.id)) continue;
+            let previousCount = getJobCards().length;
+            for (let pass = 0; pass < LOAD_MORE_SCROLL_PASSES; pass += 1) {
+                if (previousCount >= LOAD_MORE_MAX_CARDS) return;
 
-            setSortButtonBusy(true, `${index + 1}/${records.length}`);
-            updateToolbarStatus('读取活跃时间');
-            await activateJobCard(record.card);
-            const detailReady = await waitForDetailForCard(record);
-            await sleep(SCAN_DELAY_MS);
-            cacheActiveTime(record, detailReady ? getDetailActiveTimeText() : '');
+                setSortButtonBusy(true, `加载 ${previousCount}`);
+                updateToolbarStatus('加载更多职位');
+                target.scrollBy({
+                    top: Math.max(360, Math.round((target.clientHeight || window.innerHeight || 720) * 0.85)),
+                    left: 0,
+                    behavior: 'smooth'
+                });
+                await sleep(LOAD_MORE_SCROLL_DELAY_MS);
+
+                const nextCount = getJobCards().length;
+                if (nextCount <= previousCount && target.scrollTop + target.clientHeight >= target.scrollHeight - 20) return;
+                previousCount = nextCount;
+            }
+        } finally {
+            setFiltersSuspendedForLoading(false);
         }
-        return true;
     }
 
     function getListController(records = []) {
@@ -1366,29 +1936,31 @@
         return sorted;
     }
 
+    function scrollJobListToTopAfterSort(sortedRecords) {
+        const target = getJobListScrollTarget();
+        if (target && typeof target.scrollTo === 'function') {
+            target.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
+        } else if (target) {
+            target.scrollTop = 0;
+        }
+
+        const firstCard = Array.isArray(sortedRecords) && sortedRecords[0] ? sortedRecords[0].card : null;
+        firstCard?.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'smooth' });
+    }
+
     async function sortRecordsOnPage(records) {
         const sorted = records
             .slice()
             .sort(compareJobRecordsByActiveTime);
 
-        if (!await sortRecordsInVue(records, sorted)) sortRecordsInDom(records, sorted);
+        const vueSorted = await sortRecordsInVue(records, sorted);
+        sortRecordsInDom(records, sorted);
+        if (!vueSorted) updateToolbarStatus('已按当前可见职位排序');
         return sorted;
     }
 
     async function sortLoadedJobsByActiveTime() {
         if (state.scanning) return;
-
-        const records = getJobCards()
-            .filter((card) => {
-                const id = getJobIdFromCard(card);
-                return Boolean(id && !state.ignoredJobs.has(id) && !isCardHiddenByFilters(card));
-            })
-            .map(makeJobRecord);
-
-        if (!records.length) {
-            showToast('没有可排序职位');
-            return;
-        }
 
         state.scanning = true;
         const token = state.scanToken + 1;
@@ -1396,27 +1968,35 @@
         setSortButtonBusy(true);
 
         try {
-            const completed = await scanMissingActiveTimes(records, token);
-            if (!completed) return;
+            await loadMoreVisibleJobCardsBeforeSort();
+            if (token !== state.scanToken) return;
+
+            const records = getJobCards()
+                .filter((card) => {
+                    const id = getJobIdFromCard(card);
+                    return Boolean(id && !state.ignoredJobs.has(id) && !isCardHiddenByFilters(card));
+                })
+                .map(makeJobRecord);
+
+            if (!records.length) {
+                showToast('没有可排序职位');
+                return;
+            }
 
             for (const record of records) {
-                const cached = record.id ? state.activeTimeCache.get(record.id) : null;
-                if (cached) {
-                    record.activeTimeText = cached.text;
-                    record.activeRank = cached.rank;
-                    renderCardActiveBadge(record.card, cached.text);
-                } else if (record.activeTimeText) {
-                    record.activeRank = parseBossActiveTimeRank(record.activeTimeText);
-                    renderCardActiveBadge(record.card, record.activeTimeText);
-                }
+                const cardActiveTimeText = getCardActiveTimeText(record.card);
+                if (cardActiveTimeText) cacheActiveTime(record, cardActiveTimeText);
+                if (record.activeTimeText) renderCardActiveBadge(record.card, record.activeTimeText);
             }
 
             const sorted = await sortRecordsOnPage(records);
             state.lastSortedCount = sorted.length;
+            scrollJobListToTopAfterSort(sorted);
             await sleep(250);
-            refreshUi();
-            updateToolbarStatus('');
-            if (sorted[0]) await activateJobCard(findJobCardById(sorted[0].id) || sorted[0].card);
+            mountToolbar();
+            applyIgnoredJobs();
+            ensureIgnoreButton();
+            updateToolbarStatus(`已排序 ${sorted.length} 个职位`);
         } finally {
             if (token === state.scanToken) {
                 state.scanning = false;
@@ -1431,6 +2011,8 @@
         mountToolbar();
         applyIgnoredJobs();
         ensureIgnoreButton();
+        ensureChatButtonsOpenInNewTabs();
+        renderDetailCustomTags();
         void ensureActiveJobIsVisible();
 
         for (const card of getJobCards()) {
@@ -1467,8 +2049,10 @@
         loadIgnoredJobs();
         loadActiveTimeCache();
         loadHiddenFilterSettings();
+        loadCustomTags();
         installStyles();
         registerMenus();
+        installPageBridge();
         refreshUi();
         startObserver();
         window.setInterval(scheduleRefresh, 1500);

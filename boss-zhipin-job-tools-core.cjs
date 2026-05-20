@@ -32,6 +32,14 @@ function parseBossActiveTimeRank(text) {
     return Number.MAX_SAFE_INTEGER;
 }
 
+function extractBossActiveTimeText(text) {
+    const value = normalizeSpace(text);
+    if (!value) return '';
+
+    const match = value.match(/((?:刚刚|当前|今日|今天|昨天|前天)活跃|在线|(?:\d+\s*(?:分钟|小时|天|日|周|个月|月|年)(?:内|前)?活跃))/);
+    return match ? normalizeSpace(match[1]) : '';
+}
+
 function getRecordRank(record) {
     const explicitRank = Number(record && record.activeRank);
     if (Number.isFinite(explicitRank)) return explicitRank;
@@ -81,6 +89,15 @@ function parseBossSalaryMaxK(text) {
     for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*万/g)) {
         salaries.push(Number(match[1]) * 10);
     }
+    for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)\/\s*(?:时|小时)/g)) {
+        salaries.push(Number(match[1]) * 8 * 30 / 1000);
+    }
+    if (!/[元块]\/\s*(?:天|日)/.test(value)) {
+        for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)(?:\/\s*(?:月|每月))?/g)) {
+            const amount = Number(match[1]);
+            if (amount >= 1000) salaries.push(amount / 1000);
+        }
+    }
 
     const finite = salaries.filter(Number.isFinite);
     return finite.length ? Math.max(...finite) : 0;
@@ -108,6 +125,46 @@ function normalizeHiddenFilterSettings(settings = {}) {
             ? Math.round(minSalaryMaxK / 5) * 5
             : 0
     };
+}
+
+function normalizeCustomTagList(tags) {
+    const values = Array.isArray(tags)
+        ? tags
+        : String(tags || '').split(/\r?\n/);
+    const seen = new Set();
+    return values
+        .map(normalizeSpace)
+        .filter((value) => {
+            const key = value.toLowerCase();
+            if (!value || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+}
+
+function normalizeCustomTagRecords(stored) {
+    const entries = Array.isArray(stored)
+        ? stored.map((record) => [record && record.id, record])
+        : Object.entries(stored || {});
+
+    return new Map(
+        entries
+            .map(([key, record]) => {
+                const id = normalizeSpace(key);
+                if (!id || !record || typeof record !== 'object') return null;
+
+                const tags = normalizeCustomTagList(record.tags);
+                if (!tags.length) return null;
+
+                const updatedAt = Number(record.updatedAt);
+                return [id, {
+                    id,
+                    tags,
+                    ...(Number.isFinite(updatedAt) ? { updatedAt } : {})
+                }];
+            })
+            .filter(Boolean)
+    );
 }
 
 function jobMatchesHiddenFilters(record, settings) {
@@ -195,11 +252,14 @@ function serializeRecordMap(records) {
 
 module.exports = {
     compareJobRecordsByActiveTime,
+    extractBossActiveTimeText,
     extractJobIdFromHref,
     findNextVisibleJobIndex,
     getActiveTimeTextFromJobData,
     getJobDataId,
     jobMatchesHiddenFilters,
+    normalizeCustomTagList,
+    normalizeCustomTagRecords,
     normalizeHiddenFilterSettings,
     normalizeStoredRecordMap,
     normalizeSpace,
