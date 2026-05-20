@@ -1,5 +1,30 @@
+const DEFAULT_JOB_CACHE_TTL_DAYS = 30;
+const MIN_JOB_CACHE_TTL_DAYS = 1;
+const MAX_JOB_CACHE_TTL_DAYS = 365;
+const JOB_CACHE_SCHEMA_VERSION = 5;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_CACHE_RENDER_SCROLL_IDLE_MS = 700;
+
 function normalizeSpace(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function isRealJobExpectationText(text) {
+    const value = normalizeSpace(text);
+    return Boolean(value && value !== '推荐' && !/添加求职期望/.test(value));
+}
+
+function findAutoJobExpectationIndex(labels) {
+    const items = (Array.isArray(labels) ? labels : []).map(normalizeSpace);
+    const recommendationIndex = items.findIndex((text) => text === '推荐');
+    const addIndex = items.findIndex((text) => /添加求职期望/.test(text));
+    const start = recommendationIndex >= 0 ? recommendationIndex + 1 : 0;
+    const end = addIndex >= 0 ? addIndex : items.length;
+
+    for (let index = start; index < end; index += 1) {
+        if (isRealJobExpectationText(items[index])) return index;
+    }
+    return items.findIndex(isRealJobExpectationText);
 }
 
 function extractJobIdFromHref(href) {
@@ -167,6 +192,150 @@ function normalizeCustomTagRecords(stored) {
     );
 }
 
+function normalizeJobCacheSettings(settings = {}) {
+    const ttlDays = Number(settings && settings.ttlDays);
+    const rounded = Number.isFinite(ttlDays)
+        ? Math.round(ttlDays)
+        : DEFAULT_JOB_CACHE_TTL_DAYS;
+    return {
+        ttlDays: Math.min(MAX_JOB_CACHE_TTL_DAYS, Math.max(MIN_JOB_CACHE_TTL_DAYS, rounded))
+    };
+}
+
+function getOptionNow(options = {}) {
+    const now = Number(options && options.now);
+    return Number.isFinite(now) ? now : Date.now();
+}
+
+function getCachedRenderDeferDelay(options = {}) {
+    const lastUserScrollAt = Number(options && options.lastUserScrollAt);
+    if (!Number.isFinite(lastUserScrollAt) || lastUserScrollAt <= 0) return 0;
+
+    const idleMs = Number(options && options.idleMs);
+    const requiredIdleMs = Number.isFinite(idleMs) && idleMs > 0
+        ? idleMs
+        : DEFAULT_CACHE_RENDER_SCROLL_IDLE_MS;
+    const elapsedMs = Math.max(0, getOptionNow(options) - lastUserScrollAt);
+    return elapsedMs >= requiredIdleMs ? 0 : Math.ceil(requiredIdleMs - elapsedMs);
+}
+
+function getRequiredJobCacheSchemaVersion(options = {}) {
+    const version = Number(options && options.requiredSchemaVersion);
+    return Number.isFinite(version) ? Math.trunc(version) : 0;
+}
+
+function getStoredEntries(stored) {
+    if (stored instanceof Map) return Array.from(stored.entries());
+    return Array.isArray(stored)
+        ? stored.map((record) => [record && record.id, record])
+        : Object.entries(stored || {});
+}
+
+function normalizeCachedJobTagTexts(value) {
+    const rawValues = Array.isArray(value) ? value : [];
+    const seen = new Set();
+    return rawValues
+        .map(normalizeSpace)
+        .filter((text) => {
+            const key = text.toLowerCase();
+            if (!text || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+}
+
+function normalizeCachedJobRecord(key, record, now) {
+    const id = normalizeSpace(key || (record && record.id));
+    if (!id || !record || typeof record !== 'object') return null;
+
+    const normalized = { id };
+    const schemaVersion = Number(record.schemaVersion);
+    if (Number.isFinite(schemaVersion)) normalized.schemaVersion = Math.trunc(schemaVersion);
+
+    for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+        const value = normalizeSpace(record[field]);
+        if (value) normalized[field] = value;
+    }
+
+    const tagTexts = normalizeCachedJobTagTexts(record.tagTexts);
+    if (tagTexts.length) normalized.tagTexts = tagTexts;
+
+    if (!normalized.title && !normalized.href) return null;
+
+    const activeRank = Number(record.activeRank);
+    if (Number.isFinite(activeRank)) normalized.activeRank = activeRank;
+
+    const detailSchemaVersion = Number(record.detailSchemaVersion);
+    if (Number.isFinite(detailSchemaVersion)) normalized.detailSchemaVersion = Math.trunc(detailSchemaVersion);
+
+    const firstSeenAt = Number(record.firstSeenAt);
+    const lastSeenAt = Number(record.lastSeenAt ?? record.seenAt ?? record.firstSeenAt);
+    const resolvedLastSeenAt = Number.isFinite(lastSeenAt)
+        ? lastSeenAt
+        : (Number.isFinite(firstSeenAt) ? firstSeenAt : now);
+    normalized.firstSeenAt = Number.isFinite(firstSeenAt) ? firstSeenAt : resolvedLastSeenAt;
+    normalized.lastSeenAt = resolvedLastSeenAt;
+
+    return normalized;
+}
+
+function normalizeCachedJobRecords(stored, options = {}) {
+    const settings = normalizeJobCacheSettings(options);
+    const now = getOptionNow(options);
+    const requiredSchemaVersion = getRequiredJobCacheSchemaVersion(options);
+    const cutoff = now - settings.ttlDays * DAY_MS;
+
+    return new Map(
+        getStoredEntries(stored)
+            .map(([key, record]) => normalizeCachedJobRecord(key, record, now))
+            .filter((record) => record
+                && (!requiredSchemaVersion || record.schemaVersion === requiredSchemaVersion)
+                && record.lastSeenAt >= cutoff)
+            .map((record) => [record.id, record])
+    );
+}
+
+function mergeCachedJobRecords(cached, currentRecords, options = {}) {
+    const settings = normalizeJobCacheSettings(options);
+    const now = getOptionNow(options);
+    const merged = normalizeCachedJobRecords(cached, { ...options, ...settings, now });
+
+    for (const record of Array.isArray(currentRecords) ? currentRecords : []) {
+        const id = normalizeSpace(record && record.id);
+        if (!id) continue;
+
+        const existing = merged.get(id) || {};
+        const next = {
+            id,
+            schemaVersion: JOB_CACHE_SCHEMA_VERSION,
+            firstSeenAt: Number.isFinite(Number(existing.firstSeenAt)) ? Number(existing.firstSeenAt) : now,
+            lastSeenAt: now
+        };
+
+            for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+                const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
+                if (value) next[field] = value;
+            }
+
+            const tagTexts = normalizeCachedJobTagTexts(record && record.tagTexts);
+            const existingTagTexts = normalizeCachedJobTagTexts(existing.tagTexts);
+            if (tagTexts.length || existingTagTexts.length) next.tagTexts = tagTexts.length ? tagTexts : existingTagTexts;
+
+        const activeRank = Number(record && record.activeRank);
+        const existingActiveRank = Number(existing.activeRank);
+        if (Number.isFinite(activeRank)) {
+            next.activeRank = activeRank;
+        } else if (Number.isFinite(existingActiveRank)) {
+            next.activeRank = existingActiveRank;
+        }
+
+        const normalized = normalizeCachedJobRecord(id, next, now);
+        if (normalized) merged.set(id, normalized);
+    }
+
+    return normalizeCachedJobRecords(merged, { ...options, ...settings, now });
+}
+
 function jobMatchesHiddenFilters(record, settings) {
     const filters = normalizeHiddenFilterSettings(settings);
     const searchableText = normalizeSpace([
@@ -251,16 +420,23 @@ function serializeRecordMap(records) {
 }
 
 module.exports = {
+    JOB_CACHE_SCHEMA_VERSION,
     compareJobRecordsByActiveTime,
     extractBossActiveTimeText,
     extractJobIdFromHref,
+    findAutoJobExpectationIndex,
     findNextVisibleJobIndex,
     getActiveTimeTextFromJobData,
+    getCachedRenderDeferDelay,
     getJobDataId,
     jobMatchesHiddenFilters,
+    mergeCachedJobRecords,
+    isRealJobExpectationText,
+    normalizeCachedJobRecords,
     normalizeCustomTagList,
     normalizeCustomTagRecords,
     normalizeHiddenFilterSettings,
+    normalizeJobCacheSettings,
     normalizeStoredRecordMap,
     normalizeSpace,
     parseBossSalaryMaxK,

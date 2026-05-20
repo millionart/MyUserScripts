@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.28
+// @version      0.1.52
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -19,22 +19,42 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.28';
+    const SCRIPT_VERSION = '0.1.52';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
     const CUSTOM_TAG_STORAGE_KEY = 'boss-zhipin-job-tools:custom-tags';
+    const JOB_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache';
+    const JOB_CACHE_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache-settings';
     const PAGE_SORT_EVENT = `${APP_ID}:sort-job-list`;
     const PAGE_SORT_RESULT_EVENT = `${APP_ID}:sort-job-list-result`;
     const LOAD_MORE_SCROLL_PASSES = 6;
     const LOAD_MORE_SCROLL_DELAY_MS = 850;
     const LOAD_MORE_MAX_CARDS = 80;
     const UNKNOWN_ACTIVE_RANK = Number.MAX_SAFE_INTEGER;
+    const DEFAULT_JOB_CACHE_TTL_DAYS = 30;
+    const MIN_JOB_CACHE_TTL_DAYS = 1;
+    const MAX_JOB_CACHE_TTL_DAYS = 365;
+    const JOB_CACHE_SCHEMA_VERSION = 5;
+    const DETAIL_CACHE_SCHEMA_VERSION = 3;
+    const EXPECTATION_CACHE_SETTLE_MS = 2500;
+    const USER_SCROLL_RENDER_DEFER_MS = 700;
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const DETAIL_ROOT_CONTAINER_SELECTOR = [
+        '.job-detail-container',
+        '.job-detail-box',
+        '.job-detail-main',
+        '.job-detail',
+        '.detail-content'
+    ].join(',');
+    const DETAIL_SCAN_SELECTOR = `${DETAIL_ROOT_CONTAINER_SELECTOR}, .job-sec`;
 
     const state = {
         ignoredJobs: new Map(),
         activeTimeCache: new Map(),
         customTags: new Map(),
+        jobCache: new Map(),
+        jobCacheSettings: { ttlDays: DEFAULT_JOB_CACHE_TTL_DAYS },
         mutationObserver: null,
         refreshTimer: null,
         scanning: false,
@@ -43,13 +63,41 @@
         showIgnored: false,
         settingsOpen: false,
         hiddenFilters: { keywords: [], minSalaryMaxK: 0 },
+        jobExpectationSelectedByUser: false,
+        jobExpectationTouchedByUser: false,
+        selectedExpectationText: '',
+        expectationSelectedAt: 0,
         lastSortedCount: 0,
         lastStatusText: '',
+        lastCacheSignature: '',
+        lastJobListUserScrollAt: 0,
+        cachedRenderTimer: null,
+        currentCachedDetailId: '',
+        lastCachedDetailId: '',
+        lastCachedDetailSignature: '',
         chatNewTabHandlerInstalled: false
     };
 
     function normalizeSpace(value) {
         return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function isRealJobExpectationText(text) {
+        const value = normalizeSpace(text);
+        return Boolean(value && value !== '推荐' && !/添加求职期望/.test(value));
+    }
+
+    function findAutoJobExpectationIndex(labels) {
+        const items = (Array.isArray(labels) ? labels : []).map(normalizeSpace);
+        const recommendationIndex = items.findIndex((text) => text === '推荐');
+        const addIndex = items.findIndex((text) => /添加求职期望/.test(text));
+        const start = recommendationIndex >= 0 ? recommendationIndex + 1 : 0;
+        const end = addIndex >= 0 ? addIndex : items.length;
+
+        for (let index = start; index < end; index += 1) {
+            if (isRealJobExpectationText(items[index])) return index;
+        }
+        return items.findIndex(isRealJobExpectationText);
     }
 
     function extractJobIdFromHref(href) {
@@ -203,6 +251,150 @@
         );
     }
 
+    function normalizeJobCacheSettings(settings = {}) {
+        const ttlDays = Number(settings && settings.ttlDays);
+        const rounded = Number.isFinite(ttlDays)
+            ? Math.round(ttlDays)
+            : DEFAULT_JOB_CACHE_TTL_DAYS;
+        return {
+            ttlDays: Math.min(MAX_JOB_CACHE_TTL_DAYS, Math.max(MIN_JOB_CACHE_TTL_DAYS, rounded))
+        };
+    }
+
+    function getOptionNow(options = {}) {
+        const now = Number(options && options.now);
+        return Number.isFinite(now) ? now : Date.now();
+    }
+
+    function getCachedRenderDeferDelay(options = {}) {
+        const lastUserScrollAt = Number(options && options.lastUserScrollAt);
+        if (!Number.isFinite(lastUserScrollAt) || lastUserScrollAt <= 0) return 0;
+
+        const idleMs = Number(options && options.idleMs);
+        const requiredIdleMs = Number.isFinite(idleMs) && idleMs > 0
+            ? idleMs
+            : USER_SCROLL_RENDER_DEFER_MS;
+        const elapsedMs = Math.max(0, getOptionNow(options) - lastUserScrollAt);
+        return elapsedMs >= requiredIdleMs ? 0 : Math.ceil(requiredIdleMs - elapsedMs);
+    }
+
+    function getRequiredJobCacheSchemaVersion(options = {}) {
+        const version = Number(options && options.requiredSchemaVersion);
+        return Number.isFinite(version) ? Math.trunc(version) : 0;
+    }
+
+    function getStoredEntries(stored) {
+        if (stored instanceof Map) return Array.from(stored.entries());
+        return Array.isArray(stored)
+            ? stored.map((record) => [record && record.id, record])
+            : Object.entries(stored || {});
+    }
+
+    function normalizeCachedJobTagTexts(value) {
+        const rawValues = Array.isArray(value) ? value : [];
+        const seen = new Set();
+        return rawValues
+            .map(normalizeSpace)
+            .filter((text) => {
+                const key = text.toLowerCase();
+                if (!text || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+    }
+
+    function normalizeCachedJobRecord(key, record, now) {
+        const id = normalizeSpace(key || (record && record.id));
+        if (!id || !record || typeof record !== 'object') return null;
+
+        const normalized = { id };
+        const schemaVersion = Number(record.schemaVersion);
+        if (Number.isFinite(schemaVersion)) normalized.schemaVersion = Math.trunc(schemaVersion);
+
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+            const value = normalizeSpace(record[field]);
+            if (value) normalized[field] = value;
+        }
+
+        const tagTexts = normalizeCachedJobTagTexts(record.tagTexts);
+        if (tagTexts.length) normalized.tagTexts = tagTexts;
+
+        if (!normalized.title && !normalized.href) return null;
+
+        const activeRank = Number(record.activeRank);
+        if (Number.isFinite(activeRank)) normalized.activeRank = activeRank;
+
+        const detailSchemaVersion = Number(record.detailSchemaVersion);
+        if (Number.isFinite(detailSchemaVersion)) normalized.detailSchemaVersion = Math.trunc(detailSchemaVersion);
+
+        const firstSeenAt = Number(record.firstSeenAt);
+        const lastSeenAt = Number(record.lastSeenAt ?? record.seenAt ?? record.firstSeenAt);
+        const resolvedLastSeenAt = Number.isFinite(lastSeenAt)
+            ? lastSeenAt
+            : (Number.isFinite(firstSeenAt) ? firstSeenAt : now);
+        normalized.firstSeenAt = Number.isFinite(firstSeenAt) ? firstSeenAt : resolvedLastSeenAt;
+        normalized.lastSeenAt = resolvedLastSeenAt;
+
+        return normalized;
+    }
+
+    function normalizeCachedJobRecords(stored, options = {}) {
+        const settings = normalizeJobCacheSettings(options);
+        const now = getOptionNow(options);
+        const requiredSchemaVersion = getRequiredJobCacheSchemaVersion(options);
+        const cutoff = now - settings.ttlDays * DAY_MS;
+
+        return new Map(
+            getStoredEntries(stored)
+                .map(([key, record]) => normalizeCachedJobRecord(key, record, now))
+                .filter((record) => record
+                    && (!requiredSchemaVersion || record.schemaVersion === requiredSchemaVersion)
+                    && record.lastSeenAt >= cutoff)
+                .map((record) => [record.id, record])
+        );
+    }
+
+    function mergeCachedJobRecords(cached, currentRecords, options = {}) {
+        const settings = normalizeJobCacheSettings(options);
+        const now = getOptionNow(options);
+        const merged = normalizeCachedJobRecords(cached, { ...options, ...settings, now });
+
+        for (const record of Array.isArray(currentRecords) ? currentRecords : []) {
+            const id = normalizeSpace(record && record.id);
+            if (!id) continue;
+
+            const existing = merged.get(id) || {};
+            const next = {
+                id,
+                schemaVersion: JOB_CACHE_SCHEMA_VERSION,
+                firstSeenAt: Number.isFinite(Number(existing.firstSeenAt)) ? Number(existing.firstSeenAt) : now,
+                lastSeenAt: now
+            };
+
+            for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+                const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
+                if (value) next[field] = value;
+            }
+
+            const tagTexts = normalizeCachedJobTagTexts(record && record.tagTexts);
+            const existingTagTexts = normalizeCachedJobTagTexts(existing.tagTexts);
+            if (tagTexts.length || existingTagTexts.length) next.tagTexts = tagTexts.length ? tagTexts : existingTagTexts;
+
+            const activeRank = Number(record && record.activeRank);
+            const existingActiveRank = Number(existing.activeRank);
+            if (Number.isFinite(activeRank)) {
+                next.activeRank = activeRank;
+            } else if (Number.isFinite(existingActiveRank)) {
+                next.activeRank = existingActiveRank;
+            }
+
+            const normalized = normalizeCachedJobRecord(id, next, now);
+            if (normalized) merged.set(id, normalized);
+        }
+
+        return normalizeCachedJobRecords(merged, { ...options, ...settings, now });
+    }
+
     function jobMatchesHiddenFilters(record, settings) {
         const filters = normalizeHiddenFilterSettings(settings);
         const searchableText = normalizeSpace([
@@ -339,6 +531,25 @@
         safeSetValue(CUSTOM_TAG_STORAGE_KEY, serializeRecordMap(state.customTags));
     }
 
+    function loadJobCacheSettings() {
+        state.jobCacheSettings = normalizeJobCacheSettings(safeGetValue(JOB_CACHE_SETTINGS_STORAGE_KEY, {}));
+    }
+
+    function saveJobCacheSettings() {
+        safeSetValue(JOB_CACHE_SETTINGS_STORAGE_KEY, state.jobCacheSettings);
+    }
+
+    function loadJobCache() {
+        state.jobCache = normalizeCachedJobRecords(safeGetValue(JOB_CACHE_STORAGE_KEY, {}), {
+            ...state.jobCacheSettings,
+            requiredSchemaVersion: JOB_CACHE_SCHEMA_VERSION
+        });
+    }
+
+    function saveJobCache() {
+        safeSetValue(JOB_CACHE_STORAGE_KEY, serializeRecordMap(state.jobCache));
+    }
+
     function addStyle(css) {
         if (typeof GM_addStyle === 'function') {
             GM_addStyle(css);
@@ -441,11 +652,79 @@
                 white-space: nowrap;
                 color: #8d92a1;
             }
+            .${APP_ID}-version {
+                display: inline-flex;
+                align-items: center;
+                height: var(--bzjt-filter-height, 40px);
+                color: #b8bdc7;
+                font-size: 12px;
+                line-height: 1;
+                white-space: nowrap;
+            }
             .${APP_ID}-ignored-job {
                 display: none !important;
             }
             .${APP_ID}-filtered-job {
                 display: none !important;
+            }
+            .${APP_ID}-cached-card {
+                cursor: pointer;
+            }
+            .${APP_ID}-cached-list-host {
+                min-height: max-content;
+                padding-bottom: 16px !important;
+            }
+            .${APP_ID}-cached-scroll-host {
+                overflow-y: auto !important;
+                -webkit-overflow-scrolling: touch;
+            }
+            .${APP_ID}-cached-scroll-host .${APP_ID}-cached-card {
+                scroll-margin-bottom: 16px;
+            }
+            .${APP_ID}-logo-placeholder {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 100%;
+                height: 100%;
+                min-width: 40px;
+                min-height: 40px;
+                border-radius: 4px;
+                background: #f2f5f9;
+                color: #8d92a1;
+                font-size: 14px;
+                font-weight: 600;
+                line-height: 1;
+                box-sizing: border-box;
+            }
+            .${APP_ID}-logo-placeholder::before {
+                content: attr(data-initial);
+            }
+            .${APP_ID}-cache-tag {
+                color: #00a6a7;
+            }
+            .${APP_ID}-cached-meta {
+                display: inline-flex;
+                align-items: center;
+                max-width: 130px;
+                color: #8d92a1;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .${APP_ID}-cached-detail > :not(.${APP_ID}-cached-detail-overlay) {
+                display: none !important;
+            }
+            .${APP_ID}-cached-detail-overlay {
+                display: block;
+            }
+            .${APP_ID}-cached-detail .${APP_ID}-cached-detail-fallback {
+                color: #414a60;
+            }
+            .${APP_ID}-cached-detail-link {
+                display: inline-block;
+                margin-top: 10px;
+                color: #00a6a7;
             }
             .${APP_ID}-settings-panel {
                 position: absolute;
@@ -485,6 +764,20 @@
                 box-sizing: border-box;
             }
             .${APP_ID}-settings-field textarea:focus {
+                border-color: #00bebd;
+                outline: 0;
+            }
+            .${APP_ID}-settings-field input[type="number"] {
+                width: 100%;
+                height: 34px;
+                border: 1px solid #e3e7ed;
+                border-radius: 4px;
+                padding: 0 8px;
+                color: #414a60;
+                font-size: 13px;
+                box-sizing: border-box;
+            }
+            .${APP_ID}-settings-field input[type="number"]:focus {
                 border-color: #00bebd;
                 outline: 0;
             }
@@ -834,6 +1127,14 @@
             .filter((card, index, cards) => cards.indexOf(card) === index);
     }
 
+    function isCachedJobCard(card) {
+        return Boolean(card?.classList?.contains(`${APP_ID}-cached-card`));
+    }
+
+    function getLiveJobCards() {
+        return getJobCards().filter((card) => !isCachedJobCard(card));
+    }
+
     function findJobCardById(id) {
         const targetId = normalizeSpace(id);
         if (!targetId) return null;
@@ -863,7 +1164,7 @@
     }
 
     function getJobListParent() {
-        const firstCard = getJobCards()[0];
+        const firstCard = getLiveJobCards()[0] || getJobCards()[0];
         return firstCard ? firstCard.parentElement : document.querySelector('.rec-job-list, .job-list-container');
     }
 
@@ -881,11 +1182,70 @@
         return document.querySelector('.filter-condition-inner') || findToolbarAnchor()?.parentElement || null;
     }
 
+    function getActiveJobExpectationText() {
+        return normalizeSpace(document.querySelector('.expect-item.active')?.textContent || '');
+    }
+
+    function hasActiveJobExpectation() {
+        const activeText = getActiveJobExpectationText();
+        if (!activeText || !isRealJobExpectationText(activeText)) return false;
+        return Boolean(state.jobExpectationSelectedByUser
+            && state.selectedExpectationText === activeText
+            && Date.now() - state.expectationSelectedAt >= EXPECTATION_CACHE_SETTLE_MS);
+    }
+
+    function getJobExpectationItems() {
+        return Array.from(document.querySelectorAll('.expect-item'))
+            .filter((element) => element instanceof HTMLElement && normalizeSpace(element.textContent));
+    }
+
+    function markJobExpectationSelected(target) {
+        if (!target || !isRealJobExpectationText(normalizeSpace(target.textContent))) return false;
+        state.jobExpectationSelectedByUser = true;
+        state.selectedExpectationText = normalizeSpace(target.textContent);
+        state.expectationSelectedAt = Date.now();
+        state.lastCacheSignature = '';
+        return true;
+    }
+
+    function findDefaultJobExpectationItem() {
+        const items = getJobExpectationItems();
+        const index = findAutoJobExpectationIndex(items.map((item) => normalizeSpace(item.textContent)));
+        return index >= 0 ? items[index] : null;
+    }
+
+    function autoSelectDefaultJobExpectation() {
+        if (state.jobExpectationTouchedByUser) return false;
+
+        const activeItem = document.querySelector('.expect-item.active');
+        const activeText = normalizeSpace(activeItem?.textContent || '');
+        if (activeText && isRealJobExpectationText(activeText)) {
+            return markJobExpectationSelected(activeItem);
+        }
+
+        const target = findDefaultJobExpectationItem();
+        if (!target || !markJobExpectationSelected(target)) return false;
+        target.click();
+        scheduleRefresh();
+        return true;
+    }
+
+    function handleJobExpectationClick(event) {
+        const target = event.target instanceof Element ? event.target.closest('.expect-item') : null;
+        if (!target) return;
+
+        state.jobExpectationTouchedByUser = true;
+        if (!isRealJobExpectationText(normalizeSpace(target.textContent))) return;
+        markJobExpectationSelected(target);
+        scheduleRefresh();
+    }
+
     function getCardAnchor(card) {
         return card ? card.querySelector('a.job-name[href], a[href*="/job_detail/"]') : null;
     }
 
     function getJobIdFromCard(card) {
+        if (isCachedJobCard(card)) return normalizeSpace(card.dataset.bzjtCachedId);
         return extractJobIdFromHref(getCardAnchor(card)?.getAttribute('href') || getCardAnchor(card)?.href || '');
     }
 
@@ -911,11 +1271,73 @@
         return normalizeSpace(card?.querySelector('.salary, .job-salary, [class*="salary"]')?.textContent || '');
     }
 
+    function normalizeImageSrc(src) {
+        const value = normalizeSpace(src);
+        if (!value || /^data:image\/gif;base64,R0lGODlhAQABA/i.test(value)) return '';
+
+        try {
+            return new URL(value, location.href).href;
+        } catch (error) {
+            return value;
+        }
+    }
+
+    function getElementImageSrc(element) {
+        if (!element) return '';
+
+        const attributeSrc = element.currentSrc
+            || element.getAttribute?.('src')
+            || element.getAttribute?.('data-src')
+            || element.getAttribute?.('data-original')
+            || element.getAttribute?.('data-url')
+            || '';
+        const normalizedAttributeSrc = normalizeImageSrc(attributeSrc);
+        if (normalizedAttributeSrc) return normalizedAttributeSrc;
+
+        const backgroundImage = getComputedStyle(element).backgroundImage;
+        const match = backgroundImage && backgroundImage.match(/url\(["']?([^"')]+)["']?\)/);
+        return normalizeImageSrc(match?.[1] || '');
+    }
+
+    function getCardLogoSrc(card) {
+        if (!card) return '';
+
+        const candidates = Array.from(card.querySelectorAll([
+            '.company-logo img',
+            '.company-img img',
+            '.company-info img',
+            '.boss-avatar img',
+            '.job-card-right img',
+            '.company-logo',
+            '.company-img',
+            '.boss-avatar',
+            '[class*="logo"]',
+            'img'
+        ].join(',')));
+        for (const candidate of candidates) {
+            const src = getElementImageSrc(candidate);
+            if (src) return src;
+        }
+        return '';
+    }
+
     function getTextFromElements(elements) {
         return normalizeSpace(Array.from(elements || [])
             .map((element) => normalizeSpace(element.textContent))
             .filter(Boolean)
             .join(' '));
+    }
+
+    function getTextListFromElements(elements) {
+        const seen = new Set();
+        return Array.from(elements || [])
+            .map((element) => normalizeSpace(element.textContent))
+            .filter((text) => {
+                const key = text.toLowerCase();
+                if (!text || seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
     }
 
     function getCardKeywordText(card) {
@@ -941,6 +1363,41 @@
             '.job-card-body .label',
             '.job-card-body li'
         ].join(',')));
+    }
+
+    function getCardTagTexts(card) {
+        if (!card) return [];
+
+        const directTags = getTextListFromElements(card.querySelectorAll([
+            '.tag-list li',
+            '.job-tag-list li',
+            '.job-card-tag-list li',
+            '.job-card-tags li',
+            '.job-tags li',
+            '.job-info .tag',
+            '.job-info .label',
+            '.job-card-body .tag',
+            '.job-card-body .label'
+        ].join(',')));
+        if (directTags.length) return directTags;
+
+        const keywordText = getCardKeywordText(card);
+        return keywordText ? [keywordText] : [];
+    }
+
+    function getCardLocationText(card) {
+        if (!card) return '';
+
+        const location = Array.from(card.querySelectorAll([
+            '.job-area',
+            '.job-location',
+            '.company-location',
+            '[class*="job-area"]',
+            '[class*="location"]'
+        ].join(',')))
+            .map((element) => normalizeSpace(element.textContent))
+            .find((text) => text && text.length <= 40);
+        return location || '';
     }
 
     function getCardActiveTimeText(card) {
@@ -1083,6 +1540,892 @@
             href: getJobHrefFromCard(card),
             card
         };
+    }
+
+    function formatCachedJobAge(lastSeenAt) {
+        const seenAt = Number(lastSeenAt);
+        if (!Number.isFinite(seenAt)) return '缓存';
+
+        const elapsedMs = Math.max(0, Date.now() - seenAt);
+        const minutes = Math.floor(elapsedMs / 60000);
+        if (minutes < 1) return '刚刚缓存';
+        if (minutes < 60) return `${minutes}分钟前缓存`;
+
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours}小时前缓存`;
+
+        const days = Math.floor(hours / 24);
+        return `${days}天前缓存`;
+    }
+
+    function appendTextElement(parent, tagName, className, text) {
+        const element = document.createElement(tagName);
+        if (className) element.className = className;
+        element.textContent = normalizeSpace(text);
+        parent.appendChild(element);
+        return element;
+    }
+
+    function getCachedJobHref(record) {
+        const href = normalizeSpace(record && record.href);
+        if (href) return href;
+
+        try {
+            return new URL(`/job_detail/${encodeURIComponent(record.id)}.html`, location.origin).href;
+        } catch (error) {
+            return '';
+        }
+    }
+
+    function resolveDetailRootContainer(candidate) {
+        if (!(candidate instanceof Element)) return null;
+        return candidate.closest(DETAIL_ROOT_CONTAINER_SELECTOR) || candidate;
+    }
+
+    function getDetailRootCandidates(scope) {
+        const root = scope || document;
+        const elements = [];
+        if (root instanceof Element && root.matches(DETAIL_SCAN_SELECTOR)) elements.push(root);
+        elements.push(...Array.from(root.querySelectorAll(DETAIL_SCAN_SELECTOR)));
+
+        const seen = new Set();
+        return elements
+            .map((element) => resolveDetailRootContainer(element))
+            .filter((element) => {
+                if (!element || seen.has(element)) return false;
+                seen.add(element);
+                return true;
+            });
+    }
+
+    function findBestDetailRoot(candidates, requireVisible = false) {
+        const roots = (Array.isArray(candidates) ? candidates : [])
+            .filter((candidate) => candidate && (!requireVisible || isVisibleElement(candidate)));
+        const hasDescription = (candidate) => normalizeSpace(candidate.textContent).includes('职位描述');
+        const hasHeader = (candidate) => Boolean(candidate.querySelector('.job-detail-header, .job-name, h1'));
+
+        return roots.find((candidate) => hasHeader(candidate) && hasDescription(candidate))
+            || roots.find(hasHeader)
+            || roots.find(hasDescription)
+            || roots[0]
+            || null;
+    }
+
+    function findDetailRootInDocument(root) {
+        const candidates = getDetailRootCandidates(root);
+        return findBestDetailRoot(candidates);
+    }
+
+    function findDetailRoot() {
+        const candidates = getDetailRootCandidates(document);
+        return findBestDetailRoot(candidates, true);
+    }
+
+    function sanitizeCachedDetailHtml(html) {
+        const template = document.createElement('template');
+        template.innerHTML = String(html || '');
+        template.content.querySelectorAll('script, iframe, object, embed, link[rel="preload"]').forEach((element) => element.remove());
+        template.content.querySelectorAll('*').forEach((element) => {
+            for (const attribute of Array.from(element.attributes)) {
+                if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+            }
+        });
+        return template.innerHTML;
+    }
+
+    function getCurrentDetailHtmlForCard(card) {
+        const id = getJobIdFromCard(card);
+        const currentCard = getCurrentJobCard();
+        if (!id || !currentCard || getJobIdFromCard(currentCard) !== id) return '';
+
+        const root = findDetailRoot();
+        return root ? sanitizeCachedDetailHtml(root.innerHTML) : '';
+    }
+
+    function appendTagItems(list, values) {
+        for (const value of normalizeCachedJobTagTexts(values)) {
+            appendTextElement(list, 'li', '', value);
+        }
+    }
+
+    function replaceElementText(element, text) {
+        if (!element) return false;
+        element.textContent = normalizeSpace(text);
+        return true;
+    }
+
+    function ensureCacheTag(list) {
+        if (!list) return null;
+
+        const existing = Array.from(list.children || [])
+            .find((element) => normalizeSpace(element.textContent) === '缓存');
+        if (existing) {
+            existing.classList.add(`${APP_ID}-cache-tag`);
+            return existing;
+        }
+
+        return appendTextElement(list, list.matches('ul, ol') ? 'li' : 'span', `${APP_ID}-cache-tag`, '缓存');
+    }
+
+    function replaceTagList(list, values) {
+        if (!list) return false;
+        list.textContent = '';
+        appendTagItems(list, values);
+        ensureCacheTag(list);
+        return true;
+    }
+
+    function ensureCachedTagList(card) {
+        if (!card) return null;
+
+        let list = card.querySelector('.tag-list, .job-tag-list, .job-card-tag-list, .job-card-tags, .job-tags');
+        if (list) return list;
+
+        const host = card.querySelector('.job-info, .job-title, .job-card-left, .job-card-body') || card;
+        list = document.createElement('ul');
+        list.className = 'tag-list';
+        host.appendChild(list);
+        return list;
+    }
+
+    function getNativeJobCardTemplate() {
+        return getLiveJobCards()
+            .filter((card) => !card.classList.contains(`${APP_ID}-ignored-job`) && !card.classList.contains(`${APP_ID}-filtered-job`))
+            .find((card) => card.querySelector('.job-name') && card.querySelector('.salary, .job-salary, [class*="salary"]'))
+            || getLiveJobCards().find((card) => card.querySelector('.job-name'))
+            || null;
+    }
+
+    function stripCloneOnlyAttributes(root) {
+        root.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
+        root.querySelectorAll('img').forEach((image) => {
+            image.removeAttribute('srcset');
+            image.alt = '';
+        });
+    }
+
+    function cloneNativeJobCardTemplate() {
+        const template = getNativeJobCardTemplate();
+        if (!template) return null;
+
+        const card = template.cloneNode(true);
+        stripCloneOnlyAttributes(card);
+        card.classList.remove('active', `${APP_ID}-ignored-job`, `${APP_ID}-filtered-job`);
+        card.classList.add(`${APP_ID}-cached-card`);
+        card.dataset.bzjtNativeTemplate = '1';
+        return card;
+    }
+
+    function getNativeDetailClassName(root) {
+        const classNames = Array.from(root?.classList || [])
+            .filter((className) => className !== `${APP_ID}-cached-detail`
+                && className !== `${APP_ID}-cached-detail-overlay`
+                && !className.startsWith(`${APP_ID}-`));
+        return classNames.join(' ');
+    }
+
+    function detailHtmlHasNativeHeader(html) {
+        const template = document.createElement('template');
+        template.innerHTML = String(html || '');
+        return Boolean(template.content.querySelector('.job-detail-header, .job-name, h1'));
+    }
+
+    function getPlainTextFromHtml(html) {
+        const template = document.createElement('template');
+        template.innerHTML = String(html || '');
+        return normalizeSpace(template.content.textContent || '');
+    }
+
+    function cachedDetailContentMatchesRecord(record, detailHtml) {
+        const html = normalizeSpace(detailHtml);
+        if (!record || !html) return false;
+        if ([
+            `${APP_ID}-cached-detail`,
+            `${APP_ID}-cache-tag`,
+            `${APP_ID}-cached-meta`,
+            `${APP_ID}-cached-detail-link`
+        ].some((marker) => String(detailHtml).includes(marker))) return false;
+        if (!detailHtmlHasNativeHeader(detailHtml)) return false;
+
+        const id = normalizeSpace(record.id);
+        const detailJobId = normalizeSpace(record.detailJobId);
+        if (detailJobId && (!id || detailJobId !== id)) return false;
+
+        const text = getPlainTextFromHtml(detailHtml);
+        const title = normalizeSpace(record.title);
+        const salary = normalizeSpace(record.salaryText);
+        if (title) return text.includes(title);
+        return Boolean(salary && text.includes(salary));
+    }
+
+    function cachedDetailHtmlMatchesRecord(record, detailHtml) {
+        const schemaVersion = Number(record && record.detailSchemaVersion);
+        if (!Number.isFinite(schemaVersion) || schemaVersion < DETAIL_CACHE_SCHEMA_VERSION) return false;
+        return cachedDetailContentMatchesRecord(record, detailHtml);
+    }
+
+    function getTrustedCachedDetailHtml(record) {
+        return cachedDetailHtmlMatchesRecord(record, record && record.detailHtml) ? record.detailHtml : '';
+    }
+
+    function getCachedDetailDescriptionSignature(detailHtml) {
+        const template = document.createElement('template');
+        template.innerHTML = String(detailHtml || '');
+        const description = findDetailDescriptionSection(template.content) || template.content;
+        return normalizeSpace(description.textContent).slice(0, 2400);
+    }
+
+    function isDuplicateDetailForDifferentCachedJob(id, detailHtml) {
+        const signature = getCachedDetailDescriptionSignature(detailHtml);
+        return Boolean(signature
+            && state.lastCachedDetailSignature
+            && state.lastCachedDetailId
+            && state.lastCachedDetailId !== id
+            && state.lastCachedDetailSignature === signature);
+    }
+
+    function rememberCachedDetailSignature(id, detailHtml) {
+        const signature = getCachedDetailDescriptionSignature(detailHtml);
+        if (!signature) return;
+        state.lastCachedDetailId = id;
+        state.lastCachedDetailSignature = signature;
+    }
+
+    function findDetailDescriptionSection(root) {
+        if (!root) return null;
+
+        const sections = Array.from(root.querySelectorAll('.job-detail-section, .job-sec, .detail-section, [class*="job-sec"]'));
+        return sections.find((section) => normalizeSpace(section.textContent).includes('职位描述'))
+            || sections[0]
+            || null;
+    }
+
+    function createCachedDetailDescriptionSection(message = '', contentHtml = '') {
+        const section = document.createElement('div');
+        section.className = 'job-detail-section';
+        if (contentHtml) {
+            section.innerHTML = sanitizeCachedDetailHtml(contentHtml);
+            return section;
+        }
+
+        appendTextElement(section, 'h3', '', '职位描述');
+        appendTextElement(section, 'div', 'text', message || '正在加载缓存职位详情...');
+        return section;
+    }
+
+    function removeStaleCachedDetailSections(root) {
+        if (!root) return;
+
+        const sections = new Set();
+        const header = root.querySelector('.job-detail-header, .job-name, h1');
+        const headerContainer = header?.closest('.job-detail-header') || header;
+        if (headerContainer) {
+            for (let sibling = headerContainer.nextElementSibling; sibling; ) {
+                const next = sibling.nextElementSibling;
+                sections.add(sibling);
+                sibling = next;
+            }
+
+            for (const child of Array.from(root.children || [])) {
+                if (child === headerContainer || child.contains(headerContainer)) continue;
+                sections.add(child);
+            }
+        }
+
+        const descriptionSection = findDetailDescriptionSection(root);
+        if (descriptionSection) sections.add(descriptionSection);
+
+        root.querySelectorAll([
+            '.job-detail-section',
+            '.job-sec',
+            '.detail-section',
+            '.job-detail-company',
+            '.job-address',
+            '.job-detail-address',
+            '[class*="job-sec"]',
+            '[class*="job-desc"]',
+            '[class*="detail-desc"]',
+            '[class*="address"]',
+            '[class*="boss-info"]',
+            '[class*="recruiter"]'
+        ].join(',')).forEach((section) => {
+            if (!section.closest('.job-detail-header')) sections.add(section);
+        });
+
+        root.querySelectorAll('div, section, article').forEach((section) => {
+            if (section === root || section.closest('.job-detail-header') || section.querySelector('.job-detail-header')) return;
+            const text = normalizeSpace(section.textContent);
+            if (/职位描述|岗位职责|岗位要求|任职要求|工作地址|求职工具|升级VIP/.test(text)) sections.add(section);
+        });
+
+        for (const section of sections) {
+            section.remove();
+        }
+    }
+
+    function appendCachedDetailDescription(root, message = '', contentHtml = '') {
+        const section = createCachedDetailDescriptionSection(message, contentHtml);
+        root.appendChild(section);
+        return section;
+    }
+
+    function replaceCachedDetailDescription(root, message = '', contentHtml = '') {
+        removeStaleCachedDetailSections(root);
+        appendCachedDetailDescription(root, message, contentHtml);
+    }
+
+    function buildCachedJobDetailNativeShell(record, message = '', root = null, contentHtml = '') {
+        if (!(root instanceof Element)) return null;
+
+        const clone = root.cloneNode(true);
+        clone.classList.remove(`${APP_ID}-cached-detail`);
+        clone.classList.add(`${APP_ID}-cached-detail-fallback`);
+        clone.querySelectorAll(`.${APP_ID}-cached-detail-overlay`).forEach((element) => element.remove());
+        clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
+        replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), record.title || '缓存职位');
+        replaceElementText(clone.querySelector('.job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]'), record.salaryText);
+        replaceCachedDetailDescription(clone, message, contentHtml);
+        return clone;
+    }
+
+    function buildCachedJobDetailFallback(record, message = '', root = null, contentHtml = '') {
+        const nativeShell = buildCachedJobDetailNativeShell(record, message, root, contentHtml);
+        if (nativeShell) return nativeShell.outerHTML;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = normalizeSpace(`${APP_ID}-cached-detail-fallback ${getNativeDetailClassName(root)}`);
+
+        const header = appendTextElement(wrapper, 'div', 'job-detail-header', '');
+        const title = appendTextElement(header, 'div', 'job-name', record.title || '缓存职位');
+        title.setAttribute('title', record.title || '缓存职位');
+        if (record.salaryText) appendTextElement(header, 'span', 'salary', record.salaryText);
+
+        const info = appendTextElement(wrapper, 'div', 'job-info', '');
+        const tags = appendTextElement(info, 'ul', 'tag-list', '');
+        appendTagItems(tags, record.tagTexts);
+        appendTextElement(tags, 'li', `${APP_ID}-cache-tag`, '缓存');
+        appendTextElement(info, 'span', `${APP_ID}-cached-meta`, formatCachedJobAge(record.lastSeenAt));
+
+        const company = appendTextElement(wrapper, 'div', 'job-detail-company', '');
+        if (record.company) appendTextElement(company, 'span', 'company-name', record.company);
+        if (record.locationText) appendTextElement(company, 'span', 'job-area', record.locationText);
+
+        const section = appendTextElement(wrapper, 'div', 'job-detail-section', '');
+        appendTextElement(section, 'h3', '', '职位描述');
+        const content = appendTextElement(section, 'div', 'text', '');
+        if (contentHtml) {
+            content.innerHTML = sanitizeCachedDetailHtml(contentHtml);
+        } else {
+            content.textContent = message || '正在加载缓存职位详情...';
+        }
+
+        const href = getCachedJobHref(record);
+        if (href) {
+            const link = appendTextElement(section, 'a', `${APP_ID}-cached-detail-link`, '打开原职位页面');
+            link.href = href;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+        }
+
+        return wrapper.innerHTML;
+    }
+
+    async function fetchCachedJobDetailHtml(record, options = {}) {
+        const trustedDetailHtml = getTrustedCachedDetailHtml(record);
+        if (!options.forceNetwork && trustedDetailHtml) return trustedDetailHtml;
+
+        const href = getCachedJobHref(record);
+        if (!href) return '';
+
+        const response = await fetch(href, {
+            credentials: 'include',
+            cache: 'no-store'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const text = await response.text();
+        const doc = new DOMParser().parseFromString(text, 'text/html');
+        const detailRoot = findDetailRootInDocument(doc);
+        const detailHtml = detailRoot ? sanitizeCachedDetailHtml(detailRoot.innerHTML) : '';
+        return cachedDetailContentMatchesRecord(record, detailHtml) ? detailHtml : '';
+    }
+
+    function setCachedJobActive(id) {
+        const targetId = normalizeSpace(id);
+        for (const card of getJobCards()) {
+            card.classList.toggle('active', Boolean(targetId && getJobIdFromCard(card) === targetId));
+        }
+    }
+
+    function getCachedDetailOverlay(root) {
+        let overlay = root.querySelector(`:scope > .${APP_ID}-cached-detail-overlay`);
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = `${APP_ID}-cached-detail-overlay`;
+            root.appendChild(overlay);
+        }
+        return overlay;
+    }
+
+    function syncCachedDetailOverlayClass(root, overlay) {
+        if (!root || !overlay) return;
+
+        const inheritedClasses = Array.from(root.classList || [])
+            .filter((className) => className !== `${APP_ID}-cached-detail`);
+        overlay.className = [`${APP_ID}-cached-detail-overlay`, ...inheritedClasses].join(' ');
+    }
+
+    function clearCachedJobDetail() {
+        state.currentCachedDetailId = '';
+        for (const root of Array.from(document.querySelectorAll(`.${APP_ID}-cached-detail`))) {
+            root.querySelector(`:scope > .${APP_ID}-cached-detail-overlay`)?.remove();
+            root.classList.remove(`${APP_ID}-cached-detail`);
+        }
+
+        for (const card of getJobCards().filter(isCachedJobCard)) {
+            card.classList.remove('active');
+        }
+    }
+
+    function handleLiveJobCardClick(event) {
+        const card = event.target instanceof Element ? event.target.closest('.job-card-wrap') : null;
+        if (!card || isCachedJobCard(card)) return;
+        clearCachedJobDetail();
+    }
+
+    function renderCachedJobDetail(record, detailHtml, message = '') {
+        const root = findDetailRoot();
+        if (!root) {
+            showToast('没有找到右侧职位详情区');
+            return false;
+        }
+
+        root.classList.add(`${APP_ID}-cached-detail`);
+        const overlay = getCachedDetailOverlay(root);
+        syncCachedDetailOverlayClass(root, overlay);
+        overlay.innerHTML = detailHtml && detailHtmlHasNativeHeader(detailHtml)
+            ? sanitizeCachedDetailHtml(detailHtml)
+            : buildCachedJobDetailFallback(record, message, root, detailHtml);
+        ensureIgnoreButton();
+        renderDetailCustomTags();
+        return true;
+    }
+
+    async function showCachedJobDetail(record) {
+        const id = normalizeSpace(record && record.id);
+        if (!id) return;
+
+        const latestRecord = state.jobCache.get(id) || record;
+        state.currentCachedDetailId = id;
+        setCachedJobActive(id);
+        let trustedDetailHtml = getTrustedCachedDetailHtml(latestRecord);
+        if (trustedDetailHtml && isDuplicateDetailForDifferentCachedJob(id, trustedDetailHtml)) {
+            trustedDetailHtml = '';
+        }
+        renderCachedJobDetail(latestRecord, trustedDetailHtml, trustedDetailHtml ? '' : '正在加载缓存职位详情...');
+        if (trustedDetailHtml) rememberCachedDetailSignature(id, trustedDetailHtml);
+
+        try {
+            const detailHtml = await fetchCachedJobDetailHtml(latestRecord, { forceNetwork: true });
+            if (!detailHtml) throw new Error('detail not found');
+            if (state.currentCachedDetailId !== id) return;
+            if (isDuplicateDetailForDifferentCachedJob(id, detailHtml)) throw new Error('duplicate stale detail');
+
+            const currentRecord = state.jobCache.get(id) || latestRecord;
+            state.jobCache.set(id, {
+                ...currentRecord,
+                detailHtml,
+                detailJobId: id,
+                detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION,
+                detailFetchedAt: Date.now()
+            });
+            saveJobCache();
+            renderCachedJobDetail(state.jobCache.get(id), detailHtml);
+            rememberCachedDetailSignature(id, detailHtml);
+        } catch (error) {
+            if (state.currentCachedDetailId === id && !trustedDetailHtml) {
+                renderCachedJobDetail(latestRecord, '', '缓存中没有完整职位详情，且原职位详情暂时无法加载。');
+            }
+        }
+    }
+
+    function renderFallbackCachedJobCard(card, record) {
+        card.textContent = '';
+
+        const body = appendTextElement(card, 'div', 'job-card-body clearfix', '');
+        const left = appendTextElement(body, 'a', 'job-card-left', '');
+        left.href = getCachedJobHref(record);
+
+        const titleRow = appendTextElement(left, 'div', 'job-title clearfix', '');
+        appendTextElement(titleRow, 'span', 'job-name', record.title || '缓存职位');
+        if (record.locationText) {
+            const areaWrapper = appendTextElement(titleRow, 'span', 'job-area-wrapper', '');
+            appendTextElement(areaWrapper, 'span', 'job-area', record.locationText);
+        }
+
+        const info = appendTextElement(left, 'div', 'job-info clearfix', '');
+        if (record.salaryText) appendTextElement(info, 'span', 'salary', record.salaryText);
+        const tags = appendTextElement(info, 'ul', 'tag-list', '');
+        replaceTagList(tags, record.tagTexts);
+
+        const right = appendTextElement(body, 'div', 'job-card-right', '');
+        const companyInfo = appendTextElement(right, 'div', 'company-info', '');
+        const companyName = appendTextElement(companyInfo, 'h3', 'company-name', '');
+        appendTextElement(companyName, 'span', '', record.company || '公司信息已缓存');
+        const meta = appendTextElement(companyInfo, 'ul', 'company-tag-list', '');
+        appendTextElement(meta, 'li', `${APP_ID}-cached-meta`, formatCachedJobAge(record.lastSeenAt));
+        if (record.activeTimeText) appendTextElement(meta, 'li', `${APP_ID}-active-badge`, record.activeTimeText);
+    }
+
+    function updateCachedCardLogo(card, record) {
+        const image = card.querySelector([
+            '.company-logo img',
+            '.company-img img',
+            '.company-info img',
+            '.boss-avatar img',
+            '.job-card-right img',
+            'img'
+        ].join(','));
+        if (!image) return false;
+
+        const logoSrc = normalizeSpace(record && record.logoSrc);
+        const logoHost = image.closest('.company-logo, .company-img, .boss-avatar') || image.parentElement;
+        let placeholder = logoHost?.querySelector(`.${APP_ID}-logo-placeholder`);
+        image.removeAttribute('srcset');
+        image.alt = normalizeSpace(record && record.company) || '公司 logo';
+        if (logoSrc) {
+            placeholder?.remove();
+            image.src = logoSrc;
+            image.setAttribute('data-src', logoSrc);
+            image.style.removeProperty('display');
+            image.style.removeProperty('visibility');
+            logoHost?.classList.remove(`${APP_ID}-empty-logo`);
+            return true;
+        }
+
+        image.removeAttribute('src');
+        image.removeAttribute('data-src');
+        image.style.display = 'none';
+        if (logoHost) {
+            if (!placeholder) {
+                placeholder = document.createElement('span');
+                placeholder.className = `${APP_ID}-logo-placeholder`;
+                placeholder.setAttribute('aria-hidden', 'true');
+                logoHost.appendChild(placeholder);
+            }
+            placeholder.textContent = '';
+            placeholder.dataset.initial = normalizeSpace(record && record.company).slice(0, 1) || '缓';
+            logoHost.classList.add(`${APP_ID}-empty-logo`);
+        }
+        return false;
+    }
+
+    function ensureCachedCardTemplate(card) {
+        if (card.dataset.bzjtNativeTemplate === '1') return;
+
+        const nativeCard = cloneNativeJobCardTemplate();
+        if (!nativeCard) return;
+
+        card.className = nativeCard.className;
+        card.innerHTML = nativeCard.innerHTML;
+        card.dataset.bzjtNativeTemplate = '1';
+    }
+
+    function updateNativeCachedJobCard(card, record) {
+        const href = getCachedJobHref(record);
+        card.querySelectorAll('a[href]').forEach((anchor) => {
+            anchor.href = href;
+            anchor.removeAttribute('target');
+            anchor.removeAttribute('rel');
+        });
+
+        replaceElementText(card.querySelector('.job-name'), record.title || '缓存职位');
+        replaceElementText(card.querySelector('.salary, .job-salary, [class*="salary"]'), record.salaryText);
+
+        const tagList = ensureCachedTagList(card);
+        replaceTagList(tagList, record.tagTexts);
+
+        const companyElement = card.querySelector('.boss-name, .company-name span, .company-name, [class*="company-name"]');
+        replaceElementText(companyElement, record.company || '公司信息已缓存');
+        updateCachedCardLogo(card, record);
+
+        const locationElement = card.querySelector('.job-area, .job-location, .company-location, [class*="job-area"], [class*="location"]');
+        replaceElementText(locationElement, record.locationText);
+
+        const metaHost = card.querySelector('.company-tag-list, .job-card-footer, .job-info') || card;
+        metaHost.querySelectorAll(`.${APP_ID}-cached-meta, .${APP_ID}-active-badge`).forEach((element) => element.remove());
+        const metaTagName = metaHost.matches('ul, ol') ? 'li' : 'span';
+        appendTextElement(metaHost, metaTagName, `${APP_ID}-cached-meta`, formatCachedJobAge(record.lastSeenAt));
+        if (record.activeTimeText) appendTextElement(metaHost, metaTagName, `${APP_ID}-active-badge`, record.activeTimeText);
+    }
+
+    function updateCachedJobCard(card, record) {
+        const signature = JSON.stringify({ render: 'native-card-v1', record });
+        if (card.dataset.cacheSignature === signature) return;
+
+        ensureCachedCardTemplate(card);
+        card.dataset.bzjtCachedId = record.id;
+        card.dataset.cacheSignature = signature;
+
+        if (card.dataset.bzjtNativeTemplate === '1') {
+            updateNativeCachedJobCard(card, record);
+        } else {
+            renderFallbackCachedJobCard(card, record);
+        }
+    }
+
+    function createCachedJobCard(record) {
+        const card = cloneNativeJobCardTemplate() || document.createElement('div');
+        if (!card.classList.contains(`${APP_ID}-cached-card`)) {
+            card.className = `job-card-wrap ${APP_ID}-cached-card`;
+        }
+        card.addEventListener('click', (event) => {
+            if (event.target instanceof Element && event.target.closest('button')) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const latestRecord = state.jobCache.get(card.dataset.bzjtCachedId) || record;
+            void showCachedJobDetail(latestRecord);
+        });
+        updateCachedJobCard(card, record);
+        return card;
+    }
+
+    function makeCacheableJobRecordFromCard(card) {
+        if (!card || isCachedJobCard(card)) return null;
+
+        const id = getJobIdFromCard(card);
+        if (!id) return null;
+
+        const cachedActiveTime = state.activeTimeCache.get(id);
+        const activeTimeText = getCardActiveTimeText(card) || cachedActiveTime?.text || '';
+        const activeRank = activeTimeText ? parseBossActiveTimeRank(activeTimeText) : cachedActiveTime?.rank;
+        const detailHtml = getCurrentDetailHtmlForCard(card);
+        return {
+            id,
+            title: getCardTitle(card),
+            company: getCardCompany(card),
+            salaryText: getCardSalaryText(card),
+            keywordText: getCardFilterKeywordText(card),
+            logoSrc: getCardLogoSrc(card),
+            tagTexts: getCardTagTexts(card),
+            locationText: getCardLocationText(card),
+            href: getJobHrefFromCard(card),
+            detailHtml,
+            ...(detailHtml ? { detailJobId: id } : {}),
+            activeTimeText,
+            ...(Number.isFinite(activeRank) ? { activeRank } : {})
+        };
+    }
+
+    function getJobCacheSignature(records) {
+        return JSON.stringify((Array.isArray(records) ? records : []).map((record) => [
+            record.id,
+            record.schemaVersion || '',
+            record.title || '',
+            record.company || '',
+            record.salaryText || '',
+            record.keywordText || '',
+            record.logoSrc || '',
+            JSON.stringify(record.tagTexts || []),
+            record.locationText || '',
+            record.expectationText || '',
+            record.href || '',
+            record.detailHtml || '',
+            record.detailJobId || '',
+            Number.isFinite(record.detailSchemaVersion) ? record.detailSchemaVersion : '',
+            record.activeTimeText || '',
+            Number.isFinite(record.activeRank) ? record.activeRank : ''
+        ]));
+    }
+
+    function cacheCurrentMatchingJobs() {
+        const now = Date.now();
+        const before = JSON.stringify(serializeRecordMap(state.jobCache));
+        state.jobCache = normalizeCachedJobRecords(state.jobCache, {
+            ...state.jobCacheSettings,
+            now,
+            requiredSchemaVersion: JOB_CACHE_SCHEMA_VERSION
+        });
+        if (!hasActiveJobExpectation()) {
+            const after = JSON.stringify(serializeRecordMap(state.jobCache));
+            if (after !== before) saveJobCache();
+            state.lastCacheSignature = '';
+            return;
+        }
+
+        const activeExpectationText = getActiveJobExpectationText();
+        const records = getLiveJobCards()
+            .filter((card) => {
+                const id = getJobIdFromCard(card);
+                return Boolean(id && !state.ignoredJobs.has(id) && !isCardHiddenByFilters(card));
+            })
+            .map(makeCacheableJobRecordFromCard)
+            .filter(Boolean)
+            .map((record) => ({
+                ...record,
+                schemaVersion: JOB_CACHE_SCHEMA_VERSION,
+                expectationText: activeExpectationText
+            }));
+        const signature = getJobCacheSignature(records);
+
+        if (records.length && signature !== state.lastCacheSignature) {
+            state.jobCache = mergeCachedJobRecords(state.jobCache, records, {
+                ...state.jobCacheSettings,
+                now,
+                requiredSchemaVersion: JOB_CACHE_SCHEMA_VERSION
+            });
+            state.lastCacheSignature = signature;
+        }
+
+        const after = JSON.stringify(serializeRecordMap(state.jobCache));
+        if (after !== before) saveJobCache();
+    }
+
+    function getCachedJobRecordsForRender() {
+        const activeExpectationText = getActiveJobExpectationText();
+        if (!activeExpectationText) return [];
+
+        const liveIds = new Set(getLiveJobCards().map(getJobIdFromCard).filter(Boolean));
+        return Array.from(state.jobCache.values())
+            .filter((record) => {
+                const filterRecord = {
+                    ...record,
+                    keywordText: normalizeSpace([
+                        record.keywordText,
+                        getCustomTagTextForJob(record.id)
+                    ].filter(Boolean).join(' '))
+                };
+                return record.id
+                    && record.schemaVersion === JOB_CACHE_SCHEMA_VERSION
+                    && record.expectationText === activeExpectationText
+                    && !liveIds.has(record.id)
+                    && !state.ignoredJobs.has(record.id)
+                    && !jobMatchesHiddenFilters(filterRecord, state.hiddenFilters);
+            })
+            .sort((left, right) => (Number(right.lastSeenAt) || 0) - (Number(left.lastSeenAt) || 0));
+    }
+
+    function markJobListUserScroll() {
+        state.lastJobListUserScrollAt = Date.now();
+    }
+
+    function handleJobListScrollKey(event) {
+        if (!event || event.defaultPrevented) return;
+        if (['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', ' '].includes(event.key)) {
+            markJobListUserScroll();
+        }
+    }
+
+    function scheduleCachedJobRenderAfterScroll(deferMs) {
+        const delayMs = Math.max(50, Math.ceil(Number(deferMs) || 0) + 50);
+        if (state.cachedRenderTimer) window.clearTimeout(state.cachedRenderTimer);
+
+        state.cachedRenderTimer = window.setTimeout(() => {
+            state.cachedRenderTimer = null;
+            renderCachedJobCards();
+        }, delayMs);
+    }
+
+    function clearCachedJobRenderTimer() {
+        if (!state.cachedRenderTimer) return;
+        window.clearTimeout(state.cachedRenderTimer);
+        state.cachedRenderTimer = null;
+    }
+
+    function renderCachedJobCards(options = {}) {
+        const deferMs = options.allowDuringScroll
+            ? 0
+            : getCachedRenderDeferDelay({
+                lastUserScrollAt: state.lastJobListUserScrollAt,
+                now: Date.now(),
+                idleMs: USER_SCROLL_RENDER_DEFER_MS
+            });
+        if (deferMs > 0) {
+            scheduleCachedJobRenderAfterScroll(deferMs);
+            return;
+        }
+        clearCachedJobRenderTimer();
+
+        const parent = getJobListParent();
+        if (!parent) return;
+
+        const desiredRecords = getCachedJobRecordsForRender();
+        const desiredIds = new Set(desiredRecords.map((record) => record.id));
+        const existingCards = new Map(
+            Array.from(parent.querySelectorAll(`.${APP_ID}-cached-card`))
+                .map((card) => [getJobIdFromCard(card), card])
+                .filter(([id]) => id)
+        );
+
+        for (const [id, card] of existingCards.entries()) {
+            if (!desiredIds.has(id)) card.remove();
+        }
+
+        const desiredCards = desiredRecords.map((record) => {
+            const card = existingCards.get(record.id) || createCachedJobCard(record);
+            updateCachedJobCard(card, record);
+            return card;
+        });
+
+        const currentCards = Array.from(parent.querySelectorAll(`.${APP_ID}-cached-card`))
+            .filter((card) => desiredIds.has(getJobIdFromCard(card)));
+        const alreadyOrdered = currentCards.length === desiredCards.length
+            && currentCards.every((card, index) => card === desiredCards[index]);
+        if (!alreadyOrdered) {
+            for (const card of desiredCards) parent.appendChild(card);
+        }
+        syncCachedJobScrollLayout(parent, desiredCards);
+    }
+
+    function getCachedJobScrollHost(parent) {
+        if (!parent) return null;
+
+        const candidates = [
+            parent.closest('.job-list-container'),
+            parent.closest('.job-list-box'),
+            parent.closest('.job-list-wrapper'),
+            parent.closest('.job-list'),
+            parent.parentElement,
+            parent
+        ].filter(Boolean);
+        const uniqueCandidates = candidates.filter((element, index, elements) => elements.indexOf(element) === index);
+
+        return uniqueCandidates.find((element) => {
+            if (!(element instanceof HTMLElement)) return false;
+            const style = getComputedStyle(element);
+            return element.clientHeight > 0
+                && (element.scrollHeight > element.clientHeight + 4 || style.overflowY !== 'visible');
+        }) || uniqueCandidates.find((element) => element instanceof HTMLElement && element.clientHeight > 0) || parent;
+    }
+
+    function syncCachedJobScrollLayout(parent, cachedCards) {
+        const cards = Array.isArray(cachedCards) ? cachedCards.filter(Boolean) : [];
+        const scrollHost = cards.length ? getCachedJobScrollHost(parent) : null;
+
+        for (const element of Array.from(document.querySelectorAll(`.${APP_ID}-cached-list-host`))) {
+            if (element !== parent) element.classList.remove(`${APP_ID}-cached-list-host`);
+        }
+        for (const element of Array.from(document.querySelectorAll(`.${APP_ID}-cached-scroll-host`))) {
+            if (element !== scrollHost) {
+                element.classList.remove(`${APP_ID}-cached-scroll-host`);
+                element.style.removeProperty('--bzjt-cache-extra-height');
+            }
+        }
+
+        if (!parent || !cards.length) {
+            parent?.classList.remove(`${APP_ID}-cached-list-host`);
+            return;
+        }
+
+        parent.classList.add(`${APP_ID}-cached-list-host`);
+        if (scrollHost) {
+            scrollHost.classList.add(`${APP_ID}-cached-scroll-host`);
+            const cachedHeight = cards.reduce((total, card) => {
+                const rect = card.getBoundingClientRect();
+                return total + (rect.height || card.offsetHeight || 0);
+            }, 0);
+            scrollHost.style.setProperty('--bzjt-cache-extra-height', `${Math.ceil(cachedHeight)}px`);
+        }
     }
 
     function getDetailActiveTimeText() {
@@ -1302,6 +2645,7 @@
                 <button type="button" class="${APP_ID}-show-all-btn">显示已忽略</button>
                 <button type="button" class="${APP_ID}-settings-btn" aria-expanded="false">设置</button>
                 <span class="${APP_ID}-status"></span>
+                <span class="${APP_ID}-version">v${SCRIPT_VERSION}</span>
                 <div class="${APP_ID}-settings-panel" hidden>
                     <label class="${APP_ID}-settings-field">
                         <span>职位忽略关键词</span>
@@ -1313,6 +2657,10 @@
                             <span class="${APP_ID}-settings-range-value"></span>
                         </span>
                         <input class="${APP_ID}-salary-range" type="range" min="0" max="100" step="5">
+                    </label>
+                    <label class="${APP_ID}-settings-field">
+                        <span>缓存保留天数</span>
+                        <input class="${APP_ID}-cache-ttl-input" type="number" min="${MIN_JOB_CACHE_TTL_DAYS}" max="${MAX_JOB_CACHE_TTL_DAYS}" step="1">
                     </label>
                 </div>
             `;
@@ -1338,8 +2686,19 @@
             panel.querySelector(`.${APP_ID}-salary-range`).addEventListener('input', () => {
                 commitSettingsFromPanel(panel);
             });
+            panel.querySelector(`.${APP_ID}-cache-ttl-input`).addEventListener('input', () => {
+                commitSettingsFromPanel(panel);
+            });
         }
         syncToolbarButtonStyle(toolbar, anchor);
+        let version = toolbar.querySelector(`.${APP_ID}-version`);
+        if (!version) {
+            version = document.createElement('span');
+            version.className = `${APP_ID}-version`;
+            const panel = toolbar.querySelector(`.${APP_ID}-settings-panel`);
+            toolbar.insertBefore(version, panel || null);
+        }
+        version.textContent = `v${SCRIPT_VERSION}`;
         toolbar.dataset.version = SCRIPT_VERSION;
 
         const next = anchor.nextSibling;
@@ -1388,12 +2747,16 @@
         const keywordsInput = panel.querySelector(`.${APP_ID}-keyword-input`);
         const salaryRange = panel.querySelector(`.${APP_ID}-salary-range`);
         const salaryValue = panel.querySelector(`.${APP_ID}-settings-range-value`);
+        const cacheTtlInput = panel.querySelector(`.${APP_ID}-cache-ttl-input`);
 
         if (keywordsInput && document.activeElement !== keywordsInput) {
             keywordsInput.value = state.hiddenFilters.keywords.join('\n');
         }
         if (salaryRange && document.activeElement !== salaryRange) {
             salaryRange.value = String(state.hiddenFilters.minSalaryMaxK);
+        }
+        if (cacheTtlInput && document.activeElement !== cacheTtlInput) {
+            cacheTtlInput.value = String(state.jobCacheSettings.ttlDays);
         }
         if (salaryValue) {
             salaryValue.textContent = state.hiddenFilters.minSalaryMaxK > 0
@@ -1405,11 +2768,18 @@
     function commitSettingsFromPanel(panel) {
         const keywordsInput = panel.querySelector(`.${APP_ID}-keyword-input`);
         const salaryRange = panel.querySelector(`.${APP_ID}-salary-range`);
+        const cacheTtlInput = panel.querySelector(`.${APP_ID}-cache-ttl-input`);
         state.hiddenFilters = normalizeHiddenFilterSettings({
             keywords: keywordsInput ? keywordsInput.value : '',
             minSalaryMaxK: salaryRange ? salaryRange.value : 0
         });
+        state.jobCacheSettings = normalizeJobCacheSettings({
+            ttlDays: cacheTtlInput ? cacheTtlInput.value : state.jobCacheSettings.ttlDays
+        });
         saveHiddenFilterSettings();
+        saveJobCacheSettings();
+        cacheCurrentMatchingJobs();
+        renderCachedJobCards();
         updateSettingsPanel();
         applyIgnoredJobs();
         void ensureActiveJobIsVisible();
@@ -2009,6 +3379,9 @@
         state.refreshTimer = null;
         installStyles();
         mountToolbar();
+        autoSelectDefaultJobExpectation();
+        cacheCurrentMatchingJobs();
+        renderCachedJobCards();
         applyIgnoredJobs();
         ensureIgnoreButton();
         ensureChatButtonsOpenInNewTabs();
@@ -2050,9 +3423,16 @@
         loadActiveTimeCache();
         loadHiddenFilterSettings();
         loadCustomTags();
+        loadJobCacheSettings();
+        loadJobCache();
         installStyles();
         registerMenus();
         installPageBridge();
+        document.addEventListener('wheel', markJobListUserScroll, { passive: true, capture: true });
+        document.addEventListener('touchmove', markJobListUserScroll, { passive: true, capture: true });
+        document.addEventListener('keydown', handleJobListScrollKey, true);
+        document.addEventListener('click', handleJobExpectationClick, true);
+        document.addEventListener('click', handleLiveJobCardClick, true);
         refreshUi();
         startObserver();
         window.setInterval(scheduleRefresh, 1500);

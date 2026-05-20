@@ -26,6 +26,7 @@ These notes capture the working pattern used for testing Tampermonkey userscript
 - Start a temporary read-only local HTTP server from the project directory, verify the `.user.js` URL with PowerShell `Invoke-WebRequest`, and record the server PID for cleanup.
 - Open the `.user.js` URL in a real browser new window through OS process launch, such as `msedge.exe --new-window http://localhost:17893/Script%20Name.user.js`. On this machine Edge is the available Chrome-compatible browser and may be controlled by the Codex "Chrome" extension backend.
 - Use Windows UI Automation only for protected extension UI that browser tools cannot access, especially Tampermonkey's Install/Update confirmation page.
+- Immediately before using Windows UI Automation to click Tampermonkey's `更新` / `Update` / `安装` / `Install` button, re-check that the local `.user.js` URL is still reachable with PowerShell `Invoke-WebRequest`, returns HTTP 200, and contains the expected `@version`. If the localhost server has exited or the version is wrong, restart or fix the server first; do not click the Tampermonkey confirmation button against a stale or unreachable script URL.
 - Prefer locating the Tampermonkey window and invoking a button by accessible name such as `更新`, `Update`, `安装`, or `Install`.
 - After invoking the button, confirm the Tampermonkey confirmation window closes or changes state. When practical, read the installed-scripts page with Windows UI Automation and verify the target script name and `@version`.
 - If accessible button invocation fails, use a narrowly targeted coordinate click based on the extension window bounds. Avoid full-desktop screenshots unless the user explicitly approves the privacy risk.
@@ -89,6 +90,7 @@ These notes capture the working pattern used for testing Tampermonkey userscript
   - start a temporary read-only localhost HTTP server from the project directory;
   - verify the `.user.js` URL with PowerShell `Invoke-WebRequest`;
   - open the local `.user.js` URL in a real browser new window, for example with `msedge.exe --new-window`;
+  - immediately before the Windows UI Automation confirmation click, verify the same local `.user.js` URL still returns HTTP 200 and the expected `@version`; restart the server first if it is no longer reachable;
   - use Windows UI Automation to click Tampermonkey's `更新` / `Update` / `安装` / `Install` button;
   - confirm the Tampermonkey install/update window closes or otherwise indicates completion;
   - when practical, verify the installed-scripts page lists the expected script name and version;
