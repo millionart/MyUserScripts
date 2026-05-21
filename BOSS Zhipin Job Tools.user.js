@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.52
+// @version      0.1.53
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -19,7 +19,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.52';
+    const SCRIPT_VERSION = '0.1.53';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -2332,6 +2332,30 @@
         state.cachedRenderTimer = null;
     }
 
+    function clearJobCaches() {
+        const activeTimeCount = state.activeTimeCache.size;
+        const jobCacheCount = state.jobCache.size;
+        if (!activeTimeCount && !jobCacheCount) {
+            showToast('\u5f53\u524d\u6ca1\u6709\u53ef\u6e05\u9664\u7684\u7f13\u5b58');
+            return;
+        }
+
+        state.activeTimeCache = new Map();
+        state.jobCache = new Map();
+        state.lastCacheSignature = '';
+        clearCachedJobRenderTimer();
+        clearCachedJobDetail();
+        saveActiveTimeCache();
+        saveJobCache();
+
+        for (const card of getJobCards()) {
+            renderCardActiveBadge(card, getCardActiveTimeText(card));
+        }
+        renderCachedJobCards({ allowDuringScroll: true });
+        updateToolbarStatus('');
+        showToast(`\u5df2\u6e05\u9664 ${jobCacheCount} \u6761\u804c\u4f4d\u7f13\u5b58\u548c ${activeTimeCount} \u6761\u6d3b\u8dc3\u7f13\u5b58`);
+    }
+
     function renderCachedJobCards(options = {}) {
         const deferMs = options.allowDuringScroll
             ? 0
@@ -2644,6 +2668,7 @@
                 <button type="button" class="${APP_ID}-sort-btn">按活跃排序</button>
                 <button type="button" class="${APP_ID}-show-all-btn">显示已忽略</button>
                 <button type="button" class="${APP_ID}-settings-btn" aria-expanded="false">设置</button>
+                <button type="button" class="${APP_ID}-clear-cache-btn">\u6e05\u9664\u7f13\u5b58</button>
                 <span class="${APP_ID}-status"></span>
                 <span class="${APP_ID}-version">v${SCRIPT_VERSION}</span>
                 <div class="${APP_ID}-settings-panel" hidden>
@@ -2676,6 +2701,12 @@
                 event.stopPropagation();
                 state.settingsOpen = !state.settingsOpen;
                 updateSettingsPanel();
+            });
+            toolbar.querySelector(`.${APP_ID}-clear-cache-btn`).addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!window.confirm('\u786e\u8ba4\u6e05\u9664\u804c\u4f4d\u7f13\u5b58\u548c\u6d3b\u8dc3\u65f6\u95f4\u7f13\u5b58\u5417\uff1f')) return;
+                clearJobCaches();
             });
 
             const panel = toolbar.querySelector(`.${APP_ID}-settings-panel`);

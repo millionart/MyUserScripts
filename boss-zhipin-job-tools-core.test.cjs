@@ -29,13 +29,26 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.52\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.52';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.53\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.53';/);
 });
 
 test('toolbar script buttons keep a readable minimum width', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     assert.match(script, /\.\$\{APP_ID\}-toolbar button \{[\s\S]*min-width:\s*var\(--bzjt-filter-min-width,\s*68px\);/);
+});
+
+test('toolbar exposes a clear-cache action next to settings and clears both cache stores', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(
+        script,
+        /class="\$\{APP_ID\}-settings-btn"[\s\S]*class="\$\{APP_ID\}-clear-cache-btn"[\s\S]*class="\$\{APP_ID\}-status"/
+    );
+    assert.match(script, /function clearJobCaches\(\) \{/);
+    assert.match(script, /state\.activeTimeCache = new Map\(\);/);
+    assert.match(script, /state\.jobCache = new Map\(\);/);
+    assert.match(script, /saveActiveTimeCache\(\);/);
+    assert.match(script, /saveJobCache\(\);/);
 });
 
 test('extracts BOSS Zhipin job ID from detail links', () => {
