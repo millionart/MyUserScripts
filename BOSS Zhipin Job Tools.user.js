@@ -2,15 +2,17 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.54
+// @version      0.1.69
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
 // @match        https://www.zhipin.com/web/geek/jobs*
+// @match        https://www.zhipin.com/job_detail/*
 // @run-at       document-idle
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // ==/UserScript==
@@ -19,13 +21,14 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.54';
+    const SCRIPT_VERSION = '0.1.69';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
     const CUSTOM_TAG_STORAGE_KEY = 'boss-zhipin-job-tools:custom-tags';
     const JOB_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache';
     const JOB_CACHE_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache-settings';
+    const JOB_DETAIL_RECOVERY_STORAGE_KEY = 'boss-zhipin-job-tools:detail-recovery-map';
     const PAGE_SORT_EVENT = `${APP_ID}:sort-job-list`;
     const PAGE_SORT_RESULT_EVENT = `${APP_ID}:sort-job-list-result`;
     const LOAD_MORE_SCROLL_PASSES = 6;
@@ -35,10 +38,14 @@
     const DEFAULT_JOB_CACHE_TTL_DAYS = 30;
     const MIN_JOB_CACHE_TTL_DAYS = 1;
     const MAX_JOB_CACHE_TTL_DAYS = 365;
-    const JOB_CACHE_SCHEMA_VERSION = 5;
-    const DETAIL_CACHE_SCHEMA_VERSION = 3;
+    const JOB_CACHE_SCHEMA_VERSION = 6;
+    const DETAIL_CACHE_SCHEMA_VERSION = 4;
+    const DETAIL_RECOVERY_TTL_MS = 6 * 60 * 60 * 1000;
     const EXPECTATION_CACHE_SETTLE_MS = 2500;
     const USER_SCROLL_RENDER_DEFER_MS = 700;
+    const DETAIL_PREFETCH_IDLE_MS = 900;
+    const DETAIL_PREFETCH_STEP_DELAY_MS = 220;
+    const DETAIL_PREFETCH_MAX_PER_PASS = 6;
     const DAY_MS = 24 * 60 * 60 * 1000;
     const DETAIL_ROOT_CONTAINER_SELECTOR = [
         '.job-detail-container',
@@ -75,7 +82,14 @@
         currentCachedDetailId: '',
         lastCachedDetailId: '',
         lastCachedDetailSignature: '',
-        chatNewTabHandlerInstalled: false
+        chatNewTabHandlerInstalled: false,
+        detailPrefetchTimer: null,
+        detailPrefetchRunning: false,
+        detailPrefetchSignature: '',
+        detailDebugPickerActive: false,
+        detailDebugPickerTarget: null,
+        detailDebugPickerOverlay: null,
+        jobCacheChangeListenerId: null
     };
 
     function normalizeSpace(value) {
@@ -104,6 +118,297 @@
         const text = String(href || '');
         const match = text.match(/\/job_detail\/([^/?#]+?)\.html(?:[?#]|$)/);
         return match ? match[1] : '';
+    }
+
+    function extractSecurityIdFromHref(href) {
+        const text = normalizeSpace(href);
+        if (!text) return '';
+        try {
+            return normalizeSpace(new URL(text, location.origin).searchParams.get('securityId'));
+        } catch (error) {
+            const match = text.match(/[?&]securityId=([^&#]+)/i);
+            return match ? normalizeSpace(decodeURIComponent(match[1])) : '';
+        }
+    }
+
+    function isStandaloneJobDetailPage() {
+        return /\/job_detail\/[^/?#]+\.html$/i.test(normalizeSpace(location.pathname));
+    }
+
+    function extractRecoverySourceJobIdFromLocation() {
+        const hash = normalizeSpace(location.hash).replace(/^#/, '');
+        if (!hash) return '';
+        const params = new URLSearchParams(hash);
+        return normalizeSpace(params.get(`${APP_ID}-source-id`));
+    }
+
+    function normalizeDetailRecoveryMap(stored, now = Date.now()) {
+        const source = stored && typeof stored === 'object' ? stored : {};
+        const entries = Object.entries(source)
+            .map(([key, value]) => {
+                const detailId = normalizeSpace(key);
+                const sourceId = normalizeSpace(value && value.sourceId);
+                const updatedAt = Number(value && value.updatedAt);
+                if (!detailId || !sourceId || !Number.isFinite(updatedAt)) return null;
+                if (updatedAt + DETAIL_RECOVERY_TTL_MS < now) return null;
+                return [detailId, { sourceId, updatedAt }];
+            })
+            .filter(Boolean);
+        return Object.fromEntries(entries);
+    }
+
+    function loadDetailRecoveryMap() {
+        return normalizeDetailRecoveryMap(safeGetValue(JOB_DETAIL_RECOVERY_STORAGE_KEY, {}));
+    }
+
+    function saveDetailRecoveryMap(map) {
+        safeSetValue(JOB_DETAIL_RECOVERY_STORAGE_KEY, normalizeDetailRecoveryMap(map));
+    }
+
+    function rememberDetailRecoverySource(record) {
+        const sourceId = normalizeSpace(record && record.id);
+        const detailId = extractJobIdFromHref(getCachedJobHref(record));
+        if (!sourceId || !detailId) return;
+
+        const recoveryMap = loadDetailRecoveryMap();
+        recoveryMap[detailId] = {
+            sourceId,
+            updatedAt: Date.now()
+        };
+        saveDetailRecoveryMap(recoveryMap);
+    }
+
+    function resolveStoredRecoverySourceJobId(detailId) {
+        const normalizedDetailId = normalizeSpace(detailId);
+        if (!normalizedDetailId) return '';
+        const recoveryMap = loadDetailRecoveryMap();
+        return normalizeSpace(recoveryMap[normalizedDetailId] && recoveryMap[normalizedDetailId].sourceId);
+    }
+
+    function resolveStandaloneRecoverySourceJobId(detailId) {
+        return extractRecoverySourceJobIdFromLocation()
+            || resolveStoredRecoverySourceJobId(detailId);
+    }
+
+    function getStandaloneDetailDebugInfo() {
+        const detailId = extractJobIdFromHref(location.href);
+        const recoverySourceIdFromHash = extractRecoverySourceJobIdFromLocation();
+        const recoverySourceIdFromStore = resolveStoredRecoverySourceJobId(detailId);
+        const resolvedSourceId = resolveStandaloneRecoverySourceJobId(detailId);
+        const matchedRecord = state.jobCache.get(resolvedSourceId || detailId) || null;
+        const root = findDetailRoot();
+        const detailHtmlText = normalizeSpace(matchedRecord && matchedRecord.detailHtml);
+
+        return {
+            scriptVersion: SCRIPT_VERSION,
+            cacheStorageKey: JOB_CACHE_STORAGE_KEY,
+            pageHref: location.href,
+            detailId,
+            recoverySourceIdFromHash,
+            recoverySourceIdFromStore,
+            resolvedSourceId,
+            hasDetailRoot: Boolean(root),
+            detailRootTextLength: normalizeSpace(root?.textContent || '').length,
+            matchedRecord: matchedRecord ? {
+                id: matchedRecord.id,
+                title: matchedRecord.title || '',
+                company: matchedRecord.company || '',
+                href: matchedRecord.href || '',
+                securityId: matchedRecord.securityId || '',
+                detailJobId: matchedRecord.detailJobId || '',
+                detailSchemaVersion: Number(matchedRecord.detailSchemaVersion) || 0,
+                hasDetailHtml: Boolean(detailHtmlText),
+                detailHtmlLength: detailHtmlText.length,
+                detailTextPreview: detailHtmlText.slice(0, 600),
+                hasDetailSnapshot: Boolean(matchedRecord.detailSnapshot),
+                detailSnapshot: matchedRecord.detailSnapshot || null,
+                lastSeenAt: Number(matchedRecord.lastSeenAt) || 0
+            } : null
+        };
+    }
+
+    async function copyTextToClipboard(text) {
+        const value = String(text || '');
+        if (!value) return false;
+
+        try {
+            if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                await navigator.clipboard.writeText(value);
+                return true;
+            }
+        } catch (error) {
+            // Fall through to legacy copy path.
+        }
+
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.setAttribute('readonly', 'readonly');
+        textarea.style.position = 'fixed';
+        textarea.style.top = '-9999px';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+
+        let copied = false;
+        try {
+            copied = document.execCommand('copy');
+        } catch (error) {
+            copied = false;
+        } finally {
+            textarea.remove();
+        }
+        return copied;
+    }
+
+    function ensureDetailDebugPickerOverlay() {
+        let overlay = state.detailDebugPickerOverlay;
+        if (overlay && overlay.isConnected) return overlay;
+
+        overlay = document.createElement('div');
+        overlay.className = `${APP_ID}-detail-debug-picker-overlay`;
+        overlay.hidden = true;
+        document.body.appendChild(overlay);
+        state.detailDebugPickerOverlay = overlay;
+        return overlay;
+    }
+
+    function updateDetailDebugPickerOverlay(target) {
+        const overlay = ensureDetailDebugPickerOverlay();
+        if (!(target instanceof Element)) {
+            overlay.hidden = true;
+            return;
+        }
+
+        const rect = target.getBoundingClientRect();
+        overlay.hidden = false;
+        overlay.style.left = `${Math.max(0, rect.left)}px`;
+        overlay.style.top = `${Math.max(0, rect.top)}px`;
+        overlay.style.width = `${Math.max(0, rect.width)}px`;
+        overlay.style.height = `${Math.max(0, rect.height)}px`;
+    }
+
+    function updateStandaloneDetailDebugPanel() {
+        renderStandaloneDetailDebugPanel();
+        renderGlobalPickerButton();
+    }
+
+    function stopStandaloneDetailElementPicker(showCancelledToast = false) {
+        if (!state.detailDebugPickerActive) {
+            updateDetailDebugPickerOverlay(null);
+            updateStandaloneDetailDebugPanel();
+            return;
+        }
+
+        state.detailDebugPickerActive = false;
+        state.detailDebugPickerTarget = null;
+        updateDetailDebugPickerOverlay(null);
+        document.removeEventListener('mousemove', handleStandaloneDetailPickerMove, true);
+        document.removeEventListener('click', handleStandaloneDetailPickerClick, true);
+        document.removeEventListener('keydown', handleStandaloneDetailPickerKeydown, true);
+        updateStandaloneDetailDebugPanel();
+        if (showCancelledToast) showToast('已退出元素拾取');
+    }
+
+    function getStandaloneDetailPickerTarget(event) {
+        const candidate = event.target instanceof Element ? event.target : null;
+        if (!candidate) return null;
+        if (candidate.closest(`.${APP_ID}-detail-debug-panel`)) return null;
+        if (candidate.closest(`.${APP_ID}-toast-host`)) return null;
+        return candidate;
+    }
+
+    function handleStandaloneDetailPickerMove(event) {
+        if (!state.detailDebugPickerActive) return;
+        const target = getStandaloneDetailPickerTarget(event);
+        state.detailDebugPickerTarget = target;
+        updateDetailDebugPickerOverlay(target);
+    }
+
+    async function handleStandaloneDetailPickerClick(event) {
+        if (!state.detailDebugPickerActive) return;
+        const target = getStandaloneDetailPickerTarget(event);
+        if (!target) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+
+        const copied = await copyTextToClipboard(target.outerHTML || '');
+        stopStandaloneDetailElementPicker(false);
+        showToast(copied ? '已复制所选元素 HTML' : '复制 HTML 失败');
+    }
+
+    function handleStandaloneDetailPickerKeydown(event) {
+        if (!state.detailDebugPickerActive) return;
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        stopStandaloneDetailElementPicker(true);
+    }
+
+    function startStandaloneDetailElementPicker() {
+        if (state.detailDebugPickerActive) {
+            stopStandaloneDetailElementPicker(true);
+            return;
+        }
+
+        state.detailDebugPickerActive = true;
+        state.detailDebugPickerTarget = null;
+        ensureDetailDebugPickerOverlay();
+        document.addEventListener('mousemove', handleStandaloneDetailPickerMove, true);
+        document.addEventListener('click', handleStandaloneDetailPickerClick, true);
+        document.addEventListener('keydown', handleStandaloneDetailPickerKeydown, true);
+        updateStandaloneDetailDebugPanel();
+        showToast('已进入元素拾取模式，左键点击复制 HTML，Esc 取消');
+    }
+
+    function renderGlobalPickerButton() {
+        let button = document.querySelector(`.${APP_ID}-picker-fab`);
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = `${APP_ID}-picker-fab`;
+            button.title = '选择元素复制 HTML';
+            button.setAttribute('aria-label', '选择元素复制 HTML');
+            const label = document.createElement('span');
+            label.className = `${APP_ID}-picker-fab-label`;
+            label.textContent = '</>';
+            button.appendChild(label);
+            button.addEventListener('click', startStandaloneDetailElementPicker);
+            document.body.appendChild(button);
+        }
+
+        button.classList.toggle(`${APP_ID}-picker-fab-active`, state.detailDebugPickerActive);
+        button.title = state.detailDebugPickerActive ? '退出元素拾取' : '选择元素复制 HTML';
+        button.setAttribute('aria-label', state.detailDebugPickerActive ? '退出元素拾取' : '选择元素复制 HTML');
+    }
+
+    function renderStandaloneDetailDebugPanel() {
+        const info = getStandaloneDetailDebugInfo();
+        let panel = document.querySelector(`.${APP_ID}-detail-debug-panel`);
+        if (!panel) {
+            panel = document.createElement('aside');
+            panel.className = `${APP_ID}-detail-debug-panel`;
+            document.body.appendChild(panel);
+        }
+
+        panel.textContent = '';
+        appendTextElement(panel, 'h3', `${APP_ID}-detail-debug-title`, '职位缓存调试');
+        const actions = document.createElement('div');
+        actions.className = `${APP_ID}-detail-debug-actions`;
+        panel.appendChild(actions);
+        const pickerButton = document.createElement('button');
+        pickerButton.type = 'button';
+        pickerButton.className = `${APP_ID}-detail-debug-button`;
+        if (state.detailDebugPickerActive) pickerButton.classList.add(`${APP_ID}-detail-debug-button-active`);
+        pickerButton.textContent = state.detailDebugPickerActive ? '退出拾取' : '选择元素复制 HTML';
+        pickerButton.addEventListener('click', startStandaloneDetailElementPicker);
+        actions.appendChild(pickerButton);
+        appendTextElement(panel, 'div', `${APP_ID}-detail-debug-meta`, `v${SCRIPT_VERSION}`);
+        const pre = document.createElement('pre');
+        pre.className = `${APP_ID}-detail-debug-pre`;
+        pre.textContent = JSON.stringify(info, null, 2);
+        panel.appendChild(pre);
     }
 
     function parseBossActiveTimeRank(text) {
@@ -150,6 +455,11 @@
     function getJobDataId(jobData) {
         if (!jobData || typeof jobData !== 'object') return '';
         return normalizeSpace(jobData.encryptJobId || jobData.jobId || jobData.id || '');
+    }
+
+    function getJobDataSecurityId(jobData) {
+        if (!jobData || typeof jobData !== 'object') return '';
+        return normalizeSpace(jobData.securityId || jobData.encryptId || '');
     }
 
     function normalizeBossSalaryDigits(text) {
@@ -303,6 +613,59 @@
             });
     }
 
+    function normalizeCachedDetailHtmlFragment(html) {
+        const sanitized = sanitizeCachedDetailHtml(html);
+        return sanitized
+            ? sanitized.replace(/\s*(<br\s*\/?>\s*){2,}/gi, '<br>')
+            : '';
+    }
+
+    function normalizeCachedDetailSnapshot(snapshot, fallbackRecord = null) {
+        if (!snapshot || typeof snapshot !== 'object') return null;
+
+        const normalized = {};
+        for (const field of [
+            'title',
+            'salaryText',
+            'company',
+            'locationText',
+            'recruiterName',
+            'recruiterTitle',
+            'recruiterActiveTimeText',
+            'addressText'
+        ]) {
+            const value = normalizeSpace(snapshot[field]);
+            if (value) normalized[field] = value;
+        }
+
+        const tagTexts = normalizeCachedJobTagTexts(snapshot.tagTexts);
+        if (tagTexts.length) normalized.tagTexts = tagTexts;
+
+        const keywordTexts = normalizeCachedJobTagTexts(snapshot.keywordTexts);
+        if (keywordTexts.length) normalized.keywordTexts = keywordTexts;
+
+        const descriptionHtml = normalizeCachedDetailHtmlFragment(snapshot.descriptionHtml);
+        if (descriptionHtml) normalized.descriptionHtml = descriptionHtml;
+
+        const companyDescriptionHtml = normalizeCachedDetailHtmlFragment(snapshot.companyDescriptionHtml);
+        if (companyDescriptionHtml) normalized.companyDescriptionHtml = companyDescriptionHtml;
+
+        if (!normalized.title && fallbackRecord) normalized.title = normalizeSpace(fallbackRecord.title);
+        if (!normalized.salaryText && fallbackRecord) normalized.salaryText = normalizeSpace(fallbackRecord.salaryText);
+        if (!normalized.company && fallbackRecord) normalized.company = normalizeSpace(fallbackRecord.company);
+        if (!normalized.locationText && fallbackRecord) normalized.locationText = normalizeSpace(fallbackRecord.locationText);
+        if ((!normalized.tagTexts || !normalized.tagTexts.length) && fallbackRecord) {
+            const fallbackTags = normalizeCachedJobTagTexts(fallbackRecord.tagTexts);
+            if (fallbackTags.length) normalized.tagTexts = fallbackTags;
+        }
+
+        if (!normalized.descriptionHtml && !normalized.companyDescriptionHtml && !normalized.addressText && !normalized.recruiterName) {
+            return null;
+        }
+
+        return normalized;
+    }
+
     function normalizeCachedJobRecord(key, record, now) {
         const id = normalizeSpace(key || (record && record.id));
         if (!id || !record || typeof record !== 'object') return null;
@@ -311,10 +674,13 @@
         const schemaVersion = Number(record.schemaVersion);
         if (Number.isFinite(schemaVersion)) normalized.schemaVersion = Math.trunc(schemaVersion);
 
-        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'securityId', 'detailHtml', 'detailJobId', 'activeTimeText']) {
             const value = normalizeSpace(record[field]);
             if (value) normalized[field] = value;
         }
+
+        const detailSnapshot = normalizeCachedDetailSnapshot(record.detailSnapshot, normalized);
+        if (detailSnapshot) normalized.detailSnapshot = detailSnapshot;
 
         const tagTexts = normalizeCachedJobTagTexts(record.tagTexts);
         if (tagTexts.length) normalized.tagTexts = tagTexts;
@@ -326,6 +692,9 @@
 
         const detailSchemaVersion = Number(record.detailSchemaVersion);
         if (Number.isFinite(detailSchemaVersion)) normalized.detailSchemaVersion = Math.trunc(detailSchemaVersion);
+
+        const detailFetchedAt = Number(record.detailFetchedAt);
+        if (Number.isFinite(detailFetchedAt)) normalized.detailFetchedAt = detailFetchedAt;
 
         const firstSeenAt = Number(record.firstSeenAt);
         const lastSeenAt = Number(record.lastSeenAt ?? record.seenAt ?? record.firstSeenAt);
@@ -371,10 +740,14 @@
                 lastSeenAt: now
             };
 
-        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'securityId', 'detailHtml', 'detailJobId', 'activeTimeText']) {
             const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
             if (value) next[field] = value;
         }
+
+            const detailSnapshot = normalizeCachedDetailSnapshot(record && record.detailSnapshot, next)
+                || normalizeCachedDetailSnapshot(existing.detailSnapshot, next);
+            if (detailSnapshot) next.detailSnapshot = detailSnapshot;
 
             const tagTexts = normalizeCachedJobTagTexts(record && record.tagTexts);
             const existingTagTexts = normalizeCachedJobTagTexts(existing.tagTexts);
@@ -392,8 +765,16 @@
         const existingDetailSchemaVersion = Number(existing.detailSchemaVersion);
         if (Number.isFinite(detailSchemaVersion)) {
             next.detailSchemaVersion = Math.trunc(detailSchemaVersion);
-        } else if (Number.isFinite(existingDetailSchemaVersion) && normalizeSpace(next.detailHtml)) {
+        } else if (Number.isFinite(existingDetailSchemaVersion) && (normalizeSpace(next.detailHtml) || next.detailSnapshot)) {
             next.detailSchemaVersion = Math.trunc(existingDetailSchemaVersion);
+        }
+
+        const detailFetchedAt = Number(record && record.detailFetchedAt);
+        const existingDetailFetchedAt = Number(existing.detailFetchedAt);
+        if (Number.isFinite(detailFetchedAt)) {
+            next.detailFetchedAt = detailFetchedAt;
+        } else if (Number.isFinite(existingDetailFetchedAt) && (normalizeSpace(next.detailHtml) || next.detailSnapshot)) {
+            next.detailFetchedAt = existingDetailFetchedAt;
         }
 
         const normalized = normalizeCachedJobRecord(id, next, now);
@@ -554,8 +935,71 @@
         });
     }
 
+    function getJobCacheStateSignature(cache = state.jobCache) {
+        return Array.from((cache instanceof Map ? cache : new Map()).entries())
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([id, record]) => [
+                id,
+                normalizeSpace(record && record.href),
+                normalizeSpace(record && record.securityId),
+                normalizeSpace(record && record.detailHtml),
+                JSON.stringify(record && record.detailSnapshot || null),
+                Number(record && record.detailSchemaVersion) || 0,
+                Number(record && record.lastSeenAt) || 0
+            ].join('|'))
+            .join('\n');
+    }
+
+    function syncJobCacheFromStorage() {
+        const before = getJobCacheStateSignature(state.jobCache);
+        loadJobCache();
+        const after = getJobCacheStateSignature(state.jobCache);
+        return after !== before;
+    }
+
     function saveJobCache() {
         safeSetValue(JOB_CACHE_STORAGE_KEY, serializeRecordMap(state.jobCache));
+    }
+
+    function updateCachedJobRecordPreservingListOrder(record) {
+        const id = normalizeSpace(record && record.id);
+        if (!id) return false;
+
+        const now = Date.now();
+        const existing = state.jobCache.get(id) || null;
+        const normalizedIncoming = normalizeCachedJobRecord(id, {
+            ...existing,
+            ...record,
+            id,
+            schemaVersion: JOB_CACHE_SCHEMA_VERSION,
+            firstSeenAt: Number.isFinite(Number(existing && existing.firstSeenAt))
+                ? Number(existing.firstSeenAt)
+                : Number(record && record.firstSeenAt),
+            lastSeenAt: Number.isFinite(Number(existing && existing.lastSeenAt))
+                ? Number(existing.lastSeenAt)
+                : Number(record && record.lastSeenAt)
+        }, now);
+        if (!normalizedIncoming) return false;
+
+        const before = existing ? JSON.stringify(existing) : '';
+        const after = JSON.stringify(normalizedIncoming);
+        if (before === after) return false;
+
+        state.jobCache.set(id, normalizedIncoming);
+        return true;
+    }
+
+    function watchJobCacheStorage() {
+        if (state.jobCacheChangeListenerId || typeof GM_addValueChangeListener !== 'function') return;
+        try {
+            state.jobCacheChangeListenerId = GM_addValueChangeListener(JOB_CACHE_STORAGE_KEY, (_key, _oldValue, _newValue, remote) => {
+                if (!remote) return;
+                if (syncJobCacheFromStorage()) scheduleRefresh();
+            });
+        } catch (error) {
+            console.warn(`[${APP_ID}] GM_addValueChangeListener failed`, error);
+            state.jobCacheChangeListenerId = null;
+        }
     }
 
     function addStyle(css) {
@@ -733,6 +1177,109 @@
                 display: inline-block;
                 margin-top: 10px;
                 color: #00a6a7;
+            }
+            .${APP_ID}-detail-debug-panel {
+                position: fixed;
+                top: 88px;
+                right: 24px;
+                z-index: 2147483645;
+                width: min(420px, calc(100vw - 32px));
+                max-height: calc(100vh - 120px);
+                overflow: auto;
+                padding: 14px 16px;
+                border: 1px solid rgba(65, 74, 96, 0.12);
+                border-radius: 12px;
+                background: rgba(255, 255, 255, 0.96);
+                color: #1f2d3d;
+                box-shadow: 0 18px 40px rgba(20, 29, 40, 0.18);
+                backdrop-filter: blur(8px);
+                box-sizing: border-box;
+            }
+            .${APP_ID}-detail-debug-title {
+                margin: 0 0 10px;
+                color: #1f2d3d;
+                font-size: 15px;
+                font-weight: 600;
+                line-height: 1.4;
+            }
+            .${APP_ID}-detail-debug-actions {
+                display: none;
+                gap: 8px;
+                margin: 0 0 10px;
+            }
+            .${APP_ID}-picker-fab {
+                position: fixed;
+                left: 18px;
+                bottom: 18px;
+                z-index: 2147483645;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 46px;
+                height: 46px;
+                border: 0;
+                border-radius: 999px;
+                background: #00bebd;
+                color: #fff;
+                box-shadow: 0 10px 28px rgba(20, 29, 40, 0.22);
+                cursor: pointer;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 14px;
+                line-height: 1;
+            }
+            .${APP_ID}-picker-fab:hover {
+                background: #00a6a7;
+            }
+            .${APP_ID}-picker-fab.${APP_ID}-picker-fab-active {
+                background: #f97316;
+            }
+            .${APP_ID}-picker-fab-label {
+                pointer-events: none;
+                transform: translateY(-1px);
+            }
+            .${APP_ID}-detail-debug-button {
+                appearance: none;
+                border: 0;
+                border-radius: 8px;
+                background: #00bebd;
+                color: #fff;
+                font: inherit;
+                font-size: 12px;
+                line-height: 1;
+                padding: 10px 12px;
+                cursor: pointer;
+            }
+            .${APP_ID}-detail-debug-button:hover {
+                background: #00a6a7;
+            }
+            .${APP_ID}-detail-debug-button.${APP_ID}-detail-debug-button-active {
+                background: #f97316;
+            }
+            .${APP_ID}-detail-debug-meta {
+                margin: 0 0 10px;
+                color: #6b7280;
+                font-size: 12px;
+                line-height: 1.5;
+            }
+            .${APP_ID}-detail-debug-pre {
+                margin: 0;
+                padding: 12px;
+                border-radius: 10px;
+                background: #f5f7fb;
+                color: #334155;
+                font-size: 12px;
+                line-height: 1.55;
+                white-space: pre-wrap;
+                word-break: break-word;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            }
+            .${APP_ID}-detail-debug-picker-overlay {
+                position: fixed;
+                z-index: 2147483644;
+                border: 2px solid #f97316;
+                background: rgba(249, 115, 22, 0.08);
+                pointer-events: none;
+                box-sizing: border-box;
             }
             .${APP_ID}-settings-panel {
                 position: absolute;
@@ -1585,6 +2132,22 @@
         }
     }
 
+    function getCachedJobRecoveryHref(record) {
+        const href = getCachedJobHref(record);
+        const sourceId = normalizeSpace(record && record.id);
+        if (!href || !sourceId) return href;
+
+        try {
+            const url = new URL(href, location.origin);
+            const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''));
+            hashParams.set(`${APP_ID}-source-id`, sourceId);
+            url.hash = hashParams.toString();
+            return url.href;
+        } catch (error) {
+            return href;
+        }
+    }
+
     function resolveDetailRootContainer(candidate) {
         if (!(candidate instanceof Element)) return null;
         return candidate.closest(DETAIL_ROOT_CONTAINER_SELECTOR) || candidate;
@@ -1648,6 +2211,450 @@
 
         const root = findDetailRoot();
         return root ? sanitizeCachedDetailHtml(root.innerHTML) : '';
+    }
+
+    function getCurrentDetailSnapshotForCard(card) {
+        const id = getJobIdFromCard(card);
+        const currentCard = getCurrentJobCard();
+        if (!id || !currentCard || getJobIdFromCard(currentCard) !== id) return null;
+
+        const root = findDetailRoot();
+        return root ? buildDetailSnapshotFromRoot(root, {
+            id,
+            title: getCardTitle(card),
+            company: getCardCompany(card),
+            salaryText: getCardSalaryText(card),
+            locationText: getCardLocationText(card),
+            tagTexts: getCardTagTexts(card)
+        }) : null;
+    }
+
+    function getCurrentDetailSecurityIdForCard(card) {
+        const id = getJobIdFromCard(card);
+        const currentCard = getCurrentJobCard();
+        if (!id || !currentCard || getJobIdFromCard(currentCard) !== id) return '';
+
+        const root = findDetailRoot();
+        const detailLink = root?.querySelector('a.more-job-btn[href*="securityId="], a[href*="/job_detail/"][href*="securityId="]');
+        return extractSecurityIdFromHref(detailLink?.getAttribute('href') || detailLink?.href || '');
+    }
+
+    function findLiveJobCardById(id) {
+        const targetId = normalizeSpace(id);
+        if (!targetId) return null;
+        return getLiveJobCards().find((card) => getJobIdFromCard(card) === targetId) || null;
+    }
+
+    function resolveLiveSecurityIdForRecord(record) {
+        const id = normalizeSpace(record && record.id);
+        if (!id) return '';
+        const liveCard = findLiveJobCardById(id);
+        if (!liveCard) return '';
+        const jobData = getCardJobData(liveCard);
+        return getJobDataSecurityId(jobData) || getCurrentDetailSecurityIdForCard(liveCard);
+    }
+
+    function ensureRecordSecurityId(record) {
+        const currentSecurityId = normalizeSpace(record && record.securityId);
+        if (currentSecurityId) return currentSecurityId;
+
+        const resolvedSecurityId = resolveLiveSecurityIdForRecord(record);
+        const id = normalizeSpace(record && record.id);
+        if (id && resolvedSecurityId) {
+            const latestRecord = state.jobCache.get(id) || record;
+            state.jobCache.set(id, {
+                ...latestRecord,
+                securityId: resolvedSecurityId
+            });
+            saveJobCache();
+        }
+        return resolvedSecurityId;
+    }
+
+    function getStandaloneDetailTagTexts(root) {
+        const scope = root || document;
+        return getTextListFromElements(scope.querySelectorAll([
+            '.job-detail-header .tag-list li',
+            '.job-detail-header .job-tags li',
+            '.job-detail-header .job-tags span',
+            '.job-detail-header .labels li',
+            '.job-detail-header .tag',
+            '.job-detail-header .label',
+            '.job-banner .tag-list li',
+            '.job-banner .job-tags span',
+            '.job-banner .tag',
+            '.job-card-left .tag-list li',
+            '.job-keyword-list li'
+        ].join(',')));
+    }
+
+    function getStandaloneDetailKeywordTexts(root) {
+        const scope = root || document;
+        return getTextListFromElements(scope.querySelectorAll('.job-keyword-list li'));
+    }
+
+    function cloneStandaloneBannerTags(root) {
+        const scope = root || document;
+        const nativeTags = scope.querySelector('.job-banner .job-tags');
+        if (nativeTags instanceof Element) return nativeTags.cloneNode(true);
+
+        const tagTexts = getStandaloneDetailTagTexts(scope);
+        if (!tagTexts.length) return null;
+
+        const tags = document.createElement('div');
+        tags.className = 'job-tags';
+        for (const value of tagTexts) {
+            appendTextElement(tags, 'span', '', value);
+        }
+        return tags;
+    }
+
+    function getStandaloneDetailLocationText(root) {
+        const scope = root || document;
+        const companyText = normalizeSpace(scope.querySelector('.job-detail-company .company-name, .sider-company .company-info a[title], .company-name')?.textContent || '');
+        return Array.from(scope.querySelectorAll([
+            '.job-banner .text-city',
+            '.job-detail-company .job-area',
+            '.job-detail-company [class*="location"]',
+            '.job-detail-header .job-area',
+            '.job-detail-header [class*="location"]',
+            '.location-address',
+            '.basic-infor .location'
+        ].join(',')) || [])
+            .map((element) => normalizeSpace(element.textContent))
+            .find((text) => text && text !== companyText && text.length <= 40) || '';
+    }
+
+    function findStandaloneDetailDescriptionSection(root) {
+        const sections = Array.from(root?.querySelectorAll('.job-detail-section') || []);
+        return sections.find((section) => normalizeSpace(section.textContent).includes('职位描述'))
+            || sections.find((section) => section.querySelector('.job-sec-text'))
+            || null;
+    }
+
+    function getStandaloneDetailDescriptionHtml(root) {
+        const descriptionSection = findStandaloneDetailDescriptionSection(root);
+        const content = descriptionSection?.querySelector('.job-sec-text') || descriptionSection;
+        return normalizeCachedDetailHtmlFragment(content?.innerHTML || '');
+    }
+
+    function getStandaloneRecruiterSnapshot(root) {
+        const scope = root || document;
+        return {
+            recruiterName: normalizeSpace(scope.querySelector('.job-boss-info .name')?.childNodes?.[0]?.textContent || scope.querySelector('.job-boss-info .name')?.textContent || ''),
+            recruiterTitle: normalizeSpace(scope.querySelector('.job-boss-info .boss-info-attr')?.textContent || ''),
+            recruiterActiveTimeText: normalizeSpace(scope.querySelector('.job-boss-info .boss-active-time')?.textContent || '')
+        };
+    }
+
+    function getStandaloneCompanyDescriptionHtml(root) {
+        const scope = root || document;
+        const companyDescription = scope.querySelector('.company-info-box .job-sec-text, .company-info-box .fold-text');
+        return normalizeCachedDetailHtmlFragment(companyDescription?.innerHTML || '');
+    }
+
+    function getStandaloneDetailAddressText(root) {
+        const scope = root || document;
+        return normalizeSpace(scope.querySelector('.company-address .location-address, .job-location .location-address, .job-address .location-address')?.textContent || '');
+    }
+
+    function buildDetailSnapshotFromRoot(root, fallbackRecord = {}) {
+        if (!(root instanceof Element || root instanceof DocumentFragment || root instanceof Document)) return null;
+
+        const title = normalizeSpace(root.querySelector('.job-banner .name h1, .job-primary .name h1, .job-detail-header .job-name, .job-detail-header h1, .job-name, h1')?.textContent || fallbackRecord.title || document.title);
+        const salaryText = normalizeSpace(root.querySelector('.job-banner .salary, .job-primary .salary, .job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]')?.textContent || fallbackRecord.salaryText || '');
+        const company = normalizeSpace(root.querySelector('.sider-company .company-info a[title], .job-detail-company .company-name, .company-info .company-name, .company-name, [class*="company-name"]')?.textContent || fallbackRecord.company || '');
+        const locationText = getStandaloneDetailLocationText(root) || normalizeSpace(fallbackRecord.locationText);
+        const tagTexts = getStandaloneDetailTagTexts(root);
+        const keywordTexts = getStandaloneDetailKeywordTexts(root);
+        const descriptionHtml = getStandaloneDetailDescriptionHtml(root);
+        const { recruiterName, recruiterTitle, recruiterActiveTimeText } = getStandaloneRecruiterSnapshot(root);
+        const companyDescriptionHtml = getStandaloneCompanyDescriptionHtml(root);
+        const addressText = getStandaloneDetailAddressText(root);
+
+        return normalizeCachedDetailSnapshot({
+            title,
+            salaryText,
+            company,
+            locationText,
+            tagTexts,
+            keywordTexts,
+            descriptionHtml,
+            recruiterName,
+            recruiterTitle,
+            recruiterActiveTimeText,
+            companyDescriptionHtml,
+            addressText
+        }, fallbackRecord);
+    }
+
+    function appendSnapshotTagSpans(parent, values) {
+        for (const value of normalizeCachedJobTagTexts(values)) {
+            appendTextElement(parent, 'span', '', value);
+        }
+    }
+
+    function appendSnapshotKeywordItems(parent, values) {
+        for (const value of normalizeCachedJobTagTexts(values)) {
+            appendTextElement(parent, 'li', '', value);
+        }
+    }
+
+    function buildCachedJobDetailHtmlFromSnapshot(snapshot, record = null) {
+        const normalized = normalizeCachedDetailSnapshot(snapshot, record);
+        if (!normalized) return '';
+
+        const wrapper = document.createElement('div');
+        const header = appendTextElement(wrapper, 'div', 'job-detail-header', '');
+        appendTextElement(header, 'div', 'job-name', normalized.title || '缓存职位');
+        if (normalized.salaryText) appendTextElement(header, 'span', 'salary', normalized.salaryText);
+
+        if (normalized.company || normalized.locationText) {
+            const company = appendTextElement(wrapper, 'div', 'job-detail-company', '');
+            if (normalized.company) appendTextElement(company, 'span', 'company-name', normalized.company);
+            if (normalized.locationText) appendTextElement(company, 'span', 'job-area', normalized.locationText);
+        }
+
+        if (normalized.tagTexts && normalized.tagTexts.length) {
+            const tags = document.createElement('div');
+            tags.className = 'job-tags';
+            appendSnapshotTagSpans(tags, normalized.tagTexts);
+            wrapper.appendChild(tags);
+        }
+
+        const section = appendTextElement(wrapper, 'div', 'job-detail-section', '');
+        const sectionHeader = appendTextElement(section, 'div', 'detail-content-header', '');
+        appendTextElement(sectionHeader, 'h3', '', '职位描述');
+        if (normalized.keywordTexts && normalized.keywordTexts.length) {
+            const keywordList = appendTextElement(section, 'ul', 'job-keyword-list', '');
+            appendSnapshotKeywordItems(keywordList, normalized.keywordTexts);
+        }
+        if (normalized.descriptionHtml) {
+            const description = document.createElement('div');
+            description.className = 'job-sec-text';
+            description.innerHTML = normalized.descriptionHtml;
+            section.appendChild(description);
+        }
+        if (normalized.recruiterName || normalized.recruiterTitle || normalized.recruiterActiveTimeText) {
+            const bossInfo = appendTextElement(section, 'div', 'job-boss-info', '');
+            const bossName = appendTextElement(bossInfo, 'h2', 'name', normalized.recruiterName || '');
+            if (normalized.recruiterActiveTimeText) appendTextElement(bossName, 'span', 'boss-active-time', normalized.recruiterActiveTimeText);
+            if (normalized.recruiterTitle) appendTextElement(bossInfo, 'div', 'boss-info-attr', normalized.recruiterTitle);
+        }
+
+        if (normalized.companyDescriptionHtml || normalized.addressText) {
+            const companySection = appendTextElement(wrapper, 'div', 'job-detail-section job-detail-company', '');
+            if (normalized.companyDescriptionHtml) {
+                const companyInfo = appendTextElement(companySection, 'div', 'detail-section-item company-info-box', '');
+                appendTextElement(companyInfo, 'h3', '', '公司介绍');
+                const description = document.createElement('div');
+                description.className = 'job-sec-text fold-text';
+                description.innerHTML = normalized.companyDescriptionHtml;
+                companyInfo.appendChild(description);
+            }
+            if (normalized.addressText) {
+                const address = appendTextElement(companySection, 'div', 'detail-section-item company-address', '');
+                appendTextElement(address, 'h3', '', '工作地址');
+                const location = appendTextElement(address, 'div', 'job-location', '');
+                appendTextElement(location, 'div', 'location-address', normalized.addressText);
+            }
+        }
+
+        return sanitizeCachedDetailHtml(wrapper.innerHTML);
+    }
+
+    function buildStandaloneDetailCaptureHtml(root, record) {
+        const wrapper = document.createElement('div');
+        const header = appendTextElement(wrapper, 'div', 'job-detail-header', '');
+        appendTextElement(header, 'div', 'job-name', record.title || '缓存职位');
+        if (record.salaryText) appendTextElement(header, 'span', 'salary', record.salaryText);
+
+        const company = appendTextElement(wrapper, 'div', 'job-detail-company', '');
+        if (record.company) appendTextElement(company, 'span', 'company-name', record.company);
+        if (record.locationText) appendTextElement(company, 'span', 'job-area', record.locationText);
+
+        const nativeTags = cloneStandaloneBannerTags();
+        if (nativeTags) wrapper.appendChild(nativeTags);
+
+        const descriptionSection = findStandaloneDetailDescriptionSection(root);
+        if (descriptionSection) {
+            wrapper.appendChild(descriptionSection.cloneNode(true));
+        } else {
+            const section = appendTextElement(wrapper, 'div', 'job-detail-section', '');
+            appendTextElement(section, 'h3', '', '职位描述');
+            appendTextElement(section, 'div', 'text', normalizeSpace(root?.textContent || ''));
+        }
+
+        const companyDetailSection = document.querySelector('.job-detail-company');
+        if (companyDetailSection) wrapper.appendChild(companyDetailSection.cloneNode(true));
+
+        return sanitizeCachedDetailHtml(wrapper.innerHTML);
+    }
+
+    function buildStandaloneJobDetailCacheRecord(root) {
+        const detailId = extractJobIdFromHref(location.href);
+        const recoverySourceId = resolveStandaloneRecoverySourceJobId(detailId);
+        const id = recoverySourceId || detailId;
+        const title = normalizeSpace(document.querySelector('.job-banner .name h1, .job-primary .name h1, .job-detail-header .job-name, .job-detail-header h1, .job-name, h1')?.textContent || document.title);
+        const salaryText = normalizeSpace(document.querySelector('.job-banner .salary, .job-primary .salary, .job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]')?.textContent || '');
+        const company = normalizeSpace(document.querySelector('.sider-company .company-info a[title], .job-detail-company .company-name, .company-info .company-name, .company-name, [class*="company-name"]')?.textContent || '');
+        const locationText = getStandaloneDetailLocationText(root);
+        const tagTexts = getStandaloneDetailTagTexts(root);
+        const detailHtml = buildStandaloneDetailCaptureHtml(root, {
+            title,
+            salaryText,
+            company,
+            locationText,
+            tagTexts
+        });
+        if (!id || !detailHtml) return null;
+        const securityId = extractSecurityIdFromHref(location.href)
+            || extractSecurityIdFromHref(root.querySelector('a.more-job-btn[href*="securityId="], a[href*="/job_detail/"][href*="securityId="]')?.href || '');
+
+        return {
+            id,
+            title,
+            company,
+            salaryText,
+            locationText,
+            tagTexts,
+            href: location.href,
+            securityId,
+            detailHtml,
+            detailJobId: id,
+            detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION
+        };
+    }
+
+    function getCachedDetailCaptureSignature(record) {
+        if (!record) return '';
+        return [
+            normalizeSpace(record.id),
+            normalizeSpace(record.href),
+            normalizeSpace(record.securityId),
+            normalizeSpace(record.title),
+            normalizeSpace(record.company),
+            normalizeSpace(record.salaryText),
+            normalizeSpace(record.locationText),
+            JSON.stringify(normalizeCachedJobTagTexts(record.tagTexts)),
+            normalizeSpace(record.detailHtml),
+            Number(record.detailSchemaVersion) || 0
+        ].join('|');
+    }
+
+    function buildStandaloneDetailCaptureHtml(root, record) {
+        const snapshot = buildDetailSnapshotFromRoot(root, record);
+        return buildCachedJobDetailHtmlFromSnapshot(snapshot, record);
+    }
+
+    function buildStandaloneJobDetailCacheRecord(root) {
+        const detailId = extractJobIdFromHref(location.href);
+        const recoverySourceId = resolveStandaloneRecoverySourceJobId(detailId);
+        const id = recoverySourceId || detailId;
+        const detailSnapshot = buildDetailSnapshotFromRoot(root, {}) || null;
+        const title = normalizeSpace(detailSnapshot && detailSnapshot.title);
+        const salaryText = normalizeSpace(detailSnapshot && detailSnapshot.salaryText);
+        const company = normalizeSpace(detailSnapshot && detailSnapshot.company);
+        const locationText = normalizeSpace(detailSnapshot && detailSnapshot.locationText);
+        const tagTexts = normalizeCachedJobTagTexts(detailSnapshot && detailSnapshot.tagTexts);
+        const detailHtml = buildCachedJobDetailHtmlFromSnapshot(detailSnapshot, {
+            title,
+            salaryText,
+            company,
+            locationText,
+            tagTexts
+        });
+        if (!id || !detailHtml) return null;
+        const securityId = extractSecurityIdFromHref(location.href)
+            || extractSecurityIdFromHref(root.querySelector('a.more-job-btn[href*="securityId="], a[href*="/job_detail/"][href*="securityId="]')?.href || '');
+
+        return {
+            id,
+            title,
+            company,
+            salaryText,
+            locationText,
+            tagTexts,
+            href: location.href,
+            securityId,
+            detailHtml,
+            detailSnapshot,
+            detailJobId: id,
+            detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION
+        };
+    }
+
+    function getCachedDetailCaptureSignature(record) {
+        if (!record) return '';
+        return [
+            normalizeSpace(record.id),
+            normalizeSpace(record.href),
+            normalizeSpace(record.securityId),
+            normalizeSpace(record.title),
+            normalizeSpace(record.company),
+            normalizeSpace(record.salaryText),
+            normalizeSpace(record.locationText),
+            JSON.stringify(normalizeCachedJobTagTexts(record.tagTexts)),
+            JSON.stringify(normalizeCachedDetailSnapshot(record.detailSnapshot, record) || null),
+            normalizeSpace(record.detailHtml),
+            Number(record.detailSchemaVersion) || 0
+        ].join('|');
+    }
+
+    function captureStandaloneJobDetail() {
+        const root = findDetailRoot();
+        if (!root) return false;
+
+        const record = buildStandaloneJobDetailCacheRecord(root);
+        if (!record) return false;
+
+        const before = getCachedDetailCaptureSignature(state.jobCache.get(record.id));
+        updateCachedJobRecordPreservingListOrder(record);
+        const afterRecord = state.jobCache.get(record.id);
+        const after = getCachedDetailCaptureSignature(afterRecord);
+        if (!after || after === before) return false;
+        saveJobCache();
+        renderStandaloneDetailDebugPanel();
+        return true;
+    }
+
+    function captureStandaloneJobDetailWhenReady() {
+        let resolved = false;
+        let observer = null;
+
+        const stop = () => {
+            if (observer) {
+                observer.disconnect();
+                observer = null;
+            }
+        };
+
+        const tryCapture = () => {
+            if (resolved) return true;
+            renderStandaloneDetailDebugPanel();
+            if (!captureStandaloneJobDetail()) return false;
+            resolved = true;
+            stop();
+            return true;
+        };
+
+        if (tryCapture()) return;
+
+        observer = new MutationObserver(() => {
+            if (tryCapture()) return;
+        });
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        for (const delay of [400, 1200, 2600, 5000]) {
+            window.setTimeout(() => {
+                if (!resolved) tryCapture();
+            }, delay);
+        }
+
+        window.setTimeout(stop, 12000);
     }
 
     function appendTagItems(list, values) {
@@ -1776,6 +2783,69 @@
         return cachedDetailHtmlMatchesRecord(record, record && record.detailHtml) ? record.detailHtml : '';
     }
 
+    function cachedDetailSnapshotMatchesRecord(record, snapshot) {
+        const normalized = normalizeCachedDetailSnapshot(snapshot, record);
+        if (!record || !normalized) return false;
+
+        const id = normalizeSpace(record.id);
+        const detailJobId = normalizeSpace(record.detailJobId);
+        if (detailJobId && (!id || detailJobId !== id)) return false;
+
+        const title = normalizeSpace(record.title);
+        const salary = normalizeSpace(record.salaryText);
+        if (title && normalized.title && normalized.title !== title) return false;
+        if (salary && normalized.salaryText && normalized.salaryText !== salary) return false;
+        return Boolean(normalized.descriptionHtml || normalized.companyDescriptionHtml || normalized.addressText || normalized.recruiterName);
+    }
+
+    function cachedDetailContentMatchesRecord(record, detailHtml) {
+        const html = normalizeSpace(detailHtml);
+        if (!record || !html) return false;
+        if ([
+            `${APP_ID}-cached-detail`,
+            `${APP_ID}-cache-tag`,
+            `${APP_ID}-cached-meta`,
+            `${APP_ID}-cached-detail-link`
+        ].some((marker) => String(detailHtml).includes(marker))) return false;
+        if (!detailHtmlHasNativeHeader(detailHtml)) return false;
+
+        const snapshot = normalizeCachedDetailSnapshot(record.detailSnapshot, record);
+        if (snapshot) {
+            const rebuilt = buildCachedJobDetailHtmlFromSnapshot(snapshot, record);
+            const rebuiltText = getPlainTextFromHtml(rebuilt);
+            const currentText = getPlainTextFromHtml(detailHtml);
+            if (rebuiltText && currentText && currentText.includes(snapshot.title || '') && currentText.includes(snapshot.company || '')) {
+                return true;
+            }
+        }
+
+        const id = normalizeSpace(record.id);
+        const detailJobId = normalizeSpace(record.detailJobId);
+        if (detailJobId && (!id || detailJobId !== id)) return false;
+
+        const text = getPlainTextFromHtml(detailHtml);
+        const title = normalizeSpace(record.title);
+        const salary = normalizeSpace(record.salaryText);
+        if (title) return text.includes(title);
+        return Boolean(salary && text.includes(salary));
+    }
+
+    function cachedDetailHtmlMatchesRecord(record, detailHtml) {
+        const schemaVersion = Number(record && record.detailSchemaVersion);
+        if (!Number.isFinite(schemaVersion) || schemaVersion < DETAIL_CACHE_SCHEMA_VERSION) return false;
+        return cachedDetailContentMatchesRecord(record, detailHtml)
+            || cachedDetailSnapshotMatchesRecord(record, record && record.detailSnapshot);
+    }
+
+    function getTrustedCachedDetailHtml(record) {
+        const snapshot = normalizeCachedDetailSnapshot(record && record.detailSnapshot, record);
+        if (cachedDetailSnapshotMatchesRecord(record, snapshot)) {
+            const rebuilt = buildCachedJobDetailHtmlFromSnapshot(snapshot, record);
+            if (rebuilt) return rebuilt;
+        }
+        return cachedDetailHtmlMatchesRecord(record, record && record.detailHtml) ? record.detailHtml : '';
+    }
+
     function getCachedDetailDescriptionSignature(detailHtml) {
         const template = document.createElement('template');
         template.innerHTML = String(detailHtml || '');
@@ -1808,7 +2878,22 @@
             || null;
     }
 
-    function createCachedDetailDescriptionSection(message = '', contentHtml = '') {
+    function appendCachedDetailRecoveryLink(section, record, contentHtml = '') {
+        const href = getCachedJobRecoveryHref(record);
+        if (!href) return;
+        if (!contentHtml) {
+            appendTextElement(section, 'div', `${APP_ID}-cached-detail-hint`, '可先打开原职位页面查看；页面加载出职位详情后，脚本会自动缓存，下次可直接在右侧显示。');
+        }
+        const link = appendTextElement(section, 'a', `${APP_ID}-cached-detail-link`, '打开原职位页面');
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.addEventListener('click', () => {
+            rememberDetailRecoverySource(record);
+        }, { capture: true });
+    }
+
+    function createCachedDetailDescriptionSection(record, message = '', contentHtml = '') {
         const section = document.createElement('div');
         section.className = 'job-detail-section';
         if (contentHtml) {
@@ -1818,6 +2903,7 @@
 
         appendTextElement(section, 'h3', '', '职位描述');
         appendTextElement(section, 'div', 'text', message || '正在加载缓存职位详情...');
+        appendCachedDetailRecoveryLink(section, record, contentHtml);
         return section;
     }
 
@@ -1871,15 +2957,15 @@
         }
     }
 
-    function appendCachedDetailDescription(root, message = '', contentHtml = '') {
-        const section = createCachedDetailDescriptionSection(message, contentHtml);
+    function appendCachedDetailDescription(root, record, message = '', contentHtml = '') {
+        const section = createCachedDetailDescriptionSection(record, message, contentHtml);
         root.appendChild(section);
         return section;
     }
 
-    function replaceCachedDetailDescription(root, message = '', contentHtml = '') {
+    function replaceCachedDetailDescription(root, record, message = '', contentHtml = '') {
         removeStaleCachedDetailSections(root);
-        appendCachedDetailDescription(root, message, contentHtml);
+        appendCachedDetailDescription(root, record, message, contentHtml);
     }
 
     function buildCachedJobDetailNativeShell(record, message = '', root = null, contentHtml = '') {
@@ -1892,7 +2978,7 @@
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
         replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), record.title || '缓存职位');
         replaceElementText(clone.querySelector('.job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]'), record.salaryText);
-        replaceCachedDetailDescription(clone, message, contentHtml);
+        replaceCachedDetailDescription(clone, record, message, contentHtml);
         return clone;
     }
 
@@ -1929,6 +3015,9 @@
 
         const href = getCachedJobHref(record);
         if (href) {
+            if (!contentHtml) {
+                appendTextElement(section, 'div', `${APP_ID}-cached-detail-hint`, '可先打开真实职位链接查看；页面加载出职位详情后，脚本会自动缓存，下次可直接在右侧显示。');
+            }
             const link = appendTextElement(section, 'a', `${APP_ID}-cached-detail-link`, '打开原职位页面');
             link.href = href;
             link.target = '_blank';
@@ -1938,18 +3027,110 @@
         return wrapper.innerHTML;
     }
 
+    function buildCachedJobDetailHtmlFromApiData(data) {
+        const jobInfo = data && data.zpData && data.zpData.jobInfo;
+        const brandComInfo = data && data.zpData && data.zpData.brandComInfo;
+        const description = String(jobInfo && jobInfo.postDescription || '').trim();
+        const skills = normalizeCachedJobTagTexts(jobInfo && jobInfo.showSkills);
+        const welfare = normalizeCachedJobTagTexts(brandComInfo && brandComInfo.labels);
+        if (!description && !skills.length && !welfare.length) return '';
+
+        const wrapper = document.createElement('div');
+        wrapper.className = `${APP_ID}-api-detail`;
+        const fragment = document.createDocumentFragment();
+
+        if (description) {
+            const section = document.createElement('section');
+            section.className = `${APP_ID}-api-detail-section`;
+            appendTextElement(section, 'h3', `${APP_ID}-api-detail-title`, '职位描述');
+            const content = document.createElement('div');
+            content.className = `${APP_ID}-api-detail-content`;
+            description.split(/\r?\n+/).map(normalizeSpace).filter(Boolean).forEach((line) => {
+                appendTextElement(content, 'p', '', line);
+            });
+            section.appendChild(content);
+            fragment.appendChild(section);
+        }
+
+        if (skills.length) {
+            const section = document.createElement('section');
+            section.className = `${APP_ID}-api-detail-section`;
+            appendTextElement(section, 'h3', `${APP_ID}-api-detail-title`, '技能要求');
+            const list = document.createElement('ul');
+            list.className = 'tag-list';
+            appendTagItems(list, skills);
+            section.appendChild(list);
+            fragment.appendChild(section);
+        }
+
+        if (welfare.length) {
+            const section = document.createElement('section');
+            section.className = `${APP_ID}-api-detail-section`;
+            appendTextElement(section, 'h3', `${APP_ID}-api-detail-title`, '职位亮点');
+            const list = document.createElement('ul');
+            list.className = 'tag-list';
+            appendTagItems(list, welfare);
+            section.appendChild(list);
+            fragment.appendChild(section);
+        }
+
+        wrapper.appendChild(fragment);
+        return sanitizeCachedDetailHtml(wrapper.innerHTML);
+    }
+
+    async function fetchCachedJobDetailHtmlViaApi(record) {
+        const securityId = ensureRecordSecurityId(record) || extractSecurityIdFromHref(getCachedJobHref(record));
+        if (!securityId) return '';
+
+        const apiUrl = new URL('/wapi/zpgeek/job/detail.json', location.origin);
+        apiUrl.searchParams.set('securityId', securityId);
+
+        const response = await fetch(apiUrl.toString(), {
+            credentials: 'include',
+            cache: 'no-store',
+            headers: {
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (/security-check\.html/i.test(String(response.url || ''))) throw new Error('security check redirect');
+
+        const data = await response.json();
+        if (!data || typeof data !== 'object') throw new Error('invalid boss detail response');
+        if (Number(data.code) !== 0) {
+            throw new Error(normalizeSpace(data.message) || `boss api ${data.code}`);
+        }
+
+        const detailHtml = buildCachedJobDetailHtmlFromApiData(data);
+        return cachedDetailContentMatchesRecord(record, detailHtml) ? detailHtml : '';
+    }
+
     async function fetchCachedJobDetailHtml(record, options = {}) {
         const trustedDetailHtml = getTrustedCachedDetailHtml(record);
         if (!options.forceNetwork && trustedDetailHtml) return trustedDetailHtml;
 
+        let apiError = null;
+        try {
+            const apiDetailHtml = await fetchCachedJobDetailHtmlViaApi(record);
+            if (apiDetailHtml) return apiDetailHtml;
+        } catch (error) {
+            apiError = error;
+            if (/security check redirect/i.test(String(error && error.message || error))) throw error;
+        }
+
         const href = getCachedJobHref(record);
-        if (!href) return '';
+        if (!href) {
+            if (apiError) throw apiError;
+            return '';
+        }
 
         const response = await fetch(href, {
             credentials: 'include',
             cache: 'no-store'
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (/security-check\.html/i.test(String(response.url || ''))) throw new Error('security check redirect');
 
         const text = await response.text();
         const doc = new DOMParser().parseFromString(text, 'text/html');
@@ -2023,6 +3204,7 @@
         const id = normalizeSpace(record && record.id);
         if (!id) return;
 
+        syncJobCacheFromStorage();
         const latestRecord = state.jobCache.get(id) || record;
         state.currentCachedDetailId = id;
         setCachedJobActive(id);
@@ -2204,10 +3386,13 @@
         const id = getJobIdFromCard(card);
         if (!id) return null;
 
+        const jobData = getCardJobData(card);
         const cachedActiveTime = state.activeTimeCache.get(id);
         const activeTimeText = getCardActiveTimeText(card) || cachedActiveTime?.text || '';
         const activeRank = activeTimeText ? parseBossActiveTimeRank(activeTimeText) : cachedActiveTime?.rank;
         const detailHtml = getCurrentDetailHtmlForCard(card);
+        const detailSnapshot = getCurrentDetailSnapshotForCard(card);
+        const securityId = getJobDataSecurityId(jobData) || getCurrentDetailSecurityIdForCard(card);
         return {
             id,
             title: getCardTitle(card),
@@ -2218,9 +3403,11 @@
             tagTexts: getCardTagTexts(card),
             locationText: getCardLocationText(card),
             href: getJobHrefFromCard(card),
+            securityId,
             detailHtml,
+            ...(detailSnapshot ? { detailSnapshot } : {}),
             ...(detailHtml ? { detailJobId: id } : {}),
-            ...(detailHtml ? { detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION } : {}),
+            ...((detailHtml || detailSnapshot) ? { detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION } : {}),
             activeTimeText,
             ...(Number.isFinite(activeRank) ? { activeRank } : {})
         };
@@ -2239,6 +3426,8 @@
             record.locationText || '',
             record.expectationText || '',
             record.href || '',
+            record.securityId || '',
+            JSON.stringify(record.detailSnapshot || null),
             record.detailHtml || '',
             record.detailJobId || '',
             Number.isFinite(record.detailSchemaVersion) ? record.detailSchemaVersion : '',
@@ -2288,6 +3477,134 @@
 
         const after = JSON.stringify(serializeRecordMap(state.jobCache));
         if (after !== before) saveJobCache();
+    }
+
+    function clearDetailPrefetchTimer() {
+        if (!state.detailPrefetchTimer) return;
+        window.clearTimeout(state.detailPrefetchTimer);
+        state.detailPrefetchTimer = null;
+    }
+
+    function getPendingDetailPrefetchCards() {
+        if (!hasActiveJobExpectation()) return [];
+        const activeExpectationText = getActiveJobExpectationText();
+        if (!activeExpectationText) return [];
+
+        return getLiveJobCards()
+            .filter((card) => {
+                const id = getJobIdFromCard(card);
+                if (!id || state.ignoredJobs.has(id) || isCardHiddenByFilters(card)) return false;
+                const record = state.jobCache.get(id);
+                return Boolean(record
+                    && record.schemaVersion === JOB_CACHE_SCHEMA_VERSION
+                    && record.expectationText === activeExpectationText
+                    && !getTrustedCachedDetailHtml(record));
+            });
+    }
+
+    function getDetailPrefetchSignature(cards) {
+        return JSON.stringify((Array.isArray(cards) ? cards : [])
+            .map((card) => normalizeSpace(getJobIdFromCard(card)))
+            .filter(Boolean));
+    }
+
+    function updateCachedJobDetailRecord(id, detailHtml) {
+        const targetId = normalizeSpace(id);
+        const trustedDetailHtml = normalizeSpace(detailHtml);
+        if (!targetId || !trustedDetailHtml) return false;
+
+        const existing = state.jobCache.get(targetId);
+        if (!existing) return false;
+        if (existing.detailHtml === trustedDetailHtml && Number(existing.detailSchemaVersion) === DETAIL_CACHE_SCHEMA_VERSION) return false;
+
+        state.jobCache.set(targetId, {
+            ...existing,
+            detailHtml: trustedDetailHtml,
+            detailJobId: targetId,
+            detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION,
+            detailFetchedAt: Date.now()
+        });
+        return true;
+    }
+
+    async function captureLiveJobDetailForCard(card) {
+        const id = normalizeSpace(getJobIdFromCard(card));
+        if (!id) return '';
+
+        const activeId = normalizeSpace(getJobIdFromCard(getCurrentJobCard()));
+        if (activeId !== id) {
+            const activated = await activateJobCard(card);
+            if (!activated) return '';
+        }
+
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+            await sleep(attempt === 0 ? 140 : DETAIL_PREFETCH_STEP_DELAY_MS);
+            const record = makeCacheableJobRecordFromCard(card);
+            const detailHtml = normalizeSpace(record && record.detailHtml);
+            if (detailHtml) return detailHtml;
+        }
+
+        return '';
+    }
+
+    async function prefetchMissingJobDetailsFromLiveCards() {
+        if (state.detailPrefetchRunning || state.scanning || state.currentCachedDetailId) return;
+
+        const cards = getPendingDetailPrefetchCards();
+        if (!cards.length) {
+            state.detailPrefetchSignature = '';
+            return;
+        }
+
+        state.detailPrefetchRunning = true;
+        const originalActiveId = normalizeSpace(getJobIdFromCard(getCurrentJobCard()));
+        const targetCards = cards.slice(0, DETAIL_PREFETCH_MAX_PER_PASS);
+        let changed = false;
+
+        try {
+            for (let index = 0; index < targetCards.length; index += 1) {
+                if (state.currentCachedDetailId) break;
+                const card = targetCards[index];
+                const id = normalizeSpace(getJobIdFromCard(card));
+                if (!id) continue;
+
+                updateToolbarStatus(`预抓职位描述 ${index + 1}/${targetCards.length}`);
+                const detailHtml = await captureLiveJobDetailForCard(card);
+                if (detailHtml) {
+                    changed = updateCachedJobDetailRecord(id, detailHtml) || changed;
+                }
+            }
+        } finally {
+            if (originalActiveId && !state.currentCachedDetailId) {
+                const originalCard = findJobCardById(originalActiveId);
+                if (originalCard && !isCachedJobCard(originalCard)) {
+                    await activateJobCard(originalCard).catch(() => {});
+                }
+            }
+
+            state.detailPrefetchRunning = false;
+            if (changed) {
+                saveJobCache();
+                renderCachedJobCards({ allowDuringScroll: true });
+            }
+            updateToolbarStatus('');
+        }
+    }
+
+    function scheduleDetailPrefetch() {
+        clearDetailPrefetchTimer();
+        const cards = getPendingDetailPrefetchCards();
+        const signature = getDetailPrefetchSignature(cards);
+        if (!signature) {
+            state.detailPrefetchSignature = '';
+            return;
+        }
+        if (signature === state.detailPrefetchSignature) return;
+        state.detailPrefetchSignature = signature;
+        state.detailPrefetchTimer = window.setTimeout(() => {
+            state.detailPrefetchTimer = null;
+            void prefetchMissingJobDetailsFromLiveCards();
+        }, DETAIL_PREFETCH_IDLE_MS);
     }
 
     function getCachedJobRecordsForRender() {
@@ -2352,7 +3669,9 @@
         state.activeTimeCache = new Map();
         state.jobCache = new Map();
         state.lastCacheSignature = '';
+        state.detailPrefetchSignature = '';
         clearCachedJobRenderTimer();
+        clearDetailPrefetchTimer();
         clearCachedJobDetail();
         saveActiveTimeCache();
         saveJobCache();
@@ -3422,6 +4741,7 @@
         autoSelectDefaultJobExpectation();
         cacheCurrentMatchingJobs();
         renderCachedJobCards();
+        scheduleDetailPrefetch();
         applyIgnoredJobs();
         ensureIgnoreButton();
         ensureChatButtonsOpenInNewTabs();
@@ -3458,14 +4778,16 @@
         });
     }
 
-    function init() {
+    function initJobListPage() {
         loadIgnoredJobs();
         loadActiveTimeCache();
         loadHiddenFilterSettings();
         loadCustomTags();
         loadJobCacheSettings();
         loadJobCache();
+        watchJobCacheStorage();
         installStyles();
+        renderGlobalPickerButton();
         registerMenus();
         installPageBridge();
         document.addEventListener('wheel', markJobListUserScroll, { passive: true, capture: true });
@@ -3473,9 +4795,33 @@
         document.addEventListener('keydown', handleJobListScrollKey, true);
         document.addEventListener('click', handleJobExpectationClick, true);
         document.addEventListener('click', handleLiveJobCardClick, true);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            if (syncJobCacheFromStorage()) scheduleRefresh();
+        });
+        window.addEventListener('focus', () => {
+            if (syncJobCacheFromStorage()) scheduleRefresh();
+        });
         refreshUi();
         startObserver();
         window.setInterval(scheduleRefresh, 1500);
+    }
+
+    function initStandaloneJobDetailPage() {
+        installStyles();
+        loadJobCacheSettings();
+        loadJobCache();
+        renderGlobalPickerButton();
+        renderStandaloneDetailDebugPanel();
+        captureStandaloneJobDetailWhenReady();
+    }
+
+    function init() {
+        if (isStandaloneJobDetailPage()) {
+            initStandaloneJobDetailPage();
+            return;
+        }
+        initJobListPage();
     }
 
     if (document.readyState === 'loading') {

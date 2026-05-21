@@ -29,8 +29,14 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.54\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.54';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.69\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.69';/);
+});
+
+test('userscript metadata also matches standalone Boss job detail pages', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /\/\/ @match\s+https:\/\/www\.zhipin\.com\/job_detail\/\*/);
+    assert.match(script, /function isStandaloneJobDetailPage\(\)/);
 });
 
 test('toolbar script buttons keep a readable minimum width', () => {
@@ -370,6 +376,7 @@ test('merges current matching jobs into cache while preserving first seen time',
             locationText: '上海',
             expectationText: '技术美术(上海)',
             href: '/job_detail/a.html',
+            securityId: 'sec-a',
             detailHtml: '<section>新详情</section>',
             detailJobId: 'a',
             detailSchemaVersion: 3,
@@ -402,6 +409,7 @@ test('merges current matching jobs into cache while preserving first seen time',
             locationText: '上海',
             expectationText: '技术美术(上海)',
             href: '/job_detail/a.html',
+            securityId: 'sec-a',
             detailHtml: '<section>新详情</section>',
             detailJobId: 'a',
             detailSchemaVersion: 3,
@@ -431,6 +439,7 @@ test('merges cached job detail schema version when detail html is available', ()
             id: 'detail-a',
             title: 'cache detail',
             href: '/job_detail/detail-a.html',
+            securityId: 'detail-security-id',
             detailHtml: '<section>职位描述</section>',
             detailJobId: 'detail-a',
             detailSchemaVersion: 3
@@ -445,6 +454,7 @@ test('merges cached job detail schema version when detail html is available', ()
         schemaVersion: JOB_CACHE_SCHEMA_VERSION,
         title: 'cache detail',
         href: '/job_detail/detail-a.html',
+        securityId: 'detail-security-id',
         detailHtml: '<section>职位描述</section>',
         detailJobId: 'detail-a',
         detailSchemaVersion: 3,
@@ -457,7 +467,7 @@ test('userscript renders cached jobs into the live list and exposes cache ttl se
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     assert.match(script, /const JOB_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache';/);
     assert.match(script, /const JOB_CACHE_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:job-cache-settings';/);
-    assert.match(script, /const JOB_CACHE_SCHEMA_VERSION = 5;/);
+    assert.match(script, /const JOB_CACHE_SCHEMA_VERSION = 6;/);
     assert.match(script, /jobCacheSettings: \{ ttlDays: DEFAULT_JOB_CACHE_TTL_DAYS \}/);
     assert.match(script, /function cacheCurrentMatchingJobs\(\)/);
     assert.match(script, /function renderCachedJobCards\(options = \{\}\)/);
@@ -571,13 +581,19 @@ test('userscript wraps partial cached detail html with a native detail header sh
     const fallbackBody = script.slice(fallbackStart, fallbackEnd);
     const renderBody = script.slice(renderStart, renderEnd);
     assert.match(script, /function detailHtmlHasNativeHeader\(html\)/);
+    assert.match(script, /function appendCachedDetailRecoveryLink\(section, record, contentHtml = ''\)/);
     assert.match(script, /function buildCachedJobDetailNativeShell\(record, message = '', root = null, contentHtml = ''\)/);
+    assert.match(script, /function appendCachedDetailDescription\(root, record, message = '', contentHtml = ''\)/);
+    assert.match(script, /function replaceCachedDetailDescription\(root, record, message = '', contentHtml = ''\)/);
     assert.match(script, /const clone = root\.cloneNode\(true\)/);
     assert.match(script, /clone\.classList\.remove\(`\$\{APP_ID\}-cached-detail`\)/);
     assert.match(script, /replaceElementText\(clone\.querySelector\('\.job-detail-header \.job-name, \.job-detail-header h1, h1, \.job-name'\), record\.title \|\| '缓存职位'\)/);
     assert.match(script, /replaceElementText\(clone\.querySelector\('\.job-detail-header \.salary, \.job-detail-header \.job-salary, \.salary, \.job-salary, \[class\*="salary"\]'\), record\.salaryText\)/);
+    assert.match(script, /replaceCachedDetailDescription\(clone, record, message, contentHtml\)/);
     assert.match(fallbackBody, /const nativeShell = buildCachedJobDetailNativeShell\(record, message, root, contentHtml\)/);
     assert.match(fallbackBody, /if \(nativeShell\) return nativeShell\.outerHTML/);
+    assert.match(fallbackBody, /appendTextElement\(section, 'div', `\$\{APP_ID\}-cached-detail-hint`, '可先打开真实职位链接查看；页面加载出职位详情后，脚本会自动缓存，下次可直接在右侧显示。'\)/);
+    assert.match(fallbackBody, /appendTextElement\(section, 'a', `\$\{APP_ID\}-cached-detail-link`, '打开原职位页面'\)/);
     assert.match(fallbackBody, /content\.innerHTML = sanitizeCachedDetailHtml\(contentHtml\)/);
     assert.match(renderBody, /detailHtmlHasNativeHeader\(detailHtml\)/);
     assert.match(renderBody, /buildCachedJobDetailFallback\(record, message, root, detailHtml\)/);
@@ -592,14 +608,14 @@ test('userscript replaces stale native detail body when switching cached jobs', 
     const shellBody = script.slice(shellStart, shellEnd);
 
     assert.match(script, /function removeStaleCachedDetailSections\(root\)/);
-    assert.match(script, /function createCachedDetailDescriptionSection\(message = '', contentHtml = ''\)/);
-    assert.match(script, /function appendCachedDetailDescription\(root, message = '', contentHtml = ''\)/);
-    assert.match(script, /function replaceCachedDetailDescription\(root, message = '', contentHtml = ''\)/);
-    assert.match(shellBody, /replaceCachedDetailDescription\(clone, message, contentHtml\)/);
+    assert.match(script, /function createCachedDetailDescriptionSection\(record, message = '', contentHtml = ''\)/);
+    assert.match(script, /function appendCachedDetailDescription\(root, record, message = '', contentHtml = ''\)/);
+    assert.match(script, /function replaceCachedDetailDescription\(root, record, message = '', contentHtml = ''\)/);
+    assert.match(shellBody, /replaceCachedDetailDescription\(clone, record, message, contentHtml\)/);
     assert.match(script, /const headerContainer = header\?\.closest\('\.job-detail-header'\) \|\| header/);
     assert.match(script, /岗位职责\|岗位要求\|任职要求/);
     assert.match(script, /section\.remove\(\)/);
-    assert.match(script, /appendCachedDetailDescription\(root, message, contentHtml\)/);
+    assert.match(script, /appendCachedDetailDescription\(root, record, message, contentHtml\)/);
 });
 
 test('userscript ignores stale async cached detail responses after switching jobs', () => {
@@ -628,7 +644,7 @@ test('userscript only trusts cached detail html tagged for the same job', () => 
     assert.match(script, /function cachedDetailContentMatchesRecord\(record, detailHtml\)/);
     assert.match(script, /function getTrustedCachedDetailHtml\(record\)/);
     assert.match(script, /detailJobId/);
-    assert.match(script, /const DETAIL_CACHE_SCHEMA_VERSION = 3/);
+    assert.match(script, /const DETAIL_CACHE_SCHEMA_VERSION = 4/);
     assert.match(script, /detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION/);
     assert.match(script, /schemaVersion < DETAIL_CACHE_SCHEMA_VERSION/);
     assert.match(script, /`\$\{APP_ID\}-cached-detail`/);
@@ -638,7 +654,7 @@ test('userscript only trusts cached detail html tagged for the same job', () => 
     assert.match(script, /duplicate stale detail/);
     assert.match(script, /detailJobId && \(!id \|\| detailJobId !== id\)/);
     assert.match(script, /if \(title\) return text\.includes\(title\)/);
-    assert.match(script, /return cachedDetailContentMatchesRecord\(record, detailHtml\) \? detailHtml : ''/);
+    assert.match(script, /return cachedDetailContentMatchesRecord\(record, detailHtml\)\s*\|\|\s*cachedDetailSnapshotMatchesRecord\(record, record && record\.detailSnapshot\)/);
     assert.match(showBody, /let trustedDetailHtml = getTrustedCachedDetailHtml\(latestRecord\)/);
     assert.match(showBody, /renderCachedJobDetail\(latestRecord, trustedDetailHtml, trustedDetailHtml \? '' : '正在加载缓存职位详情\.\.\.'\)/);
     assert.match(showBody, /fetchCachedJobDetailHtml\(latestRecord, \{ forceNetwork: true \}\)/);
@@ -654,7 +670,54 @@ test('userscript stores detail schema version alongside captured live detail htm
     assert.notEqual(end, -1);
     const body = script.slice(start, end);
 
-    assert.match(body, /detailHtml,\s*\.\.\.\(detailHtml \? \{ detailJobId: id \} : \{\}\),\s*\.\.\.\(detailHtml \? \{ detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION \} : \{\}\)/s);
+    assert.match(body, /const detailSnapshot = getCurrentDetailSnapshotForCard\(card\)/);
+    assert.match(body, /detailHtml,/);
+    assert.match(body, /\.\.\.\(detailSnapshot \? \{ detailSnapshot \} : \{\}\)/);
+    assert.match(body, /\.\.\.\(\(detailHtml \|\| detailSnapshot\) \? \{ detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION \} : \{\}\)/);
+});
+
+test('userscript caches live job security ids for later detail api fetches', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function extractSecurityIdFromHref\(href\)/);
+    assert.match(script, /function getJobDataSecurityId\(jobData\)/);
+    assert.match(script, /function getCurrentDetailSecurityIdForCard\(card\)/);
+    assert.match(script, /function findLiveJobCardById\(id\)/);
+    assert.match(script, /function resolveLiveSecurityIdForRecord\(record\)/);
+    assert.match(script, /function ensureRecordSecurityId\(record\)/);
+    assert.match(script, /const securityId = getJobDataSecurityId\(jobData\) \|\| getCurrentDetailSecurityIdForCard\(card\)/);
+    assert.match(script, /const securityId = ensureRecordSecurityId\(record\) \|\| extractSecurityIdFromHref\(getCachedJobHref\(record\)\)/);
+    assert.match(script, /saveJobCache\(\);/);
+});
+
+test('userscript prefetches missing live job details before they fall out of the list cache', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /const DETAIL_PREFETCH_IDLE_MS = 900;/);
+    assert.match(script, /const DETAIL_PREFETCH_MAX_PER_PASS = 6;/);
+    assert.match(script, /detailPrefetchTimer: null/);
+    assert.match(script, /detailPrefetchRunning: false/);
+    assert.match(script, /function getPendingDetailPrefetchCards\(\)/);
+    assert.match(script, /function updateCachedJobDetailRecord\(id, detailHtml\)/);
+    assert.match(script, /async function captureLiveJobDetailForCard\(card\)/);
+    assert.match(script, /async function prefetchMissingJobDetailsFromLiveCards\(\)/);
+    assert.match(script, /function scheduleDetailPrefetch\(\)/);
+    assert.match(script, /updateToolbarStatus\(`预抓职位描述 \$\{index \+ 1\}\/\$\{targetCards.length\}`\)/);
+    assert.match(script, /scheduleDetailPrefetch\(\);/);
+});
+
+test('userscript treats security-check redirects as failed cached detail fetches', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /security-check\\.html/i);
+    assert.match(script, /throw new Error\('security check redirect'\)/);
+});
+
+test('userscript prefers boss detail json api before falling back to cached detail html fetch', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /async function fetchCachedJobDetailHtmlViaApi\(record\)/);
+    assert.match(script, /\/wapi\/zpgeek\/job\/detail\.json/);
+    assert.match(script, /apiUrl\.searchParams\.set\('securityId', securityId\)/);
+    assert.match(script, /'X-Requested-With': 'XMLHttpRequest'/);
+    assert.match(script, /jobInfo && jobInfo\.postDescription/);
+    assert.match(script, /const apiDetailHtml = await fetchCachedJobDetailHtmlViaApi\(record\)/);
 });
 
 test('userscript cached cards preserve logo, visible cache tag, and specific cache age text', () => {
@@ -693,8 +756,8 @@ test('userscript does not reflow cached cards while the user is scrolling the li
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     const renderStart = script.indexOf('function renderCachedJobCards(');
     const renderEnd = script.indexOf('function getCachedJobScrollHost(parent)', renderStart);
-    const initStart = script.indexOf('function init()');
-    const initEnd = script.indexOf("if (document.readyState === 'loading')", initStart);
+    const initStart = script.indexOf('function initJobListPage()');
+    const initEnd = script.indexOf('function initStandaloneJobDetailPage()', initStart);
     assert.notEqual(renderStart, -1);
     assert.notEqual(renderEnd, -1);
     assert.notEqual(initStart, -1);
@@ -712,6 +775,161 @@ test('userscript does not reflow cached cards while the user is scrolling the li
     assert.match(initBody, /document\.addEventListener\('wheel', markJobListUserScroll, \{ passive: true, capture: true \}\)/);
     assert.doesNotMatch(script, /overscroll-behavior-y:\s*contain/);
     assert.doesNotMatch(script, /scroll-behavior:\s*smooth/);
+});
+
+test('userscript captures standalone job detail pages into cache through a separate init path', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    const initStart = script.indexOf('function init()');
+    const initEnd = script.indexOf("if (document.readyState === 'loading')", initStart);
+    assert.notEqual(initStart, -1);
+    assert.notEqual(initEnd, -1);
+
+    const initBody = script.slice(initStart, initEnd);
+    assert.match(script, /function buildStandaloneJobDetailCacheRecord\(root\)/);
+    assert.match(script, /function extractRecoverySourceJobIdFromLocation\(\)/);
+    assert.match(script, /function resolveStoredRecoverySourceJobId\(detailId\)/);
+    assert.match(script, /function resolveStandaloneRecoverySourceJobId\(detailId\)/);
+    assert.match(script, /function findStandaloneDetailDescriptionSection\(root\)/);
+    assert.match(script, /function buildStandaloneDetailCaptureHtml\(root, record\)/);
+    assert.match(script, /function getStandaloneDetailDebugInfo\(\)/);
+    assert.match(script, /function renderStandaloneDetailDebugPanel\(\)/);
+    assert.match(script, /function captureStandaloneJobDetail\(\)/);
+    assert.match(script, /function captureStandaloneJobDetailWhenReady\(\)/);
+    assert.match(script, /function updateCachedJobRecordPreservingListOrder\(record\)/);
+    assert.match(script, /function initStandaloneJobDetailPage\(\)/);
+    assert.match(script, /extractJobIdFromHref\(location\.href\)/);
+    assert.match(script, /const recoverySourceId = resolveStandaloneRecoverySourceJobId\(detailId\)/);
+    assert.match(script, /const id = recoverySourceId \|\| detailId/);
+    assert.match(script, /href:\s*location\.href,/);
+    assert.match(script, /detailJobId:\s*id,/);
+    assert.match(script, /detailSchemaVersion:\s*DETAIL_CACHE_SCHEMA_VERSION/);
+    assert.match(script, /const before = getCachedDetailCaptureSignature\(state\.jobCache\.get\(record\.id\)\)/);
+    assert.match(script, /updateCachedJobRecordPreservingListOrder\(record\);/);
+    assert.match(script, /saveJobCache\(\);/);
+    assert.match(script, /renderStandaloneDetailDebugPanel\(\);/);
+    assert.match(script, /observer\.observe\(document\.body, \{\s*childList:\s*true,\s*subtree:\s*true\s*\}\);/s);
+    assert.match(initBody, /if \(isStandaloneJobDetailPage\(\)\) \{\s*initStandaloneJobDetailPage\(\);\s*return;\s*\}/s);
+    assert.match(initBody, /initJobListPage\(\);/);
+});
+
+test('standalone detail capture rebuilds native header and description from real job detail page structure', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /document\.querySelector\('\.job-banner \.name h1, \.job-primary \.name h1/);
+    assert.match(script, /document\.querySelector\('\.job-banner \.salary, \.job-primary \.salary/);
+    assert.match(script, /document\.querySelector\('\.sider-company \.company-info a\[title\]/);
+    assert.match(script, /\.job-banner \.job-tags span/);
+    assert.match(script, /\.job-keyword-list li/);
+    assert.match(script, /function cloneStandaloneBannerTags\(root\)/);
+    assert.match(script, /const nativeTags = scope\.querySelector\('\.job-banner \.job-tags'\)/);
+    assert.match(script, /nativeTags\.cloneNode\(true\)/);
+    assert.match(script, /appendTextElement\(wrapper, 'div', 'job-detail-header', ''\)/);
+    assert.match(script, /appendTextElement\(header, 'div', 'job-name', record\.title \|\| '缓存职位'\)/);
+    assert.match(script, /appendTextElement\(header, 'span', 'salary', record\.salaryText\)/);
+    assert.match(script, /cloneStandaloneBannerTags\(/);
+    assert.match(script, /if \(nativeTags\) wrapper\.appendChild\(nativeTags\)/);
+    assert.match(script, /const descriptionSection = findStandaloneDetailDescriptionSection\(root\)/);
+    assert.match(script, /wrapper\.appendChild\(descriptionSection\.cloneNode\(true\)\)/);
+});
+
+test('structured detail snapshots are extracted and stored alongside cached detail html', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /const JOB_CACHE_SCHEMA_VERSION = 6;/);
+    assert.match(script, /const DETAIL_CACHE_SCHEMA_VERSION = 4;/);
+    assert.match(script, /function normalizeCachedDetailSnapshot\(snapshot, fallbackRecord = null\)/);
+    assert.match(script, /function buildDetailSnapshotFromRoot\(root, fallbackRecord = \{\}\)/);
+    assert.match(script, /function buildCachedJobDetailHtmlFromSnapshot\(snapshot, record = null\)/);
+    assert.match(script, /detailSnapshot,/);
+    assert.match(script, /const detailSnapshot = getCurrentDetailSnapshotForCard\(card\)/);
+    assert.match(script, /hasDetailSnapshot:\s*Boolean\(matchedRecord\.detailSnapshot\)/);
+    assert.match(script, /detailSnapshot:\s*matchedRecord\.detailSnapshot \|\| null/);
+    assert.match(script, /function cachedDetailSnapshotMatchesRecord\(record, snapshot\)/);
+});
+
+test('standalone detail pages render a debug panel with cache mapping details', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-panel \{/);
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-pre \{/);
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-button \{/);
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-picker-overlay \{/);
+    assert.match(script, /const detailId = extractJobIdFromHref\(location\.href\)/);
+    assert.match(script, /const recoverySourceIdFromHash = extractRecoverySourceJobIdFromLocation\(\)/);
+    assert.match(script, /const recoverySourceIdFromStore = resolveStoredRecoverySourceJobId\(detailId\)/);
+    assert.match(script, /const matchedRecord = state\.jobCache\.get\(resolvedSourceId \|\| detailId\) \|\| null/);
+    assert.match(script, /cacheStorageKey:\s*JOB_CACHE_STORAGE_KEY/);
+    assert.match(script, /detailTextPreview:\s*detailHtmlText\.slice\(0,\s*600\)/);
+    assert.match(script, /appendTextElement\(panel, 'h3', `\$\{APP_ID\}-detail-debug-title`, '职位缓存调试'\)/);
+    assert.match(script, /pre\.textContent = JSON\.stringify\(info, null, 2\)/);
+});
+
+test('standalone detail debug panel can pick an element and copy its html to clipboard', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function copyTextToClipboard\(text\)/);
+    assert.match(script, /navigator\.clipboard && typeof navigator\.clipboard\.writeText === 'function'/);
+    assert.match(script, /document\.execCommand\('copy'\)/);
+    assert.match(script, /function startStandaloneDetailElementPicker\(\)/);
+    assert.match(script, /function stopStandaloneDetailElementPicker\(showCancelledToast = false\)/);
+    assert.match(script, /function handleStandaloneDetailPickerMove\(event\)/);
+    assert.match(script, /function handleStandaloneDetailPickerClick\(event\)/);
+    assert.match(script, /function handleStandaloneDetailPickerKeydown\(event\)/);
+    assert.match(script, /if \(event\.key !== 'Escape'\) return;/);
+    assert.match(script, /const target = getStandaloneDetailPickerTarget\(event\)/);
+    assert.match(script, /const copied = await copyTextToClipboard\(target\.outerHTML \|\| ''\)/);
+    assert.match(script, /function renderGlobalPickerButton\(\)/);
+    assert.match(script, /\.\$\{APP_ID\}-picker-fab \{/);
+    assert.match(script, /\.\$\{APP_ID\}-picker-fab-label \{/);
+    assert.match(script, /label\.textContent = '<\/>'/);
+    assert.match(script, /button\.classList\.toggle\(`\$\{APP_ID\}-picker-fab-active`, state\.detailDebugPickerActive\)/);
+    assert.match(script, /renderGlobalPickerButton\(\);/);
+    assert.match(script, /pickerButton\.textContent = state\.detailDebugPickerActive \? '退出拾取' : '选择元素复制 HTML'/);
+    assert.match(script, /pickerButton\.addEventListener\('click', startStandaloneDetailElementPicker\)/);
+});
+
+test('userscript recovery links preserve the source cached job id for standalone detail capture', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /const JOB_DETAIL_RECOVERY_STORAGE_KEY = 'boss-zhipin-job-tools:detail-recovery-map';/);
+    assert.match(script, /const DETAIL_RECOVERY_TTL_MS = 6 \* 60 \* 60 \* 1000;/);
+    assert.match(script, /function normalizeDetailRecoveryMap\(stored, now = Date\.now\(\)\)/);
+    assert.match(script, /function rememberDetailRecoverySource\(record\)/);
+    assert.match(script, /function getCachedJobRecoveryHref\(record\)/);
+    assert.match(script, /hashParams\.set\(`\$\{APP_ID\}-source-id`, sourceId\)/);
+    assert.match(script, /const href = getCachedJobRecoveryHref\(record\)/);
+    assert.match(script, /rememberDetailRecoverySource\(record\);/);
+    assert.match(script, /link\.addEventListener\('click', \(\) => \{/);
+});
+
+test('job list pages watch cache storage updates without reordering cached records by refresh time', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /\/\/ @grant\s+GM_addValueChangeListener/);
+    assert.match(script, /function watchJobCacheStorage\(\)/);
+    assert.match(script, /GM_addValueChangeListener\(JOB_CACHE_STORAGE_KEY,/);
+    assert.match(script, /if \(!remote\) return;/);
+    assert.match(script, /if \(syncJobCacheFromStorage\(\)\) scheduleRefresh\(\);/);
+    assert.match(script, /watchJobCacheStorage\(\);/);
+    assert.match(script, /lastSeenAt: Number\.isFinite\(Number\(existing && existing\.lastSeenAt\)\)/);
+    assert.match(script, /firstSeenAt: Number\.isFinite\(Number\(existing && existing\.firstSeenAt\)\)/);
+});
+
+test('userscript reloads cached job storage after returning from standalone detail tabs', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    const showStart = script.indexOf('async function showCachedJobDetail(record)');
+    const showEnd = script.indexOf('function renderFallbackCachedJobCard(card, record)', showStart);
+    const initStart = script.indexOf('function initJobListPage()');
+    const initEnd = script.indexOf('function initStandaloneJobDetailPage()', initStart);
+    assert.notEqual(showStart, -1);
+    assert.notEqual(showEnd, -1);
+    assert.notEqual(initStart, -1);
+    assert.notEqual(initEnd, -1);
+
+    const showBody = script.slice(showStart, showEnd);
+    const initBody = script.slice(initStart, initEnd);
+    assert.match(script, /function getJobCacheStateSignature\(cache = state\.jobCache\)/);
+    assert.match(script, /function syncJobCacheFromStorage\(\)/);
+    assert.match(script, /loadJobCache\(\);/);
+    assert.match(showBody, /syncJobCacheFromStorage\(\);/);
+    assert.match(initBody, /document\.addEventListener\('visibilitychange', \(\) => \{/);
+    assert.match(initBody, /if \(document\.hidden\) return;/);
+    assert.match(initBody, /window\.addEventListener\('focus', \(\) => \{/);
+    assert.match(initBody, /if \(syncJobCacheFromStorage\(\)\) scheduleRefresh\(\);/);
 });
 
 test('userscript only collects cached jobs after a job expectation is active', () => {
@@ -790,8 +1008,8 @@ test('javascript chat routes are diverted to a new tab without changing current 
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     const bridgeStart = script.indexOf('function installPageBridge()');
     const bridgeEnd = script.indexOf('function getJobCards()', bridgeStart);
-    const initStart = script.indexOf('function init()');
-    const initEnd = script.indexOf("if (document.readyState === 'loading')", initStart);
+    const initStart = script.indexOf('function initJobListPage()');
+    const initEnd = script.indexOf('function initStandaloneJobDetailPage()', initStart);
     assert.notEqual(bridgeStart, -1);
     assert.notEqual(bridgeEnd, -1);
     assert.notEqual(initStart, -1);

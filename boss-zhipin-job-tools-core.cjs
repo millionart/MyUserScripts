@@ -1,7 +1,7 @@
 const DEFAULT_JOB_CACHE_TTL_DAYS = 30;
 const MIN_JOB_CACHE_TTL_DAYS = 1;
 const MAX_JOB_CACHE_TTL_DAYS = 365;
-const JOB_CACHE_SCHEMA_VERSION = 5;
+const JOB_CACHE_SCHEMA_VERSION = 6;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CACHE_RENDER_SCROLL_IDLE_MS = 700;
 
@@ -91,6 +91,11 @@ function getActiveTimeTextFromJobData(jobData) {
 function getJobDataId(jobData) {
     if (!jobData || typeof jobData !== 'object') return '';
     return normalizeSpace(jobData.encryptJobId || jobData.jobId || jobData.id || '');
+}
+
+function getJobDataSecurityId(jobData) {
+    if (!jobData || typeof jobData !== 'object') return '';
+    return normalizeSpace(jobData.securityId || jobData.encryptId || '');
 }
 
 function normalizeBossSalaryDigits(text) {
@@ -252,7 +257,7 @@ function normalizeCachedJobRecord(key, record, now) {
     const schemaVersion = Number(record.schemaVersion);
     if (Number.isFinite(schemaVersion)) normalized.schemaVersion = Math.trunc(schemaVersion);
 
-    for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+    for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'securityId', 'detailHtml', 'detailJobId', 'activeTimeText']) {
         const value = normalizeSpace(record[field]);
         if (value) normalized[field] = value;
     }
@@ -312,7 +317,7 @@ function mergeCachedJobRecords(cached, currentRecords, options = {}) {
             lastSeenAt: now
         };
 
-        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'securityId', 'detailHtml', 'detailJobId', 'activeTimeText']) {
             const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
             if (value) next[field] = value;
         }
