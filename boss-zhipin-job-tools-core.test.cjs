@@ -29,8 +29,8 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.53\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.53';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.54\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.54';/);
 });
 
 test('toolbar script buttons keep a readable minimum width', () => {
@@ -371,6 +371,8 @@ test('merges current matching jobs into cache while preserving first seen time',
             expectationText: '技术美术(上海)',
             href: '/job_detail/a.html',
             detailHtml: '<section>新详情</section>',
+            detailJobId: 'a',
+            detailSchemaVersion: 3,
             activeTimeText: '刚刚活跃',
             activeRank: 0
         },
@@ -401,6 +403,8 @@ test('merges current matching jobs into cache while preserving first seen time',
             expectationText: '技术美术(上海)',
             href: '/job_detail/a.html',
             detailHtml: '<section>新详情</section>',
+            detailJobId: 'a',
+            detailSchemaVersion: 3,
             activeTimeText: '刚刚活跃',
             activeRank: 0,
             firstSeenAt: now - 2 * 86400000,
@@ -417,6 +421,35 @@ test('merges current matching jobs into cache while preserving first seen time',
             firstSeenAt: now,
             lastSeenAt: now
         }
+    });
+});
+
+test('merges cached job detail schema version when detail html is available', () => {
+    const now = Date.UTC(2026, 4, 20);
+    const merged = mergeCachedJobRecords({}, [
+        {
+            id: 'detail-a',
+            title: 'cache detail',
+            href: '/job_detail/detail-a.html',
+            detailHtml: '<section>职位描述</section>',
+            detailJobId: 'detail-a',
+            detailSchemaVersion: 3
+        }
+    ], {
+        now,
+        ttlDays: 30
+    });
+
+    assert.deepEqual(serializeRecordMap(merged)['detail-a'], {
+        id: 'detail-a',
+        schemaVersion: JOB_CACHE_SCHEMA_VERSION,
+        title: 'cache detail',
+        href: '/job_detail/detail-a.html',
+        detailHtml: '<section>职位描述</section>',
+        detailJobId: 'detail-a',
+        detailSchemaVersion: 3,
+        firstSeenAt: now,
+        lastSeenAt: now
     });
 });
 
@@ -611,6 +644,17 @@ test('userscript only trusts cached detail html tagged for the same job', () => 
     assert.match(showBody, /fetchCachedJobDetailHtml\(latestRecord, \{ forceNetwork: true \}\)/);
     assert.match(showBody, /detailJobId: id/);
     assert.match(showBody, /if \(state\.currentCachedDetailId === id && !trustedDetailHtml\) \{/);
+});
+
+test('userscript stores detail schema version alongside captured live detail html', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    const start = script.indexOf('function makeCacheableJobRecordFromCard(card)');
+    const end = script.indexOf('function getJobCacheSignature(records)', start);
+    assert.notEqual(start, -1);
+    assert.notEqual(end, -1);
+    const body = script.slice(start, end);
+
+    assert.match(body, /detailHtml,\s*\.\.\.\(detailHtml \? \{ detailJobId: id \} : \{\}\),\s*\.\.\.\(detailHtml \? \{ detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION \} : \{\}\)/s);
 });
 
 test('userscript cached cards preserve logo, visible cache tag, and specific cache age text', () => {

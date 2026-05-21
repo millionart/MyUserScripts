@@ -312,10 +312,10 @@ function mergeCachedJobRecords(cached, currentRecords, options = {}) {
             lastSeenAt: now
         };
 
-            for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
-                const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
-                if (value) next[field] = value;
-            }
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+            const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
+            if (value) next[field] = value;
+        }
 
             const tagTexts = normalizeCachedJobTagTexts(record && record.tagTexts);
             const existingTagTexts = normalizeCachedJobTagTexts(existing.tagTexts);
@@ -327,6 +327,14 @@ function mergeCachedJobRecords(cached, currentRecords, options = {}) {
             next.activeRank = activeRank;
         } else if (Number.isFinite(existingActiveRank)) {
             next.activeRank = existingActiveRank;
+        }
+
+        const detailSchemaVersion = Number(record && record.detailSchemaVersion);
+        const existingDetailSchemaVersion = Number(existing.detailSchemaVersion);
+        if (Number.isFinite(detailSchemaVersion)) {
+            next.detailSchemaVersion = Math.trunc(detailSchemaVersion);
+        } else if (Number.isFinite(existingDetailSchemaVersion) && normalizeSpace(next.detailHtml)) {
+            next.detailSchemaVersion = Math.trunc(existingDetailSchemaVersion);
         }
 
         const normalized = normalizeCachedJobRecord(id, next, now);

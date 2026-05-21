@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.53
+// @version      0.1.54
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -19,7 +19,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.53';
+    const SCRIPT_VERSION = '0.1.54';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -371,25 +371,33 @@
                 lastSeenAt: now
             };
 
-            for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
-                const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
-                if (value) next[field] = value;
-            }
+        for (const field of ['title', 'company', 'salaryText', 'keywordText', 'logoSrc', 'locationText', 'expectationText', 'href', 'detailHtml', 'detailJobId', 'activeTimeText']) {
+            const value = normalizeSpace(record && record[field]) || normalizeSpace(existing[field]);
+            if (value) next[field] = value;
+        }
 
             const tagTexts = normalizeCachedJobTagTexts(record && record.tagTexts);
             const existingTagTexts = normalizeCachedJobTagTexts(existing.tagTexts);
             if (tagTexts.length || existingTagTexts.length) next.tagTexts = tagTexts.length ? tagTexts : existingTagTexts;
 
-            const activeRank = Number(record && record.activeRank);
-            const existingActiveRank = Number(existing.activeRank);
-            if (Number.isFinite(activeRank)) {
-                next.activeRank = activeRank;
-            } else if (Number.isFinite(existingActiveRank)) {
-                next.activeRank = existingActiveRank;
-            }
+        const activeRank = Number(record && record.activeRank);
+        const existingActiveRank = Number(existing.activeRank);
+        if (Number.isFinite(activeRank)) {
+            next.activeRank = activeRank;
+        } else if (Number.isFinite(existingActiveRank)) {
+            next.activeRank = existingActiveRank;
+        }
 
-            const normalized = normalizeCachedJobRecord(id, next, now);
-            if (normalized) merged.set(id, normalized);
+        const detailSchemaVersion = Number(record && record.detailSchemaVersion);
+        const existingDetailSchemaVersion = Number(existing.detailSchemaVersion);
+        if (Number.isFinite(detailSchemaVersion)) {
+            next.detailSchemaVersion = Math.trunc(detailSchemaVersion);
+        } else if (Number.isFinite(existingDetailSchemaVersion) && normalizeSpace(next.detailHtml)) {
+            next.detailSchemaVersion = Math.trunc(existingDetailSchemaVersion);
+        }
+
+        const normalized = normalizeCachedJobRecord(id, next, now);
+        if (normalized) merged.set(id, normalized);
         }
 
         return normalizeCachedJobRecords(merged, { ...options, ...settings, now });
@@ -2212,6 +2220,7 @@
             href: getJobHrefFromCard(card),
             detailHtml,
             ...(detailHtml ? { detailJobId: id } : {}),
+            ...(detailHtml ? { detailSchemaVersion: DETAIL_CACHE_SCHEMA_VERSION } : {}),
             activeTimeText,
             ...(Number.isFinite(activeRank) ? { activeRank } : {})
         };
