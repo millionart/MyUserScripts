@@ -535,7 +535,8 @@ test('userscript cached detail overlay does not replace site-owned detail dom', 
     assert.match(script, /\$\{APP_ID\}-cached-detail-overlay/);
     assert.doesNotMatch(renderBody, /root\.innerHTML\s*=/);
     assert.match(renderBody, /syncCachedDetailOverlayClass\(root, overlay\)/);
-    assert.match(renderBody, /overlay\.innerHTML = detailHtml/);
+    assert.match(renderBody, /const nativeSnapshotHtml = buildCachedJobDetailHtmlFromJobsRightShellSnapshot\(record && record\.detailSnapshot, record, root\)/);
+    assert.match(renderBody, /overlay\.innerHTML = nativeSnapshotHtml/);
 });
 
 test('userscript cached detail fallback inherits native detail css classes', () => {
@@ -650,6 +651,7 @@ test('userscript only trusts cached detail html tagged for the same job', () => 
     assert.match(script, /`\$\{APP_ID\}-cached-detail`/);
     assert.match(script, /`\$\{APP_ID\}-cache-tag`/);
     assert.match(script, /detailHtmlHasNativeHeader\(detailHtml\)/);
+    assert.match(script, /const nativeSnapshotHtml = buildCachedJobDetailHtmlFromJobsRightShellSnapshot\(record && record\.detailSnapshot, record, root\)/);
     assert.match(script, /function isDuplicateDetailForDifferentCachedJob\(id, detailHtml\)/);
     assert.match(script, /duplicate stale detail/);
     assert.match(script, /detailJobId && \(!id \|\| detailJobId !== id\)/);
@@ -838,11 +840,29 @@ test('structured detail snapshots are extracted and stored alongside cached deta
     assert.match(script, /function normalizeCachedDetailSnapshot\(snapshot, fallbackRecord = null\)/);
     assert.match(script, /function buildDetailSnapshotFromRoot\(root, fallbackRecord = \{\}\)/);
     assert.match(script, /function buildCachedJobDetailHtmlFromSnapshot\(snapshot, record = null\)/);
+    assert.match(script, /function buildJobLabelListHtmlFromKeywordTexts\(values\)/);
+    assert.match(script, /function replaceListItemsPreservingAttributes\(list, values, itemSelector = ':scope > li'\)/);
     assert.match(script, /detailSnapshot,/);
     assert.match(script, /const detailSnapshot = getCurrentDetailSnapshotForCard\(card\)/);
     assert.match(script, /hasDetailSnapshot:\s*Boolean\(matchedRecord\.detailSnapshot\)/);
     assert.match(script, /detailSnapshot:\s*matchedRecord\.detailSnapshot \|\| null/);
     assert.match(script, /function cachedDetailSnapshotMatchesRecord\(record, snapshot\)/);
+    assert.match(script, /headerTagListHtml/);
+    assert.match(script, /jobLabelListHtml/);
+    assert.match(script, /keywordListHtml/);
+    assert.match(script, /job-keyword-list/);
+    assert.match(script, /job-label-list/);
+    assert.match(script, /const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts\(keywordTexts\)/);
+    assert.match(script, /recruiterAvatarSrc/);
+    assert.match(script, /recruiterStatusText/);
+    assert.match(script, /addressMapImageSrc/);
+    assert.match(script, /addressMapButtonText/);
+    assert.match(script, /moreInfoHref/);
+    assert.match(script, /function getStandaloneHeaderMetaTexts\(root\)/);
+    assert.match(script, /function buildCachedJobDetailHtmlFromNativeShellSnapshot\(snapshot, record, root\)/);
+    assert.match(script, /function buildCachedJobDetailHtmlFromJobsRightShellSnapshot\(snapshot, record, root\)/);
+    assert.match(script, /replaceListItemsPreservingAttributes\(labelList, normalized\.keywordTexts\)/);
+    assert.match(script, /replaceListItemsPreservingAttributes\(tagList, \[normalized\.cityText, normalized\.experienceText, normalized\.degreeText\]\.filter\(Boolean\)\)/);
 });
 
 test('standalone detail pages render a debug panel with cache mapping details', () => {
