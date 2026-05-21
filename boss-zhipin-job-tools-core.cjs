@@ -353,7 +353,9 @@ function jobMatchesHiddenFilters(record, settings) {
     const filters = normalizeHiddenFilterSettings(settings);
     const searchableText = normalizeSpace([
         record && record.title,
-        record && record.keywordText
+        record && record.keywordText,
+        ...(Array.isArray(record && record.tagTexts) ? record.tagTexts : []),
+        ...(Array.isArray(record && record.keywordTexts) ? record.keywordTexts : [])
     ].filter(Boolean).join(' ')).toLowerCase();
     if (searchableText && filters.keywords.some((keyword) => searchableText.includes(keyword))) return true;
 

@@ -29,8 +29,8 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.69\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.69';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.73\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.73';/);
 });
 
 test('userscript metadata also matches standalone Boss job detail pages', () => {
@@ -188,6 +188,26 @@ test('matches hidden filters by title keyword and salary maximum threshold', () 
         salaryText: '35-45K'
     }, {
         keywords: ['计算机图形学'],
+        minSalaryMaxK: 30
+    }), true);
+});
+
+test('matches hidden filters by cached tags and detail keywords', () => {
+    assert.equal(jobMatchesHiddenFilters({
+        title: 'Gameplay Engineer',
+        tagTexts: ['C/C++', 'Unity3D', 'UE5'],
+        salaryText: '35-45K'
+    }, {
+        keywords: ['ue5'],
+        minSalaryMaxK: 30
+    }), true);
+
+    assert.equal(jobMatchesHiddenFilters({
+        title: 'Gameplay Engineer',
+        keywordTexts: ['Ability System', 'Combat Loop'],
+        salaryText: '35-45K'
+    }, {
+        keywords: ['combat loop'],
         minSalaryMaxK: 30
     }), true);
 });
@@ -1003,10 +1023,34 @@ test('custom tag UI targets the job description tag row with native tag styling'
     assert.match(script, /function isElementAfter\(element, anchor\)/);
     assert.match(script, /function findDetailTagHost\(\)[\s\S]*findJobDescriptionHeading\(\)[\s\S]*isElementAfter\(candidate, heading\)/);
     assert.match(script, /function ensureDetailTagHost\(\)/);
+    assert.match(script, /existing\.classList\?\.contains\(`\$\{APP_ID\}-custom-tag-row`\)/);
+    assert.match(script, /existing\.insertAdjacentElement\('afterend', host\)/);
     assert.match(script, /className = `\$\{APP_ID\}-custom-tag-row`/);
     assert.match(script, /insertBefore\(host, heading\.nextSibling\)/);
     assert.match(script, /\.\$\{APP_ID\}-custom-tag,\s*\.\$\{APP_ID\}-custom-tag-add \{[\s\S]*background:\s*#f8f8f8;/);
     assert.match(script, /\.\$\{APP_ID\}-custom-tag-add \{[\s\S]*border:\s*0;/);
+});
+
+test('custom tag actions resolve the current cached detail job from cache state', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function getCurrentCachedDetailRecord\(\)/);
+    assert.match(script, /const id = normalizeSpace\(state\.currentCachedDetailId\)/);
+    assert.match(script, /const cachedRecord = getCurrentCachedDetailRecord\(\)/);
+    assert.match(script, /getCachedJobHref\(cachedRecord\)/);
+    assert.match(script, /getCustomTagTextForJob\(cachedRecord\.id\)/);
+    assert.match(script, /function addCustomTagForJob\(id\)/);
+    assert.match(script, /function removeCustomTagForJob\(id, tag\)/);
+    assert.match(script, /function handleCustomTagActionClick\(event\)/);
+    assert.match(script, /document\.addEventListener\('click', handleCustomTagActionClick, true\)/);
+    assert.match(script, /remove\.dataset\.jobId = recordId/);
+    assert.match(script, /remove\.dataset\.tag = tag/);
+    assert.match(script, /add\.dataset\.jobId = recordId/);
+});
+
+test('cached detail sanitization strips injected custom tag ui from cloned detail html', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /sanitizeCachedDetailHtml\(html\)[\s\S]*\.\$\{APP_ID\}-custom-tag-row[\s\S]*\.\$\{APP_ID\}-custom-tag-wrap[\s\S]*\.\$\{APP_ID\}-custom-tag-add/);
+    assert.match(script, /clone\.querySelectorAll\(`\.\$\{APP_ID\}-custom-tag-row, \.\$\{APP_ID\}-custom-tag-wrap, \.\$\{APP_ID\}-custom-tag, \.\$\{APP_ID\}-custom-tag-add, \.\$\{APP_ID\}-custom-tag-remove`\)\.forEach\(\(element\) => element\.remove\(\)\)/);
 });
 
 test('native chat links are kept as new-tab links during UI refresh', () => {

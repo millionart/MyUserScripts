@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.69
+// @version      0.1.73
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -21,7 +21,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.69';
+    const SCRIPT_VERSION = '0.1.73';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -845,7 +845,9 @@
         const filters = normalizeHiddenFilterSettings(settings);
         const searchableText = normalizeSpace([
             record && record.title,
-            record && record.keywordText
+            record && record.keywordText,
+            ...(Array.isArray(record && record.tagTexts) ? record.tagTexts : []),
+            ...(Array.isArray(record && record.keywordTexts) ? record.keywordTexts : [])
         ].filter(Boolean).join(' ')).toLowerCase();
         if (searchableText && filters.keywords.some((keyword) => searchableText.includes(keyword))) return true;
 
@@ -2102,7 +2104,17 @@
 
     function ensureDetailTagHost() {
         const existing = findDetailTagHost();
-        if (existing) return existing;
+        if (existing) {
+            if (existing.classList?.contains(`${APP_ID}-custom-tag-row`)) return existing;
+
+            let host = existing.parentElement?.querySelector(`.${APP_ID}-custom-tag-row`);
+            if (!host) {
+                host = document.createElement('div');
+                host.className = `${APP_ID}-custom-tag-row`;
+                existing.insertAdjacentElement('afterend', host);
+            }
+            return host;
+        }
 
         const heading = findJobDescriptionHeading();
         if (!heading || !heading.parentElement) return null;
@@ -2133,7 +2145,32 @@
         return getActiveJobCard() || findCardByDetailTitle();
     }
 
+    function getCurrentCachedDetailRecord() {
+        const id = normalizeSpace(state.currentCachedDetailId);
+        if (!id) return null;
+        const record = state.jobCache.get(id);
+        return record ? { ...record, id } : null;
+    }
+
     function getCurrentJobRecord() {
+        const cachedRecord = getCurrentCachedDetailRecord();
+        if (cachedRecord) {
+            return {
+                id: cachedRecord.id,
+                title: cachedRecord.title || '',
+                company: cachedRecord.company || '',
+                salaryText: cachedRecord.salaryText || '',
+                keywordText: normalizeSpace([
+                    cachedRecord.keywordText,
+                    ...(Array.isArray(cachedRecord.tagTexts) ? cachedRecord.tagTexts : []),
+                    ...(Array.isArray(cachedRecord.keywordTexts) ? cachedRecord.keywordTexts : []),
+                    getCustomTagTextForJob(cachedRecord.id)
+                ].filter(Boolean).join(' ')),
+                href: getCachedJobHref(cachedRecord),
+                card: findCardByJobId(cachedRecord.id)
+            };
+        }
+
         const card = getCurrentJobCard();
         if (!card) return null;
 
@@ -2253,6 +2290,13 @@
         const template = document.createElement('template');
         template.innerHTML = String(html || '');
         template.content.querySelectorAll('script, iframe, object, embed, link[rel="preload"]').forEach((element) => element.remove());
+        template.content.querySelectorAll([
+            `.${APP_ID}-custom-tag-row`,
+            `.${APP_ID}-custom-tag-wrap`,
+            `.${APP_ID}-custom-tag`,
+            `.${APP_ID}-custom-tag-add`,
+            `.${APP_ID}-custom-tag-remove`
+        ].join(',')).forEach((element) => element.remove());
         template.content.querySelectorAll('*').forEach((element) => {
             for (const attribute of Array.from(element.attributes)) {
                 if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
@@ -2577,6 +2621,7 @@
         clone.classList.remove(`${APP_ID}-cached-detail`);
         clone.classList.add(`${APP_ID}-cached-detail-fallback`);
         clone.querySelectorAll(`.${APP_ID}-cached-detail-overlay`).forEach((element) => element.remove());
+        clone.querySelectorAll(`.${APP_ID}-custom-tag-row, .${APP_ID}-custom-tag-wrap, .${APP_ID}-custom-tag, .${APP_ID}-custom-tag-add, .${APP_ID}-custom-tag-remove`).forEach((element) => element.remove());
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
 
         replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), normalized.title || record.title || '缓存职位');
@@ -2632,6 +2677,7 @@
         clone.classList.remove(`${APP_ID}-cached-detail`);
         clone.classList.add(`${APP_ID}-cached-detail-fallback`);
         clone.querySelectorAll(`.${APP_ID}-cached-detail-overlay`).forEach((element) => element.remove());
+        clone.querySelectorAll(`.${APP_ID}-custom-tag-row, .${APP_ID}-custom-tag-wrap, .${APP_ID}-custom-tag, .${APP_ID}-custom-tag-add, .${APP_ID}-custom-tag-remove`).forEach((element) => element.remove());
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
 
         replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), normalized.title || record.title || '缓存职位');
@@ -3216,6 +3262,7 @@
         clone.classList.remove(`${APP_ID}-cached-detail`);
         clone.classList.add(`${APP_ID}-cached-detail-fallback`);
         clone.querySelectorAll(`.${APP_ID}-cached-detail-overlay`).forEach((element) => element.remove());
+        clone.querySelectorAll(`.${APP_ID}-custom-tag-row, .${APP_ID}-custom-tag-wrap, .${APP_ID}-custom-tag, .${APP_ID}-custom-tag-add, .${APP_ID}-custom-tag-remove`).forEach((element) => element.remove());
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
         replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), record.title || '缓存职位');
         replaceElementText(clone.querySelector('.job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]'), record.salaryText);
@@ -3862,6 +3909,8 @@
                     ...record,
                     keywordText: normalizeSpace([
                         record.keywordText,
+                        ...(Array.isArray(record.tagTexts) ? record.tagTexts : []),
+                        ...(Array.isArray(record.keywordTexts) ? record.keywordTexts : []),
                         getCustomTagTextForJob(record.id)
                     ].filter(Boolean).join(' '))
                 };
@@ -4499,9 +4548,9 @@
         saveCustomTags();
     }
 
-    function addCustomTagForCurrentJob() {
-        const record = getCurrentJobRecord();
-        if (!record) {
+    function addCustomTagForJob(id) {
+        const normalizedId = normalizeSpace(id);
+        if (!normalizedId) {
             showToast('未找到当前职位');
             return;
         }
@@ -4509,25 +4558,50 @@
         const tag = normalizeSpace(window.prompt('添加自定义标签', '') || '');
         if (!tag) return;
 
-        const tags = normalizeCustomTagList([...getCustomTagsForJob(record.id), tag]);
-        setCustomTagsForJob(record.id, tags);
+        const tags = normalizeCustomTagList([...getCustomTagsForJob(normalizedId), tag]);
+        setCustomTagsForJob(normalizedId, tags);
         renderDetailCustomTags();
         applyIgnoredJobs();
         void ensureActiveJobIsVisible();
         showToast(`已添加标签：${tag}`);
     }
 
-    function removeCustomTagForCurrentJob(tag) {
-        const record = getCurrentJobRecord();
-        if (!record) return;
+    function removeCustomTagForJob(id, tag) {
+        const normalizedId = normalizeSpace(id);
+        if (!normalizedId) return;
 
         const removeKey = normalizeSpace(tag).toLowerCase();
-        const tags = getCustomTagsForJob(record.id).filter((value) => value.toLowerCase() !== removeKey);
-        setCustomTagsForJob(record.id, tags);
+        const tags = getCustomTagsForJob(normalizedId).filter((value) => value.toLowerCase() !== removeKey);
+        setCustomTagsForJob(normalizedId, tags);
         renderDetailCustomTags();
         applyIgnoredJobs();
         void ensureActiveJobIsVisible();
         showToast(`已移除标签：${tag}`);
+    }
+
+    function handleCustomTagActionClick(event) {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target) return;
+
+        const addButton = target.closest(`.${APP_ID}-custom-tag-add`);
+        if (addButton) {
+            const jobId = normalizeSpace(addButton.dataset.jobId);
+            if (!jobId) return;
+            event.preventDefault();
+            event.stopPropagation();
+            addCustomTagForJob(jobId);
+            return;
+        }
+
+        const removeButton = target.closest(`.${APP_ID}-custom-tag-remove`);
+        if (!removeButton) return;
+
+        const jobId = normalizeSpace(removeButton.dataset.jobId);
+        const tag = normalizeSpace(removeButton.dataset.tag);
+        if (!jobId || !tag) return;
+        event.preventDefault();
+        event.stopPropagation();
+        removeCustomTagForJob(jobId, tag);
     }
 
     function renderDetailCustomTags() {
@@ -4547,8 +4621,14 @@
             host.appendChild(wrap);
         }
 
-        const tags = getCustomTagsForJob(record.id);
-        const signature = JSON.stringify({ id: record.id, tags });
+        const recordId = normalizeSpace(record.id);
+        if (!recordId) {
+            wrap?.remove();
+            return;
+        }
+
+        const tags = getCustomTagsForJob(recordId);
+        const signature = JSON.stringify({ id: recordId, tags });
         if (wrap.dataset.signature === signature) return;
         wrap.dataset.signature = signature;
         wrap.textContent = '';
@@ -4566,11 +4646,8 @@
             remove.className = `${APP_ID}-custom-tag-remove`;
             remove.textContent = '×';
             remove.title = `移除标签 ${tag}`;
-            remove.addEventListener('click', (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                removeCustomTagForCurrentJob(tag);
-            });
+            remove.dataset.jobId = recordId;
+            remove.dataset.tag = tag;
             item.appendChild(remove);
             wrap.appendChild(item);
         }
@@ -4579,11 +4656,7 @@
         add.type = 'button';
         add.className = `${APP_ID}-custom-tag-add`;
         add.textContent = '+ 标签';
-        add.addEventListener('click', (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            addCustomTagForCurrentJob();
-        });
+        add.dataset.jobId = recordId;
         wrap.appendChild(add);
     }
 
@@ -5039,6 +5112,7 @@
         document.addEventListener('keydown', handleJobListScrollKey, true);
         document.addEventListener('click', handleJobExpectationClick, true);
         document.addEventListener('click', handleLiveJobCardClick, true);
+        document.addEventListener('click', handleCustomTagActionClick, true);
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) return;
             if (syncJobCacheFromStorage()) scheduleRefresh();
@@ -5057,6 +5131,7 @@
         loadJobCache();
         renderGlobalPickerButton();
         renderStandaloneDetailDebugPanel();
+        document.addEventListener('click', handleCustomTagActionClick, true);
         captureStandaloneJobDetailWhenReady();
     }
 
