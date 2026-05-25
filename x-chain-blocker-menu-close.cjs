@@ -29,13 +29,13 @@ function closeMenuFromEvent(event) {
   const menuNode = getClosestMenuNode(target);
   const removableContainer = dropdownRoot?.parentElement || menuNode?.parentElement || null;
 
-  if (removableContainer && typeof removableContainer.remove === 'function') {
-    removableContainer.remove();
+  if (menuNode && typeof menuNode.dispatchEvent === 'function') {
+    menuNode.dispatchEvent(createEscapeKeydownEvent());
     return true;
   }
 
-  if (menuNode && typeof menuNode.dispatchEvent === 'function') {
-    menuNode.dispatchEvent(createEscapeKeydownEvent());
+  if (removableContainer && typeof removableContainer.remove === 'function') {
+    removableContainer.remove();
     return true;
   }
 

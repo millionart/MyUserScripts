@@ -29,8 +29,8 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.73\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.73';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.88\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.88';/);
 });
 
 test('userscript metadata also matches standalone Boss job detail pages', () => {
@@ -742,7 +742,7 @@ test('userscript prefers boss detail json api before falling back to cached deta
     assert.match(script, /const apiDetailHtml = await fetchCachedJobDetailHtmlViaApi\(record\)/);
 });
 
-test('userscript cached cards preserve logo, visible cache tag, and specific cache age text', () => {
+test('userscript cached cards preserve logo and specific cache age text without appending a cache tag pill', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     assert.match(script, /function getCardLogoSrc\(card\)/);
     assert.match(script, /backgroundImage/);
@@ -751,11 +751,64 @@ test('userscript cached cards preserve logo, visible cache tag, and specific cac
     assert.match(script, /function updateCachedCardLogo\(card, record\)/);
     assert.match(script, /updateCachedCardLogo\(card, record\)/);
     assert.match(script, /function ensureCachedTagList\(card\)/);
-    assert.match(script, /function ensureCacheTag\(list\)/);
+    assert.match(script, /if \(!replaceListItemsPreservingAttributes\(list, values\)\) \{/);
+    assert.doesNotMatch(script, /ensureCacheTag\(list\);/);
     assert.match(script, /const minutes = Math\.floor\(elapsedMs \/ 60000\)/);
     assert.match(script, /return `\$\{minutes\}分钟前缓存`/);
     assert.match(script, /return `\$\{hours\}小时前缓存`/);
     assert.doesNotMatch(script, /return days > 0 \? `\$\{days\}天前缓存` : '今天缓存'/);
+});
+
+test('userscript cached cards prefer detail keywords in the card tag area before falling back to card tags', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function getCachedCardDisplayTagTexts\(record\)/);
+    assert.match(script, /record && record\.detailSnapshot && record\.detailSnapshot\.keywordTexts/);
+    assert.match(script, /if \(keywordTexts\.length\) return keywordTexts;/);
+    assert.match(script, /return normalizeCachedJobTagTexts\(record && record\.tagTexts\);/);
+    assert.match(script, /replaceTagList\(tags, getCachedCardDisplayTagTexts\(record\)\);/);
+    assert.match(script, /replaceTagList\(tagList, getCachedCardDisplayTagTexts\(record\)\);/);
+});
+
+test('standalone detail keyword extraction reads both job-label-list and job-keyword-list items', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function getStandaloneDetailKeywordTexts\(root\)/);
+    assert.match(script, /\.job-label-list li/);
+    assert.match(script, /\.job-keyword-list li/);
+});
+
+test('userscript strips BOSS anti-spider watermark text from cached detail text and tags', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /const ANTI_SPIDER_WATERMARK_PATTERNS = \[/);
+    assert.match(script, /\/来自\\s\*BOSS直聘\/gi/);
+    assert.match(script, /\/BOSS直聘\/gi/);
+    assert.match(script, /\/kanzhun\/gi/);
+    assert.match(script, /\/\\bboss\\b\/gi/);
+    assert.match(script, /\/直聘\/gi/);
+    assert.match(script, /function stripAntiSpiderWatermarkText\(value\)/);
+    assert.match(script, /return stripAntiSpiderWatermarkText\(value\)\.replace\(\/\\s\+\/g, ' '\)\.trim\(\);/);
+});
+
+test('cached detail label row falls back to cached card tags when keyword labels are missing', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function getCachedDetailLabelTexts\(snapshot, fallbackRecord = null\)/);
+    assert.match(script, /const source = snapshot && typeof snapshot === 'object' \? snapshot : \{\};/);
+    assert.match(script, /const sourceKeywords = normalizeCachedJobTagTexts\(source\.keywordTexts\);/);
+    assert.match(script, /const sourceTags = normalizeCachedJobTagTexts\(source\.tagTexts\);/);
+    assert.match(script, /return normalizeCachedJobTagTexts\(fallbackRecord && fallbackRecord\.tagTexts\);/);
+    assert.doesNotMatch(script, /function getCachedDetailLabelTexts[\s\S]*normalizeCachedDetailSnapshot\(snapshot, fallbackRecord\)/);
+    assert.match(script, /const detailLabelTexts = getCachedDetailLabelTexts\(snapshot, fallbackRecord\);/);
+    assert.match(script, /const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts\(detailLabelTexts\);/);
+    assert.match(script, /replaceListItemsPreservingAttributes\(labelList, getCachedDetailLabelTexts\(normalized, record\)\);/);
+    assert.match(script, /else if \(normalized\.jobLabelListHtml\) \{/);
+    assert.match(script, /template\.innerHTML = normalized\.jobLabelListHtml;/);
+    assert.match(script, /insertAfter\.insertAdjacentElement\('afterend', generatedLabelList\)/);
+});
+
+test('userscript removes style tags and watermark-only nodes from cached detail html', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /querySelectorAll\('script, style, iframe, object, embed, link\[rel=\"preload\"\]'\)/);
+    assert.match(script, /if \(rawText && !normalizeSpace\(rawText\) && !element\.children\.length\) \{/);
+    assert.match(script, /element\.remove\(\);/);
 });
 
 test('userscript marks cached list containers as scrollable when cache extends the list', () => {
@@ -837,16 +890,24 @@ test('userscript captures standalone job detail pages into cache through a separ
 test('standalone detail capture rebuilds native header and description from real job detail page structure', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     assert.match(script, /document\.querySelector\('\.job-banner \.name h1, \.job-primary \.name h1/);
-    assert.match(script, /document\.querySelector\('\.job-banner \.salary, \.job-primary \.salary/);
-    assert.match(script, /document\.querySelector\('\.sider-company \.company-info a\[title\]/);
+    assert.match(script, /function getStandaloneDetailSalaryText\(root\)/);
+    assert.match(script, /function getStandaloneDetailCompanyText\(root\)/);
+    assert.match(script, /\.sider-company \.company-info a\[title\]/);
+    assert.match(script, /\.business-info-box \.company-name, li\.company-name/);
+    assert.match(script, /\.replace\(\s*\/\^公司名称\\s\*\/,\s*''\s*\)/);
+    assert.match(script, /\.job-banner \.name \.salary/);
+    assert.match(script, /\.job-primary \.name \.salary/);
+    assert.doesNotMatch(script, /document\.querySelector\('\.job-banner \.salary, \.job-primary \.salary, \.job-detail-header \.salary, \.job-detail-header \.job-salary, \.salary, \.job-salary, \[class\*="salary"\]'\)/);
     assert.match(script, /\.job-banner \.job-tags span/);
     assert.match(script, /\.job-keyword-list li/);
     assert.match(script, /function cloneStandaloneBannerTags\(root\)/);
     assert.match(script, /const nativeTags = scope\.querySelector\('\.job-banner \.job-tags'\)/);
     assert.match(script, /nativeTags\.cloneNode\(true\)/);
+    assert.match(script, /buildDetailSnapshotFromRoot\(document, \{\}\) \|\| buildDetailSnapshotFromRoot\(root, \{\}\)/);
     assert.match(script, /appendTextElement\(wrapper, 'div', 'job-detail-header', ''\)/);
-    assert.match(script, /appendTextElement\(header, 'div', 'job-name', record\.title \|\| '缓存职位'\)/);
-    assert.match(script, /appendTextElement\(header, 'span', 'salary', record\.salaryText\)/);
+    assert.match(script, /const nameRow = appendTextElement\(header, 'div', 'name', ''\)/);
+    assert.match(script, /const titleHeading = appendTextElement\(nameRow, 'h1', '', normalized\.title \|\| '缓存职位'\)/);
+    assert.match(script, /appendTextElement\(nameRow, 'span', 'salary', normalized\.salaryText\)/);
     assert.match(script, /cloneStandaloneBannerTags\(/);
     assert.match(script, /if \(nativeTags\) wrapper\.appendChild\(nativeTags\)/);
     assert.match(script, /const descriptionSection = findStandaloneDetailDescriptionSection\(root\)/);
@@ -872,16 +933,21 @@ test('structured detail snapshots are extracted and stored alongside cached deta
     assert.match(script, /keywordListHtml/);
     assert.match(script, /job-keyword-list/);
     assert.match(script, /job-label-list/);
-    assert.match(script, /const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts\(keywordTexts\)/);
+    assert.match(script, /const detailLabelTexts = getCachedDetailLabelTexts\(snapshot, fallbackRecord\);/);
+    assert.match(script, /const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts\(detailLabelTexts\)/);
     assert.match(script, /recruiterAvatarSrc/);
     assert.match(script, /recruiterStatusText/);
     assert.match(script, /addressMapImageSrc/);
     assert.match(script, /addressMapButtonText/);
     assert.match(script, /moreInfoHref/);
     assert.match(script, /function getStandaloneHeaderMetaTexts\(root\)/);
+    assert.match(script, /function replaceDetailHeaderTitleAndSalary\(root, title, salaryText\)/);
+    assert.match(script, /\.job-detail-header \.job-detail-info \.job-salary/);
+    assert.match(script, /\.job-detail-header \.name \.salary/);
     assert.match(script, /function buildCachedJobDetailHtmlFromNativeShellSnapshot\(snapshot, record, root\)/);
     assert.match(script, /function buildCachedJobDetailHtmlFromJobsRightShellSnapshot\(snapshot, record, root\)/);
-    assert.match(script, /replaceListItemsPreservingAttributes\(labelList, normalized\.keywordTexts\)/);
+    assert.doesNotMatch(script, /replaceElementText\(clone\.querySelector\('\.job-detail-header \.job-salary, \.job-detail-header \.salary, \.salary, \.job-salary, \[class\*="salary"\]'/);
+    assert.match(script, /replaceListItemsPreservingAttributes\(labelList, getCachedDetailLabelTexts\(normalized, record\)\)/);
     assert.match(script, /replaceListItemsPreservingAttributes\(tagList, \[normalized\.cityText, normalized\.experienceText, normalized\.degreeText\]\.filter\(Boolean\)\)/);
 });
 
@@ -930,6 +996,10 @@ test('userscript recovery links preserve the source cached job id for standalone
     assert.match(script, /const DETAIL_RECOVERY_TTL_MS = 6 \* 60 \* 60 \* 1000;/);
     assert.match(script, /function normalizeDetailRecoveryMap\(stored, now = Date\.now\(\)\)/);
     assert.match(script, /function rememberDetailRecoverySource\(record\)/);
+    assert.match(script, /function resolveStandaloneCachedJobId\(detailId, securityId = ''\)/);
+    assert.match(script, /if \(normalizedDetailId && state\.jobCache\.has\(normalizedDetailId\)\) return normalizedDetailId;/);
+    assert.match(script, /extractJobIdFromHref\(getCachedJobHref\(record\)\) === normalizedDetailId/);
+    assert.match(script, /normalizeSpace\(record\.securityId\) === normalizedSecurityId/);
     assert.match(script, /function getCachedJobRecoveryHref\(record\)/);
     assert.match(script, /hashParams\.set\(`\$\{APP_ID\}-source-id`, sourceId\)/);
     assert.match(script, /const href = getCachedJobRecoveryHref\(record\)/);
@@ -990,6 +1060,7 @@ test('userscript only collects cached jobs after a job expectation is active', (
     assert.match(cacheBody, /const activeExpectationText = getActiveJobExpectationText\(\)/);
     assert.match(cacheBody, /expectationText: activeExpectationText/);
     assert.match(cacheBody, /schemaVersion: JOB_CACHE_SCHEMA_VERSION/);
+    assert.match(cacheBody, /\.filter\(\(record\) => !state\.jobCache\.has\(record\.id\)\)/);
     assert.match(cacheBody, /state\.jobCache = normalizeCachedJobRecords\(state\.jobCache, \{[\s\S]*requiredSchemaVersion: JOB_CACHE_SCHEMA_VERSION[\s\S]*\}\)/);
     assert.match(cacheBody, /return;/);
     assert.match(script, /record\.expectationText === activeExpectationText/);

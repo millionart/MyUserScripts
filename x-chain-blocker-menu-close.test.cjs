@@ -24,8 +24,9 @@ function createNode(label, options = {}) {
   return node;
 }
 
-test('removes legacy dropdown overlay container when present', () => {
+test('dispatches Escape before removing legacy dropdown overlay container when menu exists', () => {
   const overlayParent = createNode('overlayParent');
+  const menu = createNode('menu');
   const legacyDropdown = createNode('legacyDropdown', {
     closestSelectors: {
       '[data-testid="Dropdown"]': null
@@ -37,18 +38,19 @@ test('removes legacy dropdown overlay container when present', () => {
     closestSelectors: {
       'div[data-testid="Dropdown"]': legacyDropdown,
       '[data-testid="Dropdown"]': legacyDropdown,
-      'div[role="menu"]': null,
-      '[role="menu"]': null
+      'div[role="menu"]': menu,
+      '[role="menu"]': menu
     }
   });
 
   const result = closeMenuFromEvent({ target: clickTarget });
 
   assert.equal(result, true);
-  assert.equal(overlayParent.removed, true);
+  assert.equal(menu.dispatchedEvents.length, 1);
+  assert.equal(overlayParent.removed, false);
 });
 
-test('removes modern menu overlay container via role=menu ancestry', () => {
+test('dispatches Escape for modern role=menu overlays instead of removing them', () => {
   const overlay = createNode('overlay');
   const menu = createNode('menu', {
     closestSelectors: {
@@ -69,7 +71,8 @@ test('removes modern menu overlay container via role=menu ancestry', () => {
   const result = closeMenuFromEvent({ target: clickTarget });
 
   assert.equal(result, true);
-  assert.equal(overlay.removed, true);
+  assert.equal(menu.dispatchedEvents.length, 1);
+  assert.equal(overlay.removed, false);
 });
 
 test('falls back to Escape when no removable overlay container exists', () => {
@@ -89,4 +92,24 @@ test('falls back to Escape when no removable overlay container exists', () => {
   assert.equal(menu.dispatchedEvents.length, 1);
   assert.equal(menu.dispatchedEvents[0].type, 'keydown');
   assert.equal(menu.dispatchedEvents[0].key, 'Escape');
+});
+
+test('removes overlay container when only dropdown ancestry exists', () => {
+  const overlayParent = createNode('overlayParent');
+  const legacyDropdown = createNode('legacyDropdown');
+  legacyDropdown.parentElement = overlayParent;
+
+  const clickTarget = createNode('clickTarget', {
+    closestSelectors: {
+      'div[data-testid="Dropdown"]': legacyDropdown,
+      '[data-testid="Dropdown"]': legacyDropdown,
+      'div[role="menu"]': null,
+      '[role="menu"]': null
+    }
+  });
+
+  const result = closeMenuFromEvent({ target: clickTarget });
+
+  assert.equal(result, true);
+  assert.equal(overlayParent.removed, true);
 });

@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.73
+// @version      0.1.88
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -21,7 +21,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.73';
+    const SCRIPT_VERSION = '0.1.88';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -47,6 +47,13 @@
     const DETAIL_PREFETCH_STEP_DELAY_MS = 220;
     const DETAIL_PREFETCH_MAX_PER_PASS = 6;
     const DAY_MS = 24 * 60 * 60 * 1000;
+    const ANTI_SPIDER_WATERMARK_PATTERNS = [
+        /来自\s*BOSS直聘/gi,
+        /BOSS直聘/gi,
+        /kanzhun/gi,
+        /\bboss\b/gi,
+        /直聘/gi
+    ];
     const DETAIL_ROOT_CONTAINER_SELECTOR = [
         '.job-detail-container',
         '.job-detail-box',
@@ -92,8 +99,16 @@
         jobCacheChangeListenerId: null
     };
 
+    function stripAntiSpiderWatermarkText(value) {
+        let text = String(value || '');
+        for (const pattern of ANTI_SPIDER_WATERMARK_PATTERNS) {
+            text = text.replace(pattern, '');
+        }
+        return text;
+    }
+
     function normalizeSpace(value) {
-        return String(value || '').replace(/\s+/g, ' ').trim();
+        return stripAntiSpiderWatermarkText(value).replace(/\s+/g, ' ').trim();
     }
 
     function isRealJobExpectationText(text) {
@@ -190,11 +205,33 @@
             || resolveStoredRecoverySourceJobId(detailId);
     }
 
+    function resolveStandaloneCachedJobId(detailId, securityId = '') {
+        const recoverySourceId = resolveStandaloneRecoverySourceJobId(detailId);
+        if (recoverySourceId) return recoverySourceId;
+
+        const normalizedDetailId = normalizeSpace(detailId);
+        const normalizedSecurityId = normalizeSpace(securityId);
+        if (!normalizedDetailId && !normalizedSecurityId) return '';
+
+        if (normalizedDetailId && state.jobCache.has(normalizedDetailId)) return normalizedDetailId;
+
+        for (const record of state.jobCache.values()) {
+            if (normalizedDetailId && extractJobIdFromHref(getCachedJobHref(record)) === normalizedDetailId) {
+                return normalizeSpace(record.id);
+            }
+            if (normalizedSecurityId && normalizeSpace(record.securityId) === normalizedSecurityId) {
+                return normalizeSpace(record.id);
+            }
+        }
+
+        return normalizedDetailId;
+    }
+
     function getStandaloneDetailDebugInfo() {
         const detailId = extractJobIdFromHref(location.href);
         const recoverySourceIdFromHash = extractRecoverySourceJobIdFromLocation();
         const recoverySourceIdFromStore = resolveStoredRecoverySourceJobId(detailId);
-        const resolvedSourceId = resolveStandaloneRecoverySourceJobId(detailId);
+        const resolvedSourceId = resolveStandaloneCachedJobId(detailId);
         const matchedRecord = state.jobCache.get(resolvedSourceId || detailId) || null;
         const root = findDetailRoot();
         const detailHtmlText = normalizeSpace(matchedRecord && matchedRecord.detailHtml);
@@ -655,6 +692,19 @@
         return texts.length > 0;
     }
 
+    function getCachedDetailLabelTexts(snapshot, fallbackRecord = null) {
+        const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+        const sourceKeywords = normalizeCachedJobTagTexts(source.keywordTexts);
+        if (sourceKeywords.length) return sourceKeywords;
+
+        const sourceTags = normalizeCachedJobTagTexts(source.tagTexts);
+        if (sourceTags.length) return sourceTags;
+
+        const fallbackKeywords = normalizeCachedJobTagTexts(fallbackRecord && fallbackRecord.keywordTexts);
+        if (fallbackKeywords.length) return fallbackKeywords;
+        return normalizeCachedJobTagTexts(fallbackRecord && fallbackRecord.tagTexts);
+    }
+
     function normalizeCachedDetailSnapshot(snapshot, fallbackRecord = null) {
         if (!snapshot || typeof snapshot !== 'object') return null;
 
@@ -696,11 +746,12 @@
         const headerTagListHtml = normalizeCachedDetailHtmlFragment(snapshot.headerTagListHtml);
         if (headerTagListHtml) normalized.headerTagListHtml = headerTagListHtml;
 
+        const detailLabelTexts = getCachedDetailLabelTexts(snapshot, fallbackRecord);
         const jobLabelListHtml = normalizeCachedDetailHtmlFragment(snapshot.jobLabelListHtml);
         if (jobLabelListHtml) {
             normalized.jobLabelListHtml = jobLabelListHtml;
-        } else if (keywordTexts.length) {
-            const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts(keywordTexts);
+        } else if (detailLabelTexts.length) {
+            const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts(detailLabelTexts);
             if (derivedJobLabelListHtml) normalized.jobLabelListHtml = derivedJobLabelListHtml;
         }
 
@@ -2289,7 +2340,7 @@
     function sanitizeCachedDetailHtml(html) {
         const template = document.createElement('template');
         template.innerHTML = String(html || '');
-        template.content.querySelectorAll('script, iframe, object, embed, link[rel="preload"]').forEach((element) => element.remove());
+        template.content.querySelectorAll('script, style, iframe, object, embed, link[rel="preload"]').forEach((element) => element.remove());
         template.content.querySelectorAll([
             `.${APP_ID}-custom-tag-row`,
             `.${APP_ID}-custom-tag-wrap`,
@@ -2300,6 +2351,16 @@
         template.content.querySelectorAll('*').forEach((element) => {
             for (const attribute of Array.from(element.attributes)) {
                 if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+            }
+
+            const rawText = String(element.textContent || '').replace(/\s+/g, ' ').trim();
+            if (rawText && !normalizeSpace(rawText) && !element.children.length) {
+                element.remove();
+                return;
+            }
+
+            if (!element.children.length && normalizeSpace(rawText) && rawText !== normalizeSpace(rawText)) {
+                element.textContent = normalizeSpace(rawText);
             }
         });
         return template.innerHTML;
@@ -2391,7 +2452,10 @@
 
     function getStandaloneDetailKeywordTexts(root) {
         const scope = root || document;
-        return getTextListFromElements(scope.querySelectorAll('.job-keyword-list li'));
+        return getTextListFromElements(scope.querySelectorAll([
+            '.job-label-list li',
+            '.job-keyword-list li'
+        ].join(', ')));
     }
 
     function cloneStandaloneBannerTags(root) {
@@ -2461,6 +2525,42 @@
         return normalizeSpace(scope.querySelector('.company-address .location-address, .job-location .location-address, .job-address .location-address')?.textContent || '');
     }
 
+    function getStandaloneDetailSalaryText(root) {
+        const scope = root || document;
+        return normalizeSpace(scope.querySelector([
+            '.job-banner .name .salary',
+            '.job-primary .name .salary',
+            '.job-banner .info-primary .salary',
+            '.job-primary .info-primary .salary',
+            '.job-detail-header .job-salary',
+            '.job-detail-header .salary'
+        ].join(', '))?.textContent || '');
+    }
+
+    function getStandaloneDetailCompanyText(root) {
+        const scope = root || document;
+        const sidebarCompany = normalizeSpace(
+            scope.querySelector('.sider-company .company-info a[title]')?.getAttribute('title')
+            || scope.querySelector('.sider-company .company-info a[title]')?.textContent
+            || ''
+        );
+        if (sidebarCompany) return sidebarCompany;
+
+        const primaryCompany = normalizeSpace(
+            scope.querySelector('.company-info .company-name, .job-detail-company .company-name')?.textContent
+            || ''
+        );
+        if (primaryCompany) return primaryCompany;
+
+        const businessCompany = normalizeSpace(
+            scope.querySelector('.business-info-box .company-name, li.company-name')?.textContent
+            || ''
+        ).replace(/^公司名称\s*/, '');
+        if (businessCompany) return businessCompany;
+
+        return '';
+    }
+
     function getStandaloneHeaderMetaTexts(root) {
         const scope = root || document;
         const items = Array.from(scope.querySelectorAll('.job-detail-header .tag-list li'));
@@ -2471,8 +2571,8 @@
         if (!(root instanceof Element || root instanceof DocumentFragment || root instanceof Document)) return null;
 
         const title = normalizeSpace(root.querySelector('.job-banner .name h1, .job-primary .name h1, .job-detail-header .job-name, .job-detail-header h1, .job-name, h1')?.textContent || fallbackRecord.title || document.title);
-        const salaryText = normalizeSpace(root.querySelector('.job-banner .salary, .job-primary .salary, .job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]')?.textContent || fallbackRecord.salaryText || '');
-        const company = normalizeSpace(root.querySelector('.sider-company .company-info a[title], .job-detail-company .company-name, .company-info .company-name, .company-name, [class*="company-name"]')?.textContent || fallbackRecord.company || '');
+        const salaryText = getStandaloneDetailSalaryText(root) || normalizeSpace(fallbackRecord.salaryText);
+        const company = getStandaloneDetailCompanyText(root) || normalizeSpace(fallbackRecord.company);
         const locationText = getStandaloneDetailLocationText(root) || normalizeSpace(fallbackRecord.locationText);
         const [cityText = '', experienceText = '', degreeText = ''] = getStandaloneHeaderMetaTexts(root);
         const tagTexts = getStandaloneDetailTagTexts(root);
@@ -2534,8 +2634,10 @@
 
         const wrapper = document.createElement('div');
         const header = appendTextElement(wrapper, 'div', 'job-detail-header', '');
-        appendTextElement(header, 'div', 'job-name', normalized.title || '缓存职位');
-        if (normalized.salaryText) appendTextElement(header, 'span', 'salary', normalized.salaryText);
+        const nameRow = appendTextElement(header, 'div', 'name', '');
+        const titleHeading = appendTextElement(nameRow, 'h1', '', normalized.title || '缓存职位');
+        if (normalized.title) titleHeading.title = normalized.title;
+        if (normalized.salaryText) appendTextElement(nameRow, 'span', 'salary', normalized.salaryText);
 
         if (normalized.company || normalized.locationText) {
             const company = appendTextElement(wrapper, 'div', 'job-detail-company', '');
@@ -2612,6 +2714,19 @@
         return true;
     }
 
+    function replaceDetailHeaderTitleAndSalary(root, title, salaryText) {
+        if (!root) return;
+
+        replaceElementText(
+            root.querySelector('.job-detail-header .job-detail-info .job-name, .job-detail-header .job-name, .job-detail-header .name h1, .job-detail-header h1'),
+            title
+        );
+        replaceElementText(
+            root.querySelector('.job-detail-header .job-detail-info .job-salary, .job-detail-header .job-detail-info .salary, .job-detail-header .name .salary, .job-detail-header .job-salary, .job-detail-header .salary'),
+            salaryText
+        );
+    }
+
     function buildCachedJobDetailHtmlFromNativeShellSnapshot(snapshot, record, root) {
         if (!(root instanceof Element)) return '';
         const normalized = normalizeCachedDetailSnapshot(snapshot, record);
@@ -2624,8 +2739,7 @@
         clone.querySelectorAll(`.${APP_ID}-custom-tag-row, .${APP_ID}-custom-tag-wrap, .${APP_ID}-custom-tag, .${APP_ID}-custom-tag-add, .${APP_ID}-custom-tag-remove`).forEach((element) => element.remove());
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
 
-        replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), normalized.title || record.title || '缓存职位');
-        replaceElementText(clone.querySelector('.job-detail-header .job-salary, .job-detail-header .salary, .salary, .job-salary, [class*="salary"]'), normalized.salaryText || record.salaryText);
+        replaceDetailHeaderTitleAndSalary(clone, normalized.title || record.title || '缓存职位', normalized.salaryText || record.salaryText);
 
         if (!replaceElementFromHtml(clone, '.job-detail-header .tag-list', normalized.headerTagListHtml)) {
             const tagList = clone.querySelector('.job-detail-header .tag-list');
@@ -2680,8 +2794,7 @@
         clone.querySelectorAll(`.${APP_ID}-custom-tag-row, .${APP_ID}-custom-tag-wrap, .${APP_ID}-custom-tag, .${APP_ID}-custom-tag-add, .${APP_ID}-custom-tag-remove`).forEach((element) => element.remove());
         clone.querySelectorAll('[id]').forEach((element) => element.removeAttribute('id'));
 
-        replaceElementText(clone.querySelector('.job-detail-header .job-name, .job-detail-header h1, h1, .job-name'), normalized.title || record.title || '缓存职位');
-        replaceElementText(clone.querySelector('.job-detail-header .job-salary, .job-detail-header .salary, .salary, .job-salary, [class*="salary"]'), normalized.salaryText || record.salaryText);
+        replaceDetailHeaderTitleAndSalary(clone, normalized.title || record.title || '缓存职位', normalized.salaryText || record.salaryText);
 
         const tagList = clone.querySelector('.job-detail-header .tag-list');
         if (tagList) {
@@ -2693,7 +2806,17 @@
 
         const labelList = clone.querySelector('.job-detail-body .job-label-list');
         if (labelList) {
-            replaceListItemsPreservingAttributes(labelList, normalized.keywordTexts);
+            replaceListItemsPreservingAttributes(labelList, getCachedDetailLabelTexts(normalized, record));
+        } else if (normalized.jobLabelListHtml) {
+            const template = document.createElement('template');
+            template.innerHTML = normalized.jobLabelListHtml;
+            const generatedLabelList = template.content.firstElementChild;
+            if (generatedLabelList) {
+                const insertAfter = bodyTitle || clone.querySelector('.job-detail-body .job-detail-operate, .job-detail-body .job-detail-operate-wrap');
+                if (insertAfter && insertAfter.parentNode) {
+                    insertAfter.insertAdjacentElement('afterend', generatedLabelList);
+                }
+            }
         }
 
         const desc = clone.querySelector('.job-detail-body .desc, .job-detail-body .job-sec-text, .job-detail-body p.desc');
@@ -2783,8 +2906,8 @@
         const recoverySourceId = resolveStandaloneRecoverySourceJobId(detailId);
         const id = recoverySourceId || detailId;
         const title = normalizeSpace(document.querySelector('.job-banner .name h1, .job-primary .name h1, .job-detail-header .job-name, .job-detail-header h1, .job-name, h1')?.textContent || document.title);
-        const salaryText = normalizeSpace(document.querySelector('.job-banner .salary, .job-primary .salary, .job-detail-header .salary, .job-detail-header .job-salary, .salary, .job-salary, [class*="salary"]')?.textContent || '');
-        const company = normalizeSpace(document.querySelector('.sider-company .company-info a[title], .job-detail-company .company-name, .company-info .company-name, .company-name, [class*="company-name"]')?.textContent || '');
+        const salaryText = getStandaloneDetailSalaryText(root);
+        const company = getStandaloneDetailCompanyText(document);
         const locationText = getStandaloneDetailLocationText(root);
         const tagTexts = getStandaloneDetailTagTexts(root);
         const detailHtml = buildStandaloneDetailCaptureHtml(root, {
@@ -2836,9 +2959,10 @@
 
     function buildStandaloneJobDetailCacheRecord(root) {
         const detailId = extractJobIdFromHref(location.href);
-        const recoverySourceId = resolveStandaloneRecoverySourceJobId(detailId);
-        const id = recoverySourceId || detailId;
-        const detailSnapshot = buildDetailSnapshotFromRoot(root, {}) || null;
+        const securityId = extractSecurityIdFromHref(location.href)
+            || extractSecurityIdFromHref(root.querySelector('a.more-job-btn[href*="securityId="], a[href*="/job_detail/"][href*="securityId="]')?.href || '');
+        const id = resolveStandaloneCachedJobId(detailId, securityId) || detailId;
+        const detailSnapshot = buildDetailSnapshotFromRoot(document, {}) || buildDetailSnapshotFromRoot(root, {}) || null;
         const title = normalizeSpace(detailSnapshot && detailSnapshot.title);
         const salaryText = normalizeSpace(detailSnapshot && detailSnapshot.salaryText);
         const company = normalizeSpace(detailSnapshot && detailSnapshot.company);
@@ -2852,8 +2976,6 @@
             tagTexts
         });
         if (!id || !detailHtml) return null;
-        const securityId = extractSecurityIdFromHref(location.href)
-            || extractSecurityIdFromHref(root.querySelector('a.more-job-btn[href*="securityId="], a[href*="/job_detail/"][href*="securityId="]')?.href || '');
 
         return {
             id,
@@ -2971,10 +3093,20 @@
 
     function replaceTagList(list, values) {
         if (!list) return false;
-        list.textContent = '';
-        appendTagItems(list, values);
-        ensureCacheTag(list);
+        if (!replaceListItemsPreservingAttributes(list, values)) {
+            list.textContent = '';
+            appendTagItems(list, values);
+        }
         return true;
+    }
+
+    function getCachedCardDisplayTagTexts(record) {
+        const keywordTexts = normalizeCachedJobTagTexts(
+            (record && record.keywordTexts)
+            || (record && record.detailSnapshot && record.detailSnapshot.keywordTexts)
+        );
+        if (keywordTexts.length) return keywordTexts;
+        return normalizeCachedJobTagTexts(record && record.tagTexts);
     }
 
     function ensureCachedTagList(card) {
@@ -3547,7 +3679,7 @@
         const info = appendTextElement(left, 'div', 'job-info clearfix', '');
         if (record.salaryText) appendTextElement(info, 'span', 'salary', record.salaryText);
         const tags = appendTextElement(info, 'ul', 'tag-list', '');
-        replaceTagList(tags, record.tagTexts);
+        replaceTagList(tags, getCachedCardDisplayTagTexts(record));
 
         const right = appendTextElement(body, 'div', 'job-card-right', '');
         const companyInfo = appendTextElement(right, 'div', 'company-info', '');
@@ -3624,7 +3756,7 @@
         replaceElementText(card.querySelector('.salary, .job-salary, [class*="salary"]'), record.salaryText);
 
         const tagList = ensureCachedTagList(card);
-        replaceTagList(tagList, record.tagTexts);
+        replaceTagList(tagList, getCachedCardDisplayTagTexts(record));
 
         const companyElement = card.querySelector('.boss-name, .company-name span, .company-name, [class*="company-name"]');
         replaceElementText(companyElement, record.company || '公司信息已缓存');
@@ -3750,6 +3882,7 @@
             })
             .map(makeCacheableJobRecordFromCard)
             .filter(Boolean)
+            .filter((record) => !state.jobCache.has(record.id))
             .map((record) => ({
                 ...record,
                 schemaVersion: JOB_CACHE_SCHEMA_VERSION,

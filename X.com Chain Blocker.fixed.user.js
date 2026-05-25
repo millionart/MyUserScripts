@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.4.1
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据长度、内容、关键词等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       Gemini 2.5 Pro
@@ -35,7 +35,7 @@ let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterv
 let scriptConfig = {}, isConfigPanelBusy = false;
 
 // --- STYLES ---
-GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}`);
+GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel,.nuke-verify-modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:0}.nuke-config-panel::backdrop,.nuke-verify-modal::backdrop{background:rgba(91,112,131,0.45)}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea,.nuke-verify-textarea,.nuke-list-search,.nuke-setting-item input[type=number]{user-select:text;-webkit-user-select:text;pointer-events:auto}.nuke-config-textarea,.nuke-verify-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-verify-textarea{height:110px;line-height:1.5}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save,.nuke-config-button.copy{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover,.nuke-config-button.copy:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}.nuke-verify-note{font-size:14px;color:#8899a6;line-height:1.5;margin-bottom:10px}`);
 
 // --- CONFIGURATION MANAGEMENT ---
 async function loadConfig() {
@@ -52,13 +52,50 @@ async function loadConfig() {
 }
 async function saveConfig(config) { await GM_setValue(CONFIG_STORAGE_KEY, config); scriptConfig = config; }
 function updateMenuCommands() { GM_registerMenuCommand('配置与记录', showConfigPanel); }
+function closeDialogSurface(surface) {
+    if (!surface) return;
+    if (typeof surface.close === 'function' && surface.open) surface.close();
+    surface.remove();
+}
+function initializeDialogSurface(surface, options = {}) {
+    if (!surface) return;
+    const { initialFocusSelector = '', selectInitialText = false } = options;
+    const stopEvent = (event) => event.stopPropagation();
+    ['pointerdown', 'mousedown', 'mouseup', 'click', 'dblclick'].forEach((type) => {
+        surface.addEventListener(type, stopEvent);
+    });
+    surface.addEventListener('cancel', (event) => {
+        event.preventDefault();
+        closeDialogSurface(surface);
+    });
+    surface.addEventListener('click', (event) => {
+        if (event.target === surface) closeDialogSurface(surface);
+    });
+    surface.addEventListener('pointerdown', (event) => {
+        const target = event.target;
+        if (target && typeof target.matches === 'function' && target.matches('input, textarea')) {
+            window.setTimeout(() => {
+                if (typeof target.focus === 'function') target.focus({ preventScroll: true });
+                if (selectInitialText && typeof target.select === 'function') target.select();
+            }, 0);
+        }
+    }, true);
+    document.body.appendChild(surface);
+    if (typeof surface.showModal === 'function' && !surface.open) surface.showModal();
+    const initialField = initialFocusSelector ? surface.querySelector(initialFocusSelector) : null;
+    window.setTimeout(() => {
+        const target = initialField || surface;
+        if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+        if (selectInitialText && initialField && typeof initialField.select === 'function') initialField.select();
+    }, 0);
+}
 async function showConfigPanel() {
     if (isConfigPanelBusy) return;
     isConfigPanelBusy = true;
     try {
-        if (document.getElementById('nuke-url-config-panel')?.remove()) return;
+        closeDialogSurface(document.getElementById('nuke-url-config-panel'));
         let config = await loadConfig();
-        const panel = document.createElement('div');
+        const panel = document.createElement('dialog');
         panel.id = 'nuke-url-config-panel';
         panel.className = 'nuke-config-panel';
         panel.innerHTML = `
@@ -103,7 +140,8 @@ async function showConfigPanel() {
                     <div class="nuke-list"></div>
                 </div>
             </div>`;
-        document.body.appendChild(panel);
+        panel.tabIndex = -1;
+        initializeDialogSurface(panel, { initialFocusSelector: '#nuke-keywords-standard-textarea' });
         panel.querySelector('#nuke-auto-block-toggle').checked = config.autoBlockEnabled;
         panel.querySelector('#nuke-log-limit-input').value = config.blockLogLimit;
         panel.querySelector('#nuke-urls-textarea').value = (config.autoBlockUrls || []).join('\n');
@@ -115,7 +153,7 @@ async function showConfigPanel() {
             panel.querySelectorAll('.nuke-config-tab-content').forEach(c => c.classList.toggle('hidden', c.id !== `nuke-${tabName}-content`));
         };
         panel.querySelectorAll('.nuke-config-tab').forEach(tab => tab.addEventListener('click', () => setActiveTab(tab.dataset.tab)));
-        panel.querySelector('.nuke-close-button').addEventListener('click', () => panel.remove());
+        panel.querySelector('.nuke-close-button').addEventListener('click', () => closeDialogSurface(panel));
         panel.querySelector('.nuke-config-button.save').addEventListener('click', async () => {
             config.autoBlockEnabled = panel.querySelector('#nuke-auto-block-toggle').checked;
             config.blockLogLimit = parseInt(panel.querySelector('#nuke-log-limit-input').value, 10) || 500;
@@ -366,21 +404,105 @@ function closeMenuFromEvent(event) {
     const dropdownRoot = target.closest('div[data-testid="Dropdown"]') || target.closest('[data-testid="Dropdown"]');
     const menuNode = target.closest('div[role="menu"]') || target.closest('[role="menu"]');
     const removableContainer = dropdownRoot?.parentElement || menuNode?.parentElement;
-    if (removableContainer) {
-        removableContainer.remove();
-        return true;
-    }
     if (menuNode) {
-        menuNode.dispatchEvent(new KeyboardEvent('keydown', {
+        const escapeEvent = new KeyboardEvent('keydown', {
             key: 'Escape',
             code: 'Escape',
             keyCode: 27,
             which: 27,
             bubbles: true
-        }));
+        });
+        menuNode.dispatchEvent(escapeEvent);
+        document.dispatchEvent(escapeEvent);
+        if (removableContainer) {
+            window.setTimeout(() => {
+                if (menuNode.isConnected && removableContainer.isConnected) {
+                    removableContainer.remove();
+                }
+            }, 120);
+        }
+        return true;
+    }
+    if (removableContainer) {
+        removableContainer.remove();
         return true;
     }
     return false;
+}
+function showVerificationModal(userNameText) {
+    closeDialogSurface(document.getElementById('nuke-verify-modal'));
+    const modal = document.createElement('dialog');
+    modal.id = 'nuke-verify-modal';
+    modal.className = 'nuke-verify-modal';
+    modal.innerHTML = `
+        <div class="nuke-panel-header">
+            <div class="nuke-header-item left">
+                <button class="nuke-close-button" aria-label="关闭"><svg viewBox="0 0 24 24"><g><path d="M10.59 12L4.54 5.96l1.42-1.42L12 10.59l6.04-6.05 1.42 1.42L13.41 12l6.05 6.04-1.42 1.42L12 13.41l-6.04 6.05-1.42-1.42L10.59 12z"></path></g></svg></button>
+            </div>
+            <h2 class="nuke-config-title">验证用户名</h2>
+            <div class="nuke-header-item right"></div>
+        </div>
+        <div class="nuke-panel-content">
+            <p class="nuke-verify-note">这是 scraper 抓到的用户名，可直接复制后用于关键词设置。</p>
+            <textarea class="nuke-verify-textarea" readonly></textarea>
+            <div class="nuke-config-button-container">
+                <button class="nuke-config-button copy" type="button">复制用户名</button>
+            </div>
+        </div>`;
+    modal.tabIndex = -1;
+    const closeModal = () => closeDialogSurface(modal);
+    const textarea = modal.querySelector('.nuke-verify-textarea');
+    textarea.value = userNameText;
+    modal.querySelector('.nuke-close-button').addEventListener('click', closeModal);
+    modal.querySelector('.nuke-config-button.copy').addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(userNameText);
+            showToast('nuke-verify-copy-toast', '已复制', '用户名已复制到剪贴板', 2000);
+        } catch (error) {
+            console.warn('[CB] Failed to copy verified username:', error);
+            textarea.focus();
+            textarea.select();
+            showToast('nuke-verify-copy-toast', '复制失败', '已为你选中文本，可手动复制', 2500);
+        }
+    });
+    modal.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeModal();
+    });
+    initializeDialogSurface(modal, { initialFocusSelector: '.nuke-verify-textarea', selectInitialText: true });
+}
+async function copyTextToClipboard(text) {
+    if (!text) return false;
+    try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (error) {
+        console.warn('[CB] Clipboard API copy failed:', error);
+    }
+    try {
+        const fallback = document.createElement('textarea');
+        fallback.value = text;
+        fallback.setAttribute('readonly', 'readonly');
+        fallback.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none;';
+        document.body.appendChild(fallback);
+        fallback.focus();
+        fallback.select();
+        const copied = document.execCommand('copy');
+        fallback.remove();
+        return copied;
+    } catch (error) {
+        console.warn('[CB] execCommand copy failed:', error);
+        return false;
+    }
+}
+async function handleVerifiedUserName(userNameText) {
+    const copied = await copyTextToClipboard(userNameText);
+    if (copied) {
+        showToast('nuke-verify-copy-toast', '用户名已复制', `已复制: ${userNameText}`, 2600);
+        return;
+    }
+    showVerificationModal(userNameText);
 }
 
 // --- CORE LOGIC ---
@@ -609,9 +731,9 @@ function addVerificationButton(menuNode) {
             const nameElement = activeTweetArticle.querySelector('div[data-testid="User-Name"] a[role="link"] > div > div:first-child');
             const userNameText = getUsernameFromElement(nameElement);
             if (userNameText) {
-                prompt(" scraper 获取到的用户名 (可复制此内容用于关键词设置):", userNameText);
+                window.setTimeout(() => { handleVerifiedUserName(userNameText); }, 180);
             } else {
-                alert("无法从此推文获取用户名。");
+                showToast('nuke-verify-missing-toast', '无法获取用户名', '这条推文里没有抓到可用的用户名文本', 2500);
             }
         }
     });
