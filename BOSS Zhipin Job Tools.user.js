@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.98
+// @version      0.1.99
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -21,7 +21,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.98';
+    const SCRIPT_VERSION = '0.1.99';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -426,8 +426,6 @@
     }
 
     function renderDetailDebugToggleButton() {
-        removeGlobalPickerButton();
-
         const host = document.querySelector('.zp-side-entry-question') || document.querySelector('.zp-side-entry');
         let button = document.querySelector(`.${APP_ID}-detail-debug-toggle`);
         if (!button) {
@@ -5443,6 +5441,7 @@
         installStyles();
         loadJobCacheSettings();
         loadJobCache();
+        renderGlobalPickerButton();
         renderDetailDebugToggleButton();
         renderStandaloneDetailDebugPanel();
         document.addEventListener('click', handleCustomTagActionClick, true);

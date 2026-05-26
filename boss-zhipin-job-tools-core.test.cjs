@@ -30,8 +30,8 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.98\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.98';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.99\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.99';/);
 });
 
 test('userscript metadata also matches standalone Boss job detail pages', () => {
@@ -1054,7 +1054,13 @@ test('standalone detail debug panel can pick an element and copy its html to cli
     assert.match(script, /\.\$\{APP_ID\}-picker-fab-label \{/);
     assert.match(script, /label\.textContent = '<\/>'/);
     assert.match(script, /renderDetailDebugToggleButton\(\);/);
-    assert.match(script, /removeGlobalPickerButton\(\);/);
+});
+
+test('standalone detail page keeps both debug toggle and picker button available', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(script, /function renderDetailDebugToggleButton\(\) \{[\s\S]*const host = document\.querySelector\('\.zp-side-entry-question'\) \|\| document\.querySelector\('\.zp-side-entry'\);/);
+    assert.match(script, /function initStandaloneJobDetailPage\(\) \{[\s\S]*renderGlobalPickerButton\(\);[\s\S]*renderDetailDebugToggleButton\(\);/s);
+    assert.doesNotMatch(script, /function renderDetailDebugToggleButton\(\) \{[\s\S]*removeGlobalPickerButton\(\);/s);
 });
 
 test('standalone detail capture observer does not rerender debug panel before capture succeeds', () => {
