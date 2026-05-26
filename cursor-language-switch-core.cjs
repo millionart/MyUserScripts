@@ -533,6 +533,22 @@ function shouldSkipTranslationForContext(context = {}) {
     return false;
 }
 
+function shouldRebuildSettingsRow(context = {}) {
+    const hasExistingRow = Boolean(context.hasExistingRow);
+    const activeElementId = String(context.activeElementId || '');
+    const settingsButtonId = String(context.settingsButtonId || '');
+
+    if (!hasExistingRow) {
+        return true;
+    }
+
+    if (activeElementId && settingsButtonId && activeElementId === settingsButtonId) {
+        return false;
+    }
+
+    return false;
+}
+
 function createTranslationEngine() {
     function translateText(text, languageMode) {
         if (normalizeLanguageMode(languageMode) === 'default') {
@@ -569,4 +585,5 @@ module.exports = {
     normalizeLanguageMode,
     createTranslationEngine,
     shouldSkipTranslationForContext,
+    shouldRebuildSettingsRow,
 };

@@ -8,6 +8,7 @@ const {
     normalizeLanguageMode,
     createTranslationEngine,
     shouldSkipTranslationForContext,
+    shouldRebuildSettingsRow,
 } = require('./cursor-language-switch-core.cjs');
 
 function loadUserscriptTestApi() {
@@ -342,7 +343,7 @@ test('translates dynamic dashboard phrases without changing variable content', (
 test('userscript exposes a stable test API for file-tracking setup', () => {
     const api = loadUserscriptTestApi();
 
-    assert.equal(api.SCRIPT_VERSION, '0.1.23');
+    assert.equal(api.SCRIPT_VERSION, '0.1.25');
     assert.equal(api.LANGUAGE_STORAGE_KEY, 'cursor-dashboard-language-switch:language');
     assert.equal(api.DEFAULT_LANGUAGE_MODE, 'default');
     assert.equal(api.CHINESE_LANGUAGE_MODE, 'zh-CN');
@@ -372,6 +373,35 @@ test('skips translating transient GitLab loading buttons until they stabilize', 
         shouldSkipTranslationForContext({
             text: 'Connect',
             ancestorText: 'GitLab Connect GitLab for Cloud Agents, Bugbot and enhanced codebase context Connect',
+        }),
+        false,
+    );
+});
+
+test('does not rebuild the language row while the language select is active', () => {
+    assert.equal(
+        shouldRebuildSettingsRow({
+            hasExistingRow: false,
+            activeElementId: '',
+            settingsButtonId: 'cursor-language-switch-trigger',
+        }),
+        true,
+    );
+
+    assert.equal(
+        shouldRebuildSettingsRow({
+            hasExistingRow: true,
+            activeElementId: 'cursor-language-switch-trigger',
+            settingsButtonId: 'cursor-language-switch-trigger',
+        }),
+        false,
+    );
+
+    assert.equal(
+        shouldRebuildSettingsRow({
+            hasExistingRow: true,
+            activeElementId: '',
+            settingsButtonId: 'cursor-language-switch-trigger',
         }),
         false,
     );

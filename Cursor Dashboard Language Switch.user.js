@@ -2,7 +2,7 @@
 // @name         Cursor Dashboard Language Switch
 // @name:zh-CN   Cursor 后台语言切换
 // @namespace    https://github.com/milli/myuserscripts
-// @version      0.1.23
+// @version      0.1.25
 // @description  Add a language setting shell for Cursor dashboard and prepare Simplified Chinese UI translation support.
 // @description:zh-CN 为 Cursor 后台添加语言设置入口骨架，并为简体中文界面切换做准备。
 // @author       Codex
@@ -17,9 +17,13 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '0.1.23';
+    const SCRIPT_VERSION = '0.1.25';
     const SETTINGS_ROW_ID = 'cursor-language-switch-setting';
     const SETTINGS_BUTTON_ID = 'cursor-language-switch-trigger';
+    const SETTINGS_LABEL_ID = 'cursor-language-switch-label';
+    const SETTINGS_DESCRIPTION_ID = 'cursor-language-switch-description';
+    const SETTINGS_TRIGGER_TEXT_ID = 'cursor-language-switch-trigger-text';
+    const SETTINGS_MENU_ID = 'cursor-language-switch-menu';
     const LANGUAGE_STORAGE_KEY = 'cursor-dashboard-language-switch:language';
     const DEFAULT_LANGUAGE_MODE = 'default';
     const CHINESE_LANGUAGE_MODE = 'zh-CN';
@@ -751,6 +755,21 @@
             : { label: 'Language', optionDefault: 'Default', optionChinese: 'Chinese (Simplified)', current: 'Chinese (Simplified)' };
     }
 
+    function describeLanguageSetting(languageMode) {
+        return {
+            ...describeLanguageMode(languageMode),
+            description: normalizeLanguageMode(languageMode) === CHINESE_LANGUAGE_MODE
+                ? '为 Cursor 后台界面选择显示语言。'
+                : 'Choose the display language for the Cursor dashboard interface.',
+        };
+    }
+
+    function getCurrentLanguageOptionText(texts) {
+        return currentLanguageMode === CHINESE_LANGUAGE_MODE
+            ? texts.optionChinese
+            : texts.optionDefault;
+    }
+
     async function refreshPageLanguage(languageMode) {
         currentLanguageMode = normalizeLanguageMode(languageMode);
         ensureVersionMarker();
@@ -764,7 +783,7 @@
     }
 
     function buildLanguageSettingRow() {
-        const texts = describeLanguageMode(currentLanguageMode);
+        const texts = describeLanguageSetting(currentLanguageMode);
         const row = document.createElement('div');
         row.id = SETTINGS_ROW_ID;
         row.className = 'dashboard-cell align-center';
@@ -778,37 +797,146 @@
         const content = document.createElement('div');
         content.className = 'dashboard-cell-content';
         const label = document.createElement('div');
+        label.id = SETTINGS_LABEL_ID;
         label.className = 'dashboard-cell-label';
         label.textContent = texts.label;
         const description = document.createElement('div');
+        description.id = SETTINGS_DESCRIPTION_ID;
         description.className = 'dashboard-cell-description';
-        description.textContent = currentLanguageMode === CHINESE_LANGUAGE_MODE
-            ? '为 Cursor 后台界面选择显示语言。'
-            : 'Choose the display language for the Cursor dashboard interface.';
+        description.textContent = texts.description;
         content.append(label, description);
         leading.appendChild(content);
 
         const trailing = document.createElement('div');
         trailing.className = 'dashboard-cell-trailing-items';
-        const trigger = document.createElement('select');
+        const triggerWrapper = document.createElement('div');
+        triggerWrapper.className = 'relative';
+
+        const trigger = document.createElement('button');
         trigger.id = SETTINGS_BUTTON_ID;
-        trigger.className = 'dashboard-outline-button !px-2 dashboard-outline-button-md cursor-language-switch-select';
+        trigger.type = 'button';
+        trigger.className = 'dashboard-outline-button !px-2 dashboard-outline-button-md cursor-language-switch-trigger';
+        trigger.setAttribute('aria-haspopup', 'menu');
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.setAttribute('data-state', 'closed');
+
+        const triggerText = document.createElement('span');
+        triggerText.id = SETTINGS_TRIGGER_TEXT_ID;
+        triggerText.className = 'min-w-0 flex-1 truncate text-left dashboard-outline-button-text';
+        triggerText.textContent = getCurrentLanguageOptionText(texts);
+
+        const triggerIcon = document.createElement('i');
+        triggerIcon.className = 'cursor-icon ui-icon text-[color:var(--icon-quaternary)] opacity-60';
+        triggerIcon.setAttribute('data-icon-name', 'chevron-down');
+        triggerIcon.setAttribute('aria-hidden', 'true');
+        triggerIcon.style.setProperty('--cursor-icon-content', '""');
+        triggerIcon.style.setProperty('--icon-size', '10px');
+
+        const menu = document.createElement('div');
+        menu.id = SETTINGS_MENU_ID;
+        menu.className = 'cursor-language-switch-menu';
+        menu.hidden = true;
+
         [['default', texts.optionDefault], ['zh-CN', texts.optionChinese]].forEach(([value, labelText]) => {
-            const option = document.createElement('option');
-            option.value = value;
-            option.textContent = labelText;
-            option.selected = value === currentLanguageMode;
-            trigger.appendChild(option);
-        });
-        trigger.addEventListener('change', async () => {
-            const nextMode = normalizeLanguageMode(trigger.value);
-            await GM_setValue(LANGUAGE_STORAGE_KEY, nextMode);
-            await refreshPageLanguage(nextMode);
+            const optionButton = document.createElement('button');
+            optionButton.type = 'button';
+            optionButton.className = 'cursor-language-switch-menu-item';
+            optionButton.setAttribute('data-language-value', value);
+            optionButton.setAttribute('data-selected', value === currentLanguageMode ? 'true' : 'false');
+            optionButton.textContent = labelText;
+            optionButton.addEventListener('click', async () => {
+                closeLanguageMenu(row);
+                const nextMode = normalizeLanguageMode(value);
+                if (nextMode === currentLanguageMode) {
+                    syncExistingLanguageSettingRow(row);
+                    return;
+                }
+                await GM_setValue(LANGUAGE_STORAGE_KEY, nextMode);
+                await refreshPageLanguage(nextMode);
+            });
+            menu.appendChild(optionButton);
         });
 
-        trailing.appendChild(trigger);
+        trigger.addEventListener('click', () => {
+            toggleLanguageMenu(row);
+        });
+        trigger.append(triggerText, triggerIcon);
+        triggerWrapper.append(trigger, menu);
+        trailing.appendChild(triggerWrapper);
         row.append(divider, leading, trailing);
         return row;
+    }
+
+    function openLanguageMenu(row) {
+        const trigger = row.querySelector(`#${SETTINGS_BUTTON_ID}`);
+        const menu = row.querySelector(`#${SETTINGS_MENU_ID}`);
+        if (!trigger || !menu) return;
+        trigger.setAttribute('aria-expanded', 'true');
+        trigger.setAttribute('data-state', 'open');
+        menu.hidden = false;
+    }
+
+    function closeLanguageMenu(row) {
+        const trigger = row.querySelector(`#${SETTINGS_BUTTON_ID}`);
+        const menu = row.querySelector(`#${SETTINGS_MENU_ID}`);
+        if (!trigger || !menu) return;
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.setAttribute('data-state', 'closed');
+        menu.hidden = true;
+    }
+
+    function toggleLanguageMenu(row) {
+        const menu = row.querySelector(`#${SETTINGS_MENU_ID}`);
+        if (!menu) return;
+        if (menu.hidden) {
+            openLanguageMenu(row);
+            return;
+        }
+        closeLanguageMenu(row);
+    }
+
+    function syncLanguageMenu(row, texts) {
+        const triggerText = row.querySelector(`#${SETTINGS_TRIGGER_TEXT_ID}`);
+        const menu = row.querySelector(`#${SETTINGS_MENU_ID}`);
+        if (triggerText) {
+            triggerText.textContent = getCurrentLanguageOptionText(texts);
+        }
+        if (!menu) return;
+
+        const optionDefinitions = [
+            ['default', texts.optionDefault],
+            ['zh-CN', texts.optionChinese],
+        ];
+        const items = Array.from(menu.querySelectorAll('[data-language-value]'));
+        items.forEach((item, index) => {
+            const [value, labelText] = optionDefinitions[index] || [];
+            if (!value) {
+                item.remove();
+                return;
+            }
+            item.textContent = labelText;
+            item.setAttribute('data-language-value', value);
+            item.setAttribute('data-selected', value === currentLanguageMode ? 'true' : 'false');
+        });
+    }
+
+    function syncExistingLanguageSettingRow(row) {
+        if (!row) return false;
+
+        const texts = describeLanguageSetting(currentLanguageMode);
+        const label = row.querySelector(`#${SETTINGS_LABEL_ID}`);
+        const description = row.querySelector(`#${SETTINGS_DESCRIPTION_ID}`);
+        const select = row.querySelector(`#${SETTINGS_BUTTON_ID}`);
+
+        if (label) {
+            label.textContent = texts.label;
+        }
+        if (description) {
+            description.textContent = texts.description;
+        }
+        syncLanguageMenu(row, texts);
+
+        return Boolean(label && description && select);
     }
 
     function findThemeRow() {
@@ -825,12 +953,15 @@
         if (!themeRow || !themeRow.parentElement) return;
 
         const existingRow = document.getElementById(SETTINGS_ROW_ID);
-        const newRow = buildLanguageSettingRow();
         if (existingRow) {
-            existingRow.replaceWith(newRow);
-        } else {
-            themeRow.insertAdjacentElement('afterend', newRow);
+            if (syncExistingLanguageSettingRow(existingRow)) {
+                return;
+            }
+            existingRow.remove();
         }
+
+        const newRow = buildLanguageSettingRow();
+        themeRow.insertAdjacentElement('afterend', newRow);
     }
 
     function ensureStyles() {
@@ -838,17 +969,61 @@
             #${VERSION_MARKER_ID} {
                 backdrop-filter: blur(8px);
             }
-            .cursor-language-switch-select {
+            .cursor-language-switch-trigger {
                 min-width: 168px;
-                color: inherit;
-                appearance: auto;
                 cursor: pointer;
             }
-            .cursor-language-switch-select option {
-                color: #f5f5f5;
-                background: #161817;
+            .cursor-language-switch-menu {
+                position: absolute;
+                right: 0;
+                top: calc(100% + 8px);
+                z-index: 2147483646;
+                min-width: 168px;
+                padding: 6px;
+                border: 1px solid var(--border-tertiary);
+                border-radius: 10px;
+                background: var(--bg-elevated, #161817);
+                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+            }
+            .cursor-language-switch-menu-item {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                border: 0;
+                border-radius: 8px;
+                background: transparent;
+                color: inherit;
+                padding: 8px 10px;
+                font: inherit;
+                cursor: pointer;
+                text-align: left;
+            }
+            .cursor-language-switch-menu-item:hover {
+                background: var(--bg-quaternary);
+            }
+            .cursor-language-switch-menu-item[data-selected="true"] {
+                background: var(--bg-quaternary);
+                color: var(--text-primary);
             }
         `);
+    }
+
+    function installGlobalMenuCloser() {
+        document.addEventListener('click', (event) => {
+            const row = document.getElementById(SETTINGS_ROW_ID);
+            if (!row) return;
+            const target = event.target;
+            if (target instanceof Node && row.contains(target)) return;
+            closeLanguageMenu(row);
+        }, true);
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key !== 'Escape') return;
+            const row = document.getElementById(SETTINGS_ROW_ID);
+            if (!row) return;
+            closeLanguageMenu(row);
+        });
     }
 
     function scheduleRefresh() {
@@ -893,6 +1068,7 @@
         injectLanguageSetting();
         await refreshPageLanguage(storedMode);
         installObservers();
+        installGlobalMenuCloser();
     }
 
     if (document.readyState === 'loading') {
