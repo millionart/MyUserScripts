@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.88
+// @version      0.1.98
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -21,7 +21,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.88';
+    const SCRIPT_VERSION = '0.1.98';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -94,6 +94,7 @@
         detailPrefetchRunning: false,
         detailPrefetchSignature: '',
         detailDebugPickerActive: false,
+        detailDebugPanelVisible: false,
         detailDebugPickerTarget: null,
         detailDebugPickerOverlay: null,
         jobCacheChangeListenerId: null
@@ -327,7 +328,7 @@
 
     function updateStandaloneDetailDebugPanel() {
         renderStandaloneDetailDebugPanel();
-        renderGlobalPickerButton();
+        renderDetailDebugToggleButton();
     }
 
     function stopStandaloneDetailElementPicker(showCancelledToast = false) {
@@ -420,7 +421,58 @@
         button.setAttribute('aria-label', state.detailDebugPickerActive ? '退出元素拾取' : '选择元素复制 HTML');
     }
 
+    function removeGlobalPickerButton() {
+        document.querySelector(`.${APP_ID}-picker-fab`)?.remove();
+    }
+
+    function renderDetailDebugToggleButton() {
+        removeGlobalPickerButton();
+
+        const host = document.querySelector('.zp-side-entry-question') || document.querySelector('.zp-side-entry');
+        let button = document.querySelector(`.${APP_ID}-detail-debug-toggle`);
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = `${APP_ID}-detail-debug-toggle`;
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                state.detailDebugPanelVisible = !state.detailDebugPanelVisible;
+                renderStandaloneDetailDebugPanel();
+                renderDetailDebugToggleButton();
+            });
+            document.body.appendChild(button);
+        }
+
+        button.style.position = 'fixed';
+        if (host instanceof Element) {
+            const rect = host.getBoundingClientRect();
+            const hasUsableRect = rect.width > 8 && rect.height > 8;
+            if (hasUsableRect) {
+                button.style.left = `${Math.max(8, rect.left - 52)}px`;
+                button.style.top = `${Math.max(8, rect.top + Math.max(0, (rect.height - 30) / 2))}px`;
+                button.style.right = 'auto';
+                button.style.bottom = 'auto';
+            } else {
+                button.style.left = 'auto';
+                button.style.top = 'auto';
+                button.style.right = '18px';
+                button.style.bottom = '120px';
+            }
+        } else {
+            button.style.left = 'auto';
+            button.style.top = 'auto';
+            button.style.right = '18px';
+            button.style.bottom = '120px';
+        }
+        button.textContent = '调试';
+        button.classList.toggle(`${APP_ID}-detail-debug-toggle-active`, state.detailDebugPanelVisible);
+        button.setAttribute('aria-label', state.detailDebugPanelVisible ? '收起职位缓存调试' : '展开职位缓存调试');
+        button.title = state.detailDebugPanelVisible ? '收起职位缓存调试' : '展开职位缓存调试';
+    }
+
     function renderStandaloneDetailDebugPanel() {
+        renderDetailDebugToggleButton();
         const info = getStandaloneDetailDebugInfo();
         let panel = document.querySelector(`.${APP_ID}-detail-debug-panel`);
         if (!panel) {
@@ -429,18 +481,11 @@
             document.body.appendChild(panel);
         }
 
+        panel.hidden = !state.detailDebugPanelVisible;
+        if (!state.detailDebugPanelVisible) return;
+
         panel.textContent = '';
         appendTextElement(panel, 'h3', `${APP_ID}-detail-debug-title`, '职位缓存调试');
-        const actions = document.createElement('div');
-        actions.className = `${APP_ID}-detail-debug-actions`;
-        panel.appendChild(actions);
-        const pickerButton = document.createElement('button');
-        pickerButton.type = 'button';
-        pickerButton.className = `${APP_ID}-detail-debug-button`;
-        if (state.detailDebugPickerActive) pickerButton.classList.add(`${APP_ID}-detail-debug-button-active`);
-        pickerButton.textContent = state.detailDebugPickerActive ? '退出拾取' : '选择元素复制 HTML';
-        pickerButton.addEventListener('click', startStandaloneDetailElementPicker);
-        actions.appendChild(pickerButton);
         appendTextElement(panel, 'div', `${APP_ID}-detail-debug-meta`, `v${SCRIPT_VERSION}`);
         const pre = document.createElement('pre');
         pre.className = `${APP_ID}-detail-debug-pre`;
@@ -497,6 +542,75 @@
     function getJobDataSecurityId(jobData) {
         if (!jobData || typeof jobData !== 'object') return '';
         return normalizeSpace(jobData.securityId || jobData.encryptId || '');
+    }
+
+    function getJobDataArrayValues(jobData, keys) {
+        if (!jobData || typeof jobData !== 'object') return [];
+        for (const key of Array.isArray(keys) ? keys : []) {
+            const value = jobData[key];
+            if (Array.isArray(value) && value.length) return value;
+        }
+        return [];
+    }
+
+    function getJobDataFirstText(jobData, keys) {
+        if (!jobData || typeof jobData !== 'object') return '';
+        for (const key of Array.isArray(keys) ? keys : []) {
+            const value = normalizeSpace(jobData[key]);
+            if (value) return value;
+        }
+        return '';
+    }
+
+    function buildJobDataLocationText(jobData) {
+        if (!jobData || typeof jobData !== 'object') return '';
+        const direct = getJobDataFirstText(jobData, ['locationName', 'areaDistrict']);
+        if (direct && /·/.test(direct)) return direct;
+
+        const parts = normalizeCachedJobTagTexts([
+            getJobDataFirstText(jobData, ['cityName', 'city', 'jobCity']),
+            getJobDataFirstText(jobData, ['districtName', 'district', 'areaDistrict']),
+            getJobDataFirstText(jobData, ['businessDistrict', 'businessArea'])
+        ]);
+        return parts.join('·');
+    }
+
+    function buildCachedJobRecordFromJobData(jobData) {
+        if (!jobData || typeof jobData !== 'object') return null;
+        const id = getJobDataId(jobData);
+        if (!id) return null;
+
+        const title = getJobDataFirstText(jobData, ['jobName', 'positionName', 'postName', 'title', 'name']);
+        const company = getJobDataFirstText(jobData, ['brandName', 'companyName', 'brand', 'company', 'comName']);
+        const salaryText = getJobDataFirstText(jobData, ['salaryDesc', 'salaryText', 'salary', 'payDesc']);
+        const logoSrc = getJobDataFirstText(jobData, ['brandLogo', 'companyLogo', 'logoUrl', 'logo']);
+        const locationText = buildJobDataLocationText(jobData);
+        const securityId = getJobDataSecurityId(jobData);
+        const keywordTexts = normalizeCachedJobTagTexts([
+            ...getJobDataArrayValues(jobData, ['skills', 'jobLabels', 'labels']),
+            getJobDataFirstText(jobData, ['skillLabel', 'skillsDesc'])
+        ]);
+        const tagTexts = normalizeCachedJobTagTexts([
+            getJobDataFirstText(jobData, ['jobExperience', 'experienceName', 'experience']),
+            getJobDataFirstText(jobData, ['jobDegree', 'degreeName', 'degree'])
+        ]);
+        const activeTimeText = getActiveTimeTextFromJobData(jobData);
+        const activeRank = activeTimeText ? parseBossActiveTimeRank(activeTimeText) : Number.NaN;
+
+        return {
+            id,
+            ...(title ? { title } : {}),
+            ...(company ? { company } : {}),
+            ...(salaryText ? { salaryText } : {}),
+            ...(keywordTexts.length ? { keywordText: keywordTexts.join(' '), keywordTexts } : {}),
+            ...(logoSrc ? { logoSrc } : {}),
+            ...(tagTexts.length ? { tagTexts } : {}),
+            ...(locationText ? { locationText } : {}),
+            href: `https://www.zhipin.com/job_detail/${id}.html`,
+            ...(securityId ? { securityId } : {}),
+            ...(activeTimeText ? { activeTimeText } : {}),
+            ...(Number.isFinite(activeRank) ? { activeRank } : {})
+        };
     }
 
     function normalizeBossSalaryDigits(text) {
@@ -1312,11 +1426,6 @@
                 font-weight: 600;
                 line-height: 1.4;
             }
-            .${APP_ID}-detail-debug-actions {
-                display: none;
-                gap: 8px;
-                margin: 0 0 10px;
-            }
             .${APP_ID}-picker-fab {
                 position: fixed;
                 left: 18px;
@@ -1346,6 +1455,29 @@
             .${APP_ID}-picker-fab-label {
                 pointer-events: none;
                 transform: translateY(-1px);
+            }
+            .${APP_ID}-detail-debug-toggle {
+                position: fixed;
+                z-index: 2147483646;
+                appearance: none;
+                border: 0;
+                border-radius: 999px;
+                background: #00bebd;
+                color: #fff;
+                font: inherit;
+                font-size: 12px;
+                line-height: 1;
+                min-width: 44px;
+                min-height: 30px;
+                padding: 8px 10px;
+                cursor: pointer;
+                box-shadow: 0 6px 16px rgba(20, 29, 40, 0.18);
+            }
+            .${APP_ID}-detail-debug-toggle:hover {
+                background: #00a6a7;
+            }
+            .${APP_ID}-detail-debug-toggle.${APP_ID}-detail-debug-toggle-active {
+                background: #f97316;
             }
             .${APP_ID}-detail-debug-button {
                 appearance: none;
@@ -2714,6 +2846,37 @@
         return true;
     }
 
+    function getScopedVueAttributeNames(element) {
+        if (!(element instanceof Element)) return [];
+        return Array.from(element.attributes || [])
+            .map((attribute) => attribute.name)
+            .filter((name) => /^data-v-/.test(name));
+    }
+
+    function applyScopedVueAttributes(element, attributeNames) {
+        if (!(element instanceof Element) || !Array.isArray(attributeNames) || !attributeNames.length) return;
+        for (const name of attributeNames) {
+            element.setAttribute(name, '');
+        }
+    }
+
+    function materializeScopedDetailLabelList(html, scopeSource) {
+        const normalizedHtml = normalizeCachedDetailHtmlFragment(html);
+        if (!normalizedHtml) return null;
+
+        const template = document.createElement('template');
+        template.innerHTML = normalizedHtml;
+        const list = template.content.firstElementChild;
+        if (!(list instanceof Element)) return null;
+
+        const scopeNames = getScopedVueAttributeNames(scopeSource);
+        if (!scopeNames.length) return list;
+
+        applyScopedVueAttributes(list, scopeNames);
+        list.querySelectorAll('li, a, span').forEach((element) => applyScopedVueAttributes(element, scopeNames));
+        return list;
+    }
+
     function replaceDetailHeaderTitleAndSalary(root, title, salaryText) {
         if (!root) return;
 
@@ -2808,9 +2971,10 @@
         if (labelList) {
             replaceListItemsPreservingAttributes(labelList, getCachedDetailLabelTexts(normalized, record));
         } else if (normalized.jobLabelListHtml) {
-            const template = document.createElement('template');
-            template.innerHTML = normalized.jobLabelListHtml;
-            const generatedLabelList = template.content.firstElementChild;
+            const generatedLabelList = materializeScopedDetailLabelList(
+                normalized.jobLabelListHtml,
+                bodyTitle || clone.querySelector('.job-detail-body .desc, .job-detail-body .job-detail-operate, .job-detail-body')
+            );
             if (generatedLabelList) {
                 const insertAfter = bodyTitle || clone.querySelector('.job-detail-body .job-detail-operate, .job-detail-body .job-detail-operate-wrap');
                 if (insertAfter && insertAfter.parentNode) {
@@ -3040,7 +3204,6 @@
 
         const tryCapture = () => {
             if (resolved) return true;
-            renderStandaloneDetailDebugPanel();
             if (!captureStandaloneJobDetail()) return false;
             resolved = true;
             stop();
@@ -3875,13 +4038,31 @@
         }
 
         const activeExpectationText = getActiveJobExpectationText();
-        const records = getLiveJobCards()
+        const visibleRecordMap = new Map(
+            getLiveJobCards()
             .filter((card) => {
                 const id = getJobIdFromCard(card);
                 return Boolean(id && !state.ignoredJobs.has(id) && !isCardHiddenByFilters(card));
             })
             .map(makeCacheableJobRecordFromCard)
             .filter(Boolean)
+            .map((record) => [record.id, record])
+        );
+        const controller = getListController();
+        const controllerRecords = Array.isArray(controller && controller.jobList)
+            ? controller.jobList
+                .map((jobData) => {
+                    const baseRecord = buildCachedJobRecordFromJobData(jobData);
+                    if (!baseRecord) return null;
+                    const visibleRecord = visibleRecordMap.get(baseRecord.id);
+                    return {
+                        ...baseRecord,
+                        ...(visibleRecord || {})
+                    };
+                })
+                .filter(Boolean)
+            : [];
+        const records = (controllerRecords.length ? controllerRecords : Array.from(visibleRecordMap.values()))
             .filter((record) => !state.jobCache.has(record.id))
             .map((record) => ({
                 ...record,
@@ -5237,7 +5418,7 @@
         loadJobCache();
         watchJobCacheStorage();
         installStyles();
-        renderGlobalPickerButton();
+        renderDetailDebugToggleButton();
         registerMenus();
         installPageBridge();
         document.addEventListener('wheel', markJobListUserScroll, { passive: true, capture: true });
@@ -5262,7 +5443,7 @@
         installStyles();
         loadJobCacheSettings();
         loadJobCache();
-        renderGlobalPickerButton();
+        renderDetailDebugToggleButton();
         renderStandaloneDetailDebugPanel();
         document.addEventListener('click', handleCustomTagActionClick, true);
         captureStandaloneJobDetailWhenReady();

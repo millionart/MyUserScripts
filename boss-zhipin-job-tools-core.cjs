@@ -98,6 +98,84 @@ function getJobDataSecurityId(jobData) {
     return normalizeSpace(jobData.securityId || jobData.encryptId || '');
 }
 
+function normalizeCachedJobTagTexts(values) {
+    return Array.from(new Set(
+        (Array.isArray(values) ? values : [values])
+            .flatMap((value) => Array.isArray(value) ? value : [value])
+            .map(normalizeSpace)
+            .filter(Boolean)
+    ));
+}
+
+function getJobDataArrayValues(jobData, keys) {
+    if (!jobData || typeof jobData !== 'object') return [];
+    for (const key of Array.isArray(keys) ? keys : []) {
+        const value = jobData[key];
+        if (Array.isArray(value) && value.length) return value;
+    }
+    return [];
+}
+
+function getJobDataFirstText(jobData, keys) {
+    if (!jobData || typeof jobData !== 'object') return '';
+    for (const key of Array.isArray(keys) ? keys : []) {
+        const value = normalizeSpace(jobData[key]);
+        if (value) return value;
+    }
+    return '';
+}
+
+function buildJobDataLocationText(jobData) {
+    if (!jobData || typeof jobData !== 'object') return '';
+    const direct = getJobDataFirstText(jobData, ['locationName', 'areaDistrict']);
+    if (direct && /·/.test(direct)) return direct;
+
+    const parts = normalizeCachedJobTagTexts([
+        getJobDataFirstText(jobData, ['cityName', 'city', 'jobCity']),
+        getJobDataFirstText(jobData, ['districtName', 'district', 'areaDistrict']),
+        getJobDataFirstText(jobData, ['businessDistrict', 'businessArea'])
+    ]);
+    return parts.join('·');
+}
+
+function buildCachedJobRecordFromJobData(jobData) {
+    if (!jobData || typeof jobData !== 'object') return null;
+    const id = getJobDataId(jobData);
+    if (!id) return null;
+
+    const title = getJobDataFirstText(jobData, ['jobName', 'positionName', 'postName', 'title', 'name']);
+    const company = getJobDataFirstText(jobData, ['brandName', 'companyName', 'brand', 'company', 'comName']);
+    const salaryText = getJobDataFirstText(jobData, ['salaryDesc', 'salaryText', 'salary', 'payDesc']);
+    const logoSrc = getJobDataFirstText(jobData, ['brandLogo', 'companyLogo', 'logoUrl', 'logo']);
+    const locationText = buildJobDataLocationText(jobData);
+    const securityId = getJobDataSecurityId(jobData);
+    const keywordTexts = normalizeCachedJobTagTexts([
+        ...getJobDataArrayValues(jobData, ['skills', 'jobLabels', 'labels']),
+        getJobDataFirstText(jobData, ['skillLabel', 'skillsDesc'])
+    ]);
+    const tagTexts = normalizeCachedJobTagTexts([
+        getJobDataFirstText(jobData, ['jobExperience', 'experienceName', 'experience']),
+        getJobDataFirstText(jobData, ['jobDegree', 'degreeName', 'degree'])
+    ]);
+    const activeTimeText = getActiveTimeTextFromJobData(jobData);
+    const activeRank = activeTimeText ? parseBossActiveTimeRank(activeTimeText) : Number.NaN;
+
+    return {
+        id,
+        ...(title ? { title } : {}),
+        ...(company ? { company } : {}),
+        ...(salaryText ? { salaryText } : {}),
+        ...(keywordTexts.length ? { keywordText: keywordTexts.join(' '), keywordTexts } : {}),
+        ...(logoSrc ? { logoSrc } : {}),
+        ...(tagTexts.length ? { tagTexts } : {}),
+        ...(locationText ? { locationText } : {}),
+        href: `https://www.zhipin.com/job_detail/${id}.html`,
+        ...(securityId ? { securityId } : {}),
+        ...(activeTimeText ? { activeTimeText } : {}),
+        ...(Number.isFinite(activeRank) ? { activeRank } : {})
+    };
+}
+
 function normalizeBossSalaryDigits(text) {
     return String(text || '').replace(/[\uE031-\uE03A]/g, (char) => {
         const digit = char.charCodeAt(0) - 0xE031;
@@ -435,6 +513,7 @@ function serializeRecordMap(records) {
 }
 
 module.exports = {
+    buildCachedJobRecordFromJobData,
     JOB_CACHE_SCHEMA_VERSION,
     compareJobRecordsByActiveTime,
     extractBossActiveTimeText,

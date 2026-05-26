@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const {
+    buildCachedJobRecordFromJobData,
     JOB_CACHE_SCHEMA_VERSION,
     compareJobRecordsByActiveTime,
     extractJobIdFromHref,
@@ -29,8 +30,8 @@ const {
 
 test('userscript metadata is bumped for cached job retention delivery', () => {
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
-    assert.match(script, /\/\/ @version\s+0\.1\.88\b/);
-    assert.match(script, /const SCRIPT_VERSION = '0\.1\.88';/);
+    assert.match(script, /\/\/ @version\s+0\.1\.98\b/);
+    assert.match(script, /const SCRIPT_VERSION = '0\.1\.98';/);
 });
 
 test('userscript metadata also matches standalone Boss job detail pages', () => {
@@ -210,6 +211,53 @@ test('matches hidden filters by cached tags and detail keywords', () => {
         keywords: ['combat loop'],
         minSalaryMaxK: 30
     }), true);
+});
+
+test('builds a cacheable job record from loaded page job data', () => {
+    const record = buildCachedJobRecordFromJobData({
+        encryptJobId: 'abc123',
+        securityId: 'sec456',
+        jobName: 'TA（渲染向）',
+        brandName: '蛮啾网络',
+        salaryDesc: '15-30K·16薪',
+        brandLogo: 'https://img.example/logo.png',
+        skills: ['shader', 'UE5'],
+        cityName: '上海',
+        areaDistrict: '杨浦区',
+        businessDistrict: '五角场',
+        bossOnline: true
+    });
+
+    assert.deepEqual(record, {
+        id: 'abc123',
+        title: 'TA（渲染向）',
+        company: '蛮啾网络',
+        salaryText: '15-30K·16薪',
+        keywordText: 'shader UE5',
+        keywordTexts: ['shader', 'UE5'],
+        logoSrc: 'https://img.example/logo.png',
+        locationText: '上海·杨浦区·五角场',
+        href: 'https://www.zhipin.com/job_detail/abc123.html',
+        securityId: 'sec456',
+        activeTimeText: '在线',
+        activeRank: 0
+    });
+});
+
+test('build cached job record from job data keeps tag-style experience and degree labels', () => {
+    const record = buildCachedJobRecordFromJobData({
+        encryptJobId: 'def789',
+        title: '技术美术',
+        companyName: '某公司',
+        salary: '20-40K',
+        jobExperience: '3-5年',
+        jobDegree: '本科',
+        cityName: '上海'
+    });
+
+    assert.equal(record.id, 'def789');
+    assert.deepEqual(record.tagTexts, ['3-5年', '本科']);
+    assert.equal(record.locationText, '上海');
 });
 
 test('normalizes custom tags by job without changing hidden filter settings', () => {
@@ -800,7 +848,11 @@ test('cached detail label row falls back to cached card tags when keyword labels
     assert.match(script, /const derivedJobLabelListHtml = buildJobLabelListHtmlFromKeywordTexts\(detailLabelTexts\);/);
     assert.match(script, /replaceListItemsPreservingAttributes\(labelList, getCachedDetailLabelTexts\(normalized, record\)\);/);
     assert.match(script, /else if \(normalized\.jobLabelListHtml\) \{/);
-    assert.match(script, /template\.innerHTML = normalized\.jobLabelListHtml;/);
+    assert.match(script, /function getScopedVueAttributeNames\(element\)/);
+    assert.match(script, /function applyScopedVueAttributes\(element, attributeNames\)/);
+    assert.match(script, /function materializeScopedDetailLabelList\(html, scopeSource\)/);
+    assert.match(script, /list\.querySelectorAll\('li, a, span'\)\.forEach/);
+    assert.match(script, /const generatedLabelList = materializeScopedDetailLabelList\(/);
     assert.match(script, /insertAfter\.insertAdjacentElement\('afterend', generatedLabelList\)/);
 });
 
@@ -955,7 +1007,13 @@ test('standalone detail pages render a debug panel with cache mapping details', 
     const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
     assert.match(script, /\.\$\{APP_ID\}-detail-debug-panel \{/);
     assert.match(script, /\.\$\{APP_ID\}-detail-debug-pre \{/);
-    assert.match(script, /\.\$\{APP_ID\}-detail-debug-button \{/);
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-toggle \{/);
+    assert.match(script, /\.\$\{APP_ID\}-detail-debug-toggle\.\$\{APP_ID\}-detail-debug-toggle-active \{/);
+    assert.match(script, /button\.style\.position = 'fixed';/);
+    assert.match(script, /button\.style\.left = `\$\{Math\.max\(8, rect\.left - 52\)\}px`;/);
+    assert.match(script, /button\.style\.top = `\$\{Math\.max\(8, rect\.top \+ Math\.max\(0, \(rect\.height - 30\) \/ 2\)\)\}px`;/);
+    assert.match(script, /min-width:\s*44px;/);
+    assert.match(script, /min-height:\s*30px;/);
     assert.match(script, /\.\$\{APP_ID\}-detail-debug-picker-overlay \{/);
     assert.match(script, /const detailId = extractJobIdFromHref\(location\.href\)/);
     assert.match(script, /const recoverySourceIdFromHash = extractRecoverySourceJobIdFromLocation\(\)/);
@@ -963,6 +1021,16 @@ test('standalone detail pages render a debug panel with cache mapping details', 
     assert.match(script, /const matchedRecord = state\.jobCache\.get\(resolvedSourceId \|\| detailId\) \|\| null/);
     assert.match(script, /cacheStorageKey:\s*JOB_CACHE_STORAGE_KEY/);
     assert.match(script, /detailTextPreview:\s*detailHtmlText\.slice\(0,\s*600\)/);
+    assert.match(script, /detailDebugPanelVisible: false,/);
+    assert.match(script, /function renderDetailDebugToggleButton\(\)/);
+    assert.match(script, /function renderStandaloneDetailDebugPanel\(\) \{\s*renderDetailDebugToggleButton\(\);/s);
+    assert.match(script, /button\.textContent = '调试';/);
+    assert.match(script, /state\.detailDebugPanelVisible = !state\.detailDebugPanelVisible;/);
+    assert.match(script, /panel\.hidden = !state\.detailDebugPanelVisible;/);
+    assert.match(script, /if \(!state\.detailDebugPanelVisible\) return;/);
+    assert.match(script, /const hasUsableRect = rect\.width > 8 && rect\.height > 8;/);
+    assert.match(script, /button\.style\.right = '18px';/);
+    assert.match(script, /button\.style\.bottom = '120px';/);
     assert.match(script, /appendTextElement\(panel, 'h3', `\$\{APP_ID\}-detail-debug-title`, '职位缓存调试'\)/);
     assert.match(script, /pre\.textContent = JSON\.stringify\(info, null, 2\)/);
 });
@@ -981,13 +1049,20 @@ test('standalone detail debug panel can pick an element and copy its html to cli
     assert.match(script, /const target = getStandaloneDetailPickerTarget\(event\)/);
     assert.match(script, /const copied = await copyTextToClipboard\(target\.outerHTML \|\| ''\)/);
     assert.match(script, /function renderGlobalPickerButton\(\)/);
+    assert.match(script, /function removeGlobalPickerButton\(\)/);
     assert.match(script, /\.\$\{APP_ID\}-picker-fab \{/);
     assert.match(script, /\.\$\{APP_ID\}-picker-fab-label \{/);
     assert.match(script, /label\.textContent = '<\/>'/);
-    assert.match(script, /button\.classList\.toggle\(`\$\{APP_ID\}-picker-fab-active`, state\.detailDebugPickerActive\)/);
-    assert.match(script, /renderGlobalPickerButton\(\);/);
-    assert.match(script, /pickerButton\.textContent = state\.detailDebugPickerActive \? '退出拾取' : '选择元素复制 HTML'/);
-    assert.match(script, /pickerButton\.addEventListener\('click', startStandaloneDetailElementPicker\)/);
+    assert.match(script, /renderDetailDebugToggleButton\(\);/);
+    assert.match(script, /removeGlobalPickerButton\(\);/);
+});
+
+test('standalone detail capture observer does not rerender debug panel before capture succeeds', () => {
+    const script = fs.readFileSync(path.join(__dirname, 'BOSS Zhipin Job Tools.user.js'), 'utf8');
+    assert.match(
+        script,
+        /const tryCapture = \(\) => \{\s*if \(resolved\) return true;\s*if \(!captureStandaloneJobDetail\(\)\) return false;\s*resolved = true;\s*stop\(\);/s
+    );
 });
 
 test('userscript recovery links preserve the source cached job id for standalone detail capture', () => {
