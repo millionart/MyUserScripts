@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.14.53
+// @version      2.14.58
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       Gemini 2.5 Pro
@@ -35,6 +35,7 @@
 'use strict';
 // --- CONFIG & CONSTANTS ---
 const MENU_ITEM_TEXT = "九族拉黑";
+const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4-6.8c0-4.1,3.4-7.5,7.5-7.5S19.5,7.9,19.5,12z M12,6c-2.2,0-4,1.8-4,4s1.8,4,4,4s4-1.8,4-4S14.2,6,12,6z M12,14c-1.1,0-2-0.9-2-2c0-0.4,0.1-0.7,0.3-1H10v-2h1.3c-0.2-0.3-0.3-0.6-0.3-1c0-1.1,0.9-2,2-2s2,0.9,2,2c0,0.4-0.1,0.7-0.3,1H14v2h-1.3c0.2,0.3,0.3,0.6,0.3,1C14,13.1,13.1,14,12,14z";
 const STORAGE_KEY = 'CHAIN_BLOCKER_DATA';
 const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const BLOCK_INTERVAL_MS = 10 * 1000;
@@ -55,7 +56,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.14.53';
+const SPAM_SCANNER_BUILD = '2.14.58';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -792,15 +793,16 @@ const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null;
-let scriptConfig = {}, isConfigPanelBusy = false, debugConfigTriggerInstalled = false;
+let manualDetectedNukeRunning = false;
+let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false;
 const followerCountCache = new Map();
 const followerFetchPending = new Map();
 
 // --- STYLES ---
 GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel,.nuke-verify-modal{position:fixed;z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:0;margin:0}.nuke-verify-modal{top:50%;left:50%;transform:translate(-50%,-50%)}.nuke-config-panel{max-height:calc(100vh - 16px);overflow-y:auto;transform:none;top:0;left:0}.nuke-config-panel.nuke-dialog-dragging{user-select:none;will-change:left,top}.nuke-panel-header.nuke-dialog-drag-handle{cursor:grab;touch-action:none}.nuke-panel-header.nuke-dialog-drag-handle:active{cursor:grabbing}.nuke-config-panel::backdrop,.nuke-verify-modal::backdrop{background:rgba(91,112,131,0.45)}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea,.nuke-verify-textarea,.nuke-list-search,.nuke-setting-item input[type=number]{user-select:text;-webkit-user-select:text;pointer-events:auto}.nuke-config-textarea,.nuke-verify-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-verify-textarea{height:110px;line-height:1.5}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save,.nuke-config-button.copy{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover,.nuke-config-button.copy:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-block-reason{display:block;font-size:12px;color:#8899a6;margin-top:4px;line-height:1.4;word-break:break-word;white-space:normal}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer;flex-shrink:0;margin-left:8px}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item select{max-width:240px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-ocr-engine-item{align-items:center}.nuke-ocr-engine-controls{display:flex;align-items:center;gap:8px;flex-shrink:0}.nuke-ocr-engine-status{width:20px;height:20px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}.nuke-ocr-engine-status--idle{visibility:hidden;pointer-events:none}.nuke-ocr-engine-status svg{width:20px;height:20px;display:block}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-track{stroke:#38444d}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-progress{stroke:#1d9bf0;transition:stroke-dashoffset .25s ease}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-fill{fill:#f4212e}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-mark{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}.nuke-ocr-engine-status--error{cursor:help}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}.nuke-verify-note{font-size:14px;color:#8899a6;line-height:1.5;margin-bottom:10px}article[data-testid="tweet"].nuke-spam-identified{box-shadow:inset 0 0 0 1px rgba(255,173,31,.55);border-radius:12px}.nuke-spam-badge{display:inline-flex;align-items:center;margin:4px 12px 0;padding:2px 8px;font-size:12px;font-weight:700;color:#ffad1f;background:rgba(255,173,31,.12);border:1px solid rgba(255,173,31,.35);border-radius:9999px;cursor:help}`);
 GM_addStyle(`.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}`);
-GM_addStyle(`#nuke-spam-debug-config-trigger{position:fixed;right:12px;bottom:12px;z-index:100002;width:36px;height:36px;border-radius:9999px;border:1px solid #536471;background:#0f1419;color:#eff3f4;font:700 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.35);cursor:pointer}#nuke-spam-debug-config-trigger:hover{background:#1d9bf0;border-color:#1d9bf0;color:#fff}`);
 GM_addStyle(`.nuke-settings-module{border-top:1px solid #253341;padding-top:14px;margin-top:14px}.nuke-settings-module:first-child{border-top:0;padding-top:0;margin-top:0}.nuke-settings-module-title{font-size:13px;font-weight:700;color:#eff3f4;margin:0 0 10px}`);
+GM_addStyle(`#nuke-manual-detected-nuke-button{position:fixed;right:20px;bottom:146px;z-index:100002;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-manual-detected-nuke-button:hover:not(:disabled){background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg{width:32px;height:32px;display:block}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
 
 // --- CONFIGURATION MANAGEMENT ---
 async function loadConfig() {
@@ -849,33 +851,20 @@ function shouldShowDebugConfigTrigger() {
     const hash = String(window.location.hash || '');
     return /(?:[?&#])cb_spam_debug=1(?:[&#]|$)/.test(href) || /(?:^|[#&])cb-spam-debug(?:=1)?(?:[&#]|$)/.test(hash);
 }
-function ensureDebugConfigTrigger() {
-    const existing = document.getElementById('nuke-spam-debug-config-trigger');
-    if (!shouldShowDebugConfigTrigger()) {
-        existing?.remove();
-        return;
-    }
-    if (existing || !document.body) return;
-    const button = document.createElement('button');
-    button.id = 'nuke-spam-debug-config-trigger';
-    button.type = 'button';
-    button.textContent = 'CB';
-    button.setAttribute('aria-label', '打开 Chain Blocker 调试配置');
-    button.title = '打开 Chain Blocker 调试配置';
-    button.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        void showConfigPanel();
-    });
-    document.body.appendChild(button);
+function onInternalConfigShortcut(event) {
+    if (!shouldShowDebugConfigTrigger()) return;
+    if (event.code !== 'F8') return;
+    if (!event.altKey || !event.shiftKey) return;
+    if (event.repeat) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void showConfigPanel();
 }
-function installDebugConfigTrigger() {
-    if (!debugConfigTriggerInstalled) {
-        debugConfigTriggerInstalled = true;
-        window.addEventListener('hashchange', ensureDebugConfigTrigger);
-        window.addEventListener('popstate', ensureDebugConfigTrigger);
-    }
-    ensureDebugConfigTrigger();
+function installInternalConfigTrigger() {
+    if (internalConfigTriggerInstalled) return;
+    internalConfigTriggerInstalled = true;
+    document.addEventListener('cb-spam-probe', onCbSpamProbeRequest);
+    window.addEventListener('keydown', onInternalConfigShortcut, true);
 }
 function handleUserscriptBuildRerun() {
     try {
@@ -1178,6 +1167,7 @@ async function showConfigPanel() {
             config.spamAvatarKeywords = panel.querySelector('#nuke-spam-avatar-keywords-textarea').value.split('\n').map((kw) => kw.trim()).filter(Boolean);
             config.spamIdentifyMinScore = Math.max(1, parseInt(panel.querySelector('#nuke-spam-identify-score-input').value, 10) || DEFAULT_SPAM_IDENTIFY_MIN_SCORE);
             await saveConfig(config);
+            ensureManualDetectedNukeButton();
             if (nextEngine !== AVATAR_OCR_ENGINE_OFF) {
                 void preloadAvatarOcrEngineForUi(nextEngine);
             } else {
@@ -1903,6 +1893,7 @@ function ensureSpamBadge(article, detection, kind = 'text') {
         badge.title = `${detection.summary}\n得分: ${detection.score}`;
         badge.textContent = `疑似引流 · ${detection.score}分`;
     }
+    window.setTimeout(updateManualDetectedNukeButton, 0);
 }
 function isAutoNukeEnabled() {
     return scriptConfig.autoBlockEnabled === true;
@@ -1921,6 +1912,94 @@ function triggerAutoNukeForMarkedArticle(article, trigger) {
     article.dataset.autoblockChecked = 'complete';
     void initiateNukeProcess(article, trigger);
     return true;
+}
+function isDetectedNukeTargetArticle(article) {
+    return !!(
+        article?.isConnected &&
+        article.querySelector('.nuke-spam-badge') &&
+        article.dataset.autoblockTriggered !== 'true' &&
+        article.style.display !== 'none'
+    );
+}
+function getDetectedNukeTargetArticles() {
+    return Array.from(document.querySelectorAll('article[data-testid="tweet"]')).filter(isDetectedNukeTargetArticle);
+}
+function buildManualDetectedNukeTrigger(article) {
+    const badge = article?.querySelector?.('.nuke-spam-badge');
+    const badgeText = badge?.textContent?.trim() || '';
+    const badgeTitle = badge?.title?.trim() || '';
+    const combined = `${badgeText}\n${badgeTitle}`.trim();
+    if (/头像|OCR|全国安排/.test(combined)) {
+        const hit = (badgeTitle.match(/头像 OCR[:：]\s*([^\n]+)/)?.[1] || badgeText.replace(/^头像疑似引流\s*·\s*/, '') || '头像 OCR').trim();
+        return { triggerMode: 'auto', autoReason: 'avatar_ocr', avatarOcrHit: hit };
+    }
+    if (/疑似引流/.test(combined)) {
+        const score = Number(badgeText.match(/(\d+)\s*分/)?.[1]);
+        const summary = badgeTitle.split('\n')[0] || badgeText;
+        return { triggerMode: 'auto', autoReason: 'spam_identify', spamSummary: summary, spamScore: Number.isFinite(score) ? score : undefined };
+    }
+    return { triggerMode: 'auto', autoReason: 'manual_detected_target', spamSummary: combined || '已检测目标' };
+}
+function updateManualDetectedNukeButton() {
+    const button = document.getElementById('nuke-manual-detected-nuke-button');
+    if (!button) return;
+    const count = getDetectedNukeTargetArticles().length;
+    const countEl = button.querySelector('.nuke-manual-detected-count');
+    button.disabled = manualDetectedNukeRunning || count === 0;
+    button.title = count ? `九族拉黑 ${count} 个已检测目标` : '暂无已检测目标';
+    button.setAttribute('aria-label', button.title);
+    if (countEl) {
+        countEl.textContent = count > 99 ? '99+' : String(count);
+        countEl.hidden = count === 0;
+    }
+}
+function ensureManualDetectedNukeButton() {
+    const existing = document.getElementById('nuke-manual-detected-nuke-button');
+    if (isAutoNukeEnabled()) {
+        existing?.remove();
+        return;
+    }
+    if (!document.body || existing) {
+        updateManualDetectedNukeButton();
+        return;
+    }
+    const button = document.createElement('button');
+    button.id = 'nuke-manual-detected-nuke-button';
+    button.type = 'button';
+    button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><g><path d="${NUKE_ICON_PATH}" fill="currentColor"></path></g></svg><span class="nuke-manual-detected-count" hidden>0</span>`;
+    button.addEventListener('click', () => {
+        void executeManualNukeForDetectedTargets();
+    });
+    document.body.appendChild(button);
+    updateManualDetectedNukeButton();
+}
+async function executeManualNukeForDetectedTargets() {
+    if (manualDetectedNukeRunning || isAutoNukeEnabled()) return;
+    scanSpamIdentifyContent();
+    scanAndProcessContent();
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+    const articles = getDetectedNukeTargetArticles();
+    if (!articles.length) {
+        showToast('nuke-manual-detected-toast', '暂无已检测目标', '没有可执行九族拉黑的标记推文', 3000);
+        updateManualDetectedNukeButton();
+        return;
+    }
+    manualDetectedNukeRunning = true;
+    updateManualDetectedNukeButton();
+    showToast('nuke-manual-detected-toast', '手动执行九族拉黑', `正在处理 ${articles.length} 个已检测目标`, 3500);
+    try {
+        for (const article of articles) {
+            if (!isDetectedNukeTargetArticle(article)) continue;
+            article.dataset.autoblockTriggered = 'true';
+            article.dataset.autoblockChecked = 'complete';
+            await initiateNukeProcess(article, buildManualDetectedNukeTrigger(article));
+            updateManualDetectedNukeButton();
+            await new Promise((resolve) => window.setTimeout(resolve, 350));
+        }
+    } finally {
+        manualDetectedNukeRunning = false;
+        updateManualDetectedNukeButton();
+    }
 }
 function finalizeSpamArticleScan(article) {
     if (!article) return;
@@ -2119,6 +2198,7 @@ function scanSpamIdentifyContent() {
         document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
         document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
         document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
+        ensureManualDetectedNukeButton();
     } catch {
         /* probe only */
     }
@@ -2179,6 +2259,7 @@ function resolveAuthorBlockReason(trigger = {}) {
     if (trigger.autoReason === 'standard_keywords') return 'auto_author_keyword';
     if (trigger.autoReason === 'spam_identify') return 'auto_spam_identify';
     if (trigger.autoReason === 'avatar_ocr') return 'auto_avatar_ocr';
+    if (trigger.autoReason === 'manual_detected_target') return 'auto_manual_detected';
     return 'manual_author';
 }
 function buildAuthorBlockNote(trigger, context = {}) {
@@ -2188,7 +2269,8 @@ function buildAuthorBlockNote(trigger, context = {}) {
         auto_promo_target: '自动九族·引流目标',
         auto_author_keyword: '自动拉黑·关键词',
         auto_spam_identify: '自动九族·引流识别',
-        auto_avatar_ocr: '自动九族·头像OCR'
+        auto_avatar_ocr: '自动九族·头像OCR',
+        auto_manual_detected: '手动九族·已检测目标'
     };
     const handle = context.authorHandle ? `@${context.authorHandle}` : '该用户';
     let blockNote = `${reasonLabels[reason] || '拉黑·主推'} ${handle} 的推文${formatTweetContextSuffix(context)}`.trim();
@@ -2204,6 +2286,9 @@ function buildAuthorBlockNote(trigger, context = {}) {
     }
     if (reason === 'auto_avatar_ocr' && trigger.avatarOcrHit) {
         blockNote += `（头像 OCR: ${truncateBlockContextText(trigger.avatarOcrHit, 60)}）`;
+    }
+    if (reason === 'auto_manual_detected' && trigger.spamSummary) {
+        blockNote += `（${truncateBlockContextText(trigger.spamSummary, 60)}）`;
     }
     return { blockReason: reason, blockNote };
 }
@@ -2928,6 +3013,7 @@ function scanAndProcessContent() {
         const screenName = getScreenNameFromProfileHref(userLink?.href) || cell.querySelector('a[role="link"] span')?.textContent.trim() || '';
         void maybeAutoBlockTarget(cell.closest('div[data-testid="cellInnerDiv"]'), userNameText, screenName);
     });
+    ensureManualDetectedNukeButton();
 }
 function addNukeButton(menuNode) {
     if (menuNode.querySelector('.nuke-button')) return;
@@ -2940,10 +3026,9 @@ function addNukeButton(menuNode) {
         span.textContent = MENU_ITEM_TEXT;
         span.style.color = 'rgb(244, 33, 46)';
     }
-    const biohazardIconPath = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4-6.8c0-4.1,3.4-7.5,7.5-7.5S19.5,7.9,19.5,12z M12,6c-2.2,0-4,1.8-4,4s1.8,4,4,4s4-1.8,4-4S14.2,6,12,6z M12,14c-1.1,0-2-0.9-2-2c0-0.4,0.1-0.7,0.3-1H10v-2h1.3c-0.2-0.3-0.3-0.6-0.3-1c0-1.1,0.9-2,2-2s2,0.9,2,2c0,0.4-0.1,0.7-0.3,1H14v2h-1.3c0.2,0.3,0.3,0.6,0.3,1C14,13.1,13.1,14,12,14z";
     const svgIcon = nukeButton.querySelector('svg');
     if (svgIcon) {
-        svgIcon.innerHTML = `<g><path d="${biohazardIconPath}" fill="currentColor"></path></g>`;
+        svgIcon.innerHTML = `<g><path d="${NUKE_ICON_PATH}" fill="currentColor"></path></g>`;
         svgIcon.style.color = 'rgb(244, 33, 46)';
     }
     nukeButton.addEventListener('click', e => {
@@ -3032,16 +3117,28 @@ function onCbSpamProbeRequest(event) {
         scriptConfig.spamAvatarOcrEngine = normalizeAvatarOcrEngine(detail.engine);
         delete scriptConfig.spamAvatarOcrEnabled;
         void saveConfig(scriptConfig);
+        return;
+    }
+    if (detail.action === 'manualNukeDetected') {
+        void executeManualNukeForDetectedTargets();
     }
 }
 function exposePageSpamProbe() {
     try {
-        document.addEventListener('cb-spam-probe', onCbSpamProbeRequest);
+        installInternalConfigTrigger();
         document.documentElement.dataset.cbSpamProbeReady = '1';
         getPageWindow().__cbSpamProbe = {
-            openConfig: () => showConfigPanel(),
+            openConfig: () => {
+                document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'openConfig' } }));
+            },
             switchEngine: (engine) => {
                 document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'switchEngine', engine } }));
+            },
+            saveEngine: (engine) => {
+                document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'saveEngine', engine } }));
+            },
+            manualNukeDetected: () => {
+                document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'manualNukeDetected' } }));
             }
         };
     } catch {
@@ -3063,7 +3160,6 @@ async function initialize() {
     }
     exposePageSpamProbe();
     updateMenuCommands();
-    installDebugConfigTrigger();
     const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
     if (!profileLink) { setTimeout(initialize, 500); return; }
     try {
@@ -3075,6 +3171,7 @@ async function initialize() {
         currentUserScreenName = user.legacy.screen_name;
         console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
         await updateStatusToast();
+        ensureManualDetectedNukeButton();
         if (shouldShowDebugConfigTrigger()) {
             document.documentElement.dataset.cbSpamDebugMode = '1';
         } else {
