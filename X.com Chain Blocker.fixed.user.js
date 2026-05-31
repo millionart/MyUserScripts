@@ -2,9 +2,9 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.14.29
+// @version      2.14.53
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
-// @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据长度、内容、关键词、长用户名粉丝数等规则自动拉黑，并提供黑/白名单管理面板。
+// @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       Gemini 2.5 Pro
 // @license      MIT
 // @match        *://x.com/*
@@ -28,7 +28,7 @@
 // @connect      cdn.jsdelivr.net
 // @connect      tessdata.projectnaptha.com
 // @connect      docs.opencv.org
-// @require      https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js
+// @connect      paddle-model-ecology.bj.bcebos.com
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
 // ==/UserScript==
 (function () {
@@ -40,7 +40,7 @@ const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const BLOCK_INTERVAL_MS = 10 * 1000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
 const USERNAME_LENGTH_THRESHOLD = 25;
-const DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD = 500;
+const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 500;
 const BLOCK_CONTEXT_TEXT_MAX = 120;
 const DEFAULT_SPAM_IDENTIFY_MIN_SCORE = 3;
 const AVATAR_OCR_CACHE_MS = 30 * 60 * 1000;
@@ -55,7 +55,8 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.14.29';
+const SPAM_SCANNER_BUILD = '2.14.53';
+const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
 let tesseractLangCachePromise = null;
@@ -65,30 +66,40 @@ let avatarOcrPaddleReady = false;
 let avatarOcrEngineUiToken = 0;
 const AVATAR_OCR_ENGINE_TESSERACT = 'tesseract';
 const AVATAR_OCR_ENGINE_PADDLE = 'paddle';
+const AVATAR_OCR_ENGINE_OFF = 'off';
 const DEFAULT_AVATAR_OCR_ENGINE = AVATAR_OCR_ENGINE_TESSERACT;
 const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist';
 const TESSERACT_CORE_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1';
-const PADDLE_BROWSER_ASSETS = 'https://cdn.jsdelivr.net/npm/paddleocr-browser@1.0.3/dist/';
-const ESEARCH_OCR_URL = 'https://cdn.jsdelivr.net/npm/esearch-ocr@5.1.5/dist/esearch-ocr.js';
-const ORT_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js';
-const OPENCV_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0/opencv.js';
+const PADDLE_OCR_JS_URL = 'https://cdn.jsdelivr.net/npm/paddleocr@1.0.6/dist/index.js';
+const PADDLE_DET_TAR_URL = 'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_mobile_det_onnx.tar';
+const PADDLE_REC_TAR_URL = 'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_mobile_rec_onnx.tar';
+const ORT_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.wasm.min.js';
+const ORT_WASM_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/';
+const OPENCV_SCRIPT_URL = 'https://cdn.jsdelivr.net/npm/opencv.js@1.2.1/opencv.js';
 let userscriptCvLoadPromise = null;
+let ortWasmBlobPaths = null;
 function getPageWindow() {
     return typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 }
 function normalizeAvatarOcrEngine(value) {
     const engine = String(value || '').trim().toLowerCase();
+    if (engine === AVATAR_OCR_ENGINE_OFF) return AVATAR_OCR_ENGINE_OFF;
     if (engine === AVATAR_OCR_ENGINE_PADDLE) return AVATAR_OCR_ENGINE_PADDLE;
     return AVATAR_OCR_ENGINE_TESSERACT;
 }
 function getAvatarOcrEngine() {
     return normalizeAvatarOcrEngine(scriptConfig.spamAvatarOcrEngine);
 }
+function isAvatarOcrEnabled() {
+    return scriptConfig.spamAvatarOcrEnabled !== false && getAvatarOcrEngine() !== AVATAR_OCR_ENGINE_OFF;
+}
 function isAvatarOcrEngineFailed() {
-    return getAvatarOcrEngine() === AVATAR_OCR_ENGINE_PADDLE ? avatarOcrPaddleFailed : avatarOcrTesseractFailed;
+    const engine = getAvatarOcrEngine();
+    if (engine === AVATAR_OCR_ENGINE_OFF) return false;
+    return engine === AVATAR_OCR_ENGINE_PADDLE ? avatarOcrPaddleFailed : avatarOcrTesseractFailed;
 }
 function shouldDeferBackgroundAvatarOcr() {
-    if (scriptConfig.spamAvatarOcrEnabled === false || scriptConfig.spamIdentifyEnabled === false) return false;
+    if (!isAvatarOcrEnabled() || scriptConfig.spamIdentifyEnabled === false) return false;
     if (document.documentElement.dataset.cbSpamOcrUiState === 'loading') return true;
     const engine = getAvatarOcrEngine();
     if (engine === AVATAR_OCR_ENGINE_PADDLE) {
@@ -291,6 +302,7 @@ function resetPaddleUserscriptState() {
     userscriptCvLoadPromise = null;
     const pageWin = getPageWindow();
     delete pageWin.__cbPaddleBrowser;
+    delete pageWin.__cbPaddleOcrMod;
     delete pageWin.__cbPaddleBrowserLoadError;
     delete pageWin.__cbPaddleInitConfig;
     delete pageWin.__cbOrtScriptInjected;
@@ -346,13 +358,29 @@ function waitForPageOpenCv(timeoutMs = 300000) {
     const pageWin = getPageWindow();
     const started = Date.now();
     return new Promise((resolve, reject) => {
+        let pendingPromiseObserved = false;
         const finish = (cv) => {
             if (cv?.Mat) resolve(cv);
+            else if (!pendingPromiseObserved && typeof pageWin.cv?.then === 'function') {
+                pendingPromiseObserved = true;
+                pageWin.cv.then((resolvedCv) => {
+                    if (resolvedCv?.Mat) resolve(resolvedCv);
+                    else finish(pageWin.cv);
+                }).catch(reject);
+            }
             else if (Date.now() - started > timeoutMs) reject(new Error('timeout waiting for cv'));
             else window.setTimeout(() => finish(pageWin.cv), 250);
         };
         if (pageWin.cv?.Mat) {
             resolve(pageWin.cv);
+            return;
+        }
+        if (typeof pageWin.cv?.then === 'function') {
+            pendingPromiseObserved = true;
+            pageWin.cv.then((resolvedCv) => {
+                if (resolvedCv?.Mat) resolve(resolvedCv);
+                else finish(pageWin.cv);
+            }).catch(reject);
             return;
         }
         if (pageWin.cv && typeof pageWin.cv.onRuntimeInitialized === 'function') {
@@ -367,48 +395,163 @@ function waitForPageOpenCv(timeoutMs = 300000) {
 }
 async function loadPaddleModule() {
     const pageWin = getPageWindow();
-    if (pageWin.__cbPaddleMod) return pageWin.__cbPaddleMod;
-    let moduleUrl = ESEARCH_OCR_URL;
-    try {
-        if (typeof GM_getResourceURL === 'function') {
-            moduleUrl = GM_getResourceURL('esearchOcr');
-        }
-    } catch {
-        /* fallback */
-    }
+    if (pageWin.__cbPaddleOcrMod) return pageWin.__cbPaddleOcrMod;
     if (!pageWin.__cbPaddleModInjected) {
-        await injectPageScriptText(
-            `import { init as paddleInit, ocr as paddleOcr } from ${JSON.stringify(moduleUrl)};
-window.__cbPaddleMod = { init: paddleInit, ocr: paddleOcr };
-window.dispatchEvent(new CustomEvent('cb-paddle-mod-ready'));`,
-            { type: 'module', marker: '__cbPaddleModInjected' }
-        );
-        await new Promise((resolve, reject) => {
-            const timer = window.setTimeout(() => reject(new Error('paddle module load timeout')), 120000);
-            pageWin.addEventListener('cb-paddle-mod-ready', () => {
+        await new Promise(async (resolve, reject) => {
+            const timer = window.setTimeout(() => {
+                pageWin.removeEventListener('cb-paddle-mod-ready', onReady);
+                reject(new Error('paddle module load timeout'));
+            }, 120000);
+            const onReady = () => {
                 window.clearTimeout(timer);
                 resolve();
-            }, { once: true });
+            };
+            pageWin.addEventListener('cb-paddle-mod-ready', onReady, { once: true });
+            try {
+                const paddleScriptText = await gmFetchText(PADDLE_OCR_JS_URL, 120000);
+                addPageScriptElement({ textContent: paddleScriptText });
+                const poll = () => {
+                    if (pageWin.paddleocr?.PaddleOcrService) {
+                        pageWin.__cbPaddleOcrMod = pageWin.paddleocr;
+                        pageWin.dispatchEvent(new CustomEvent('cb-paddle-mod-ready'));
+                    } else {
+                        window.setTimeout(poll, 50);
+                    }
+                };
+                poll();
+                pageWin.__cbPaddleModInjected = true;
+            } catch (error) {
+                window.clearTimeout(timer);
+                pageWin.removeEventListener('cb-paddle-mod-ready', onReady);
+                reject(error);
+            }
         });
     }
-    if (!pageWin.__cbPaddleMod) throw new Error('esearch-ocr 未加载');
-    return pageWin.__cbPaddleMod;
+    if (!pageWin.__cbPaddleOcrMod?.PaddleOcrService) throw new Error('paddleocr 未加载');
+    return pageWin.__cbPaddleOcrMod;
 }
-function injectPageScriptText(text, { type = 'text/javascript', marker } = {}) {
-    const pageWin = getPageWindow();
-    if (marker && pageWin[marker]) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-        GM_addElement('script', {
-            parent: document.head,
-            type,
-            textContent: text,
-            onload: () => {
-                if (marker) pageWin[marker] = true;
-                resolve();
-            },
-            onerror: () => reject(new Error('GM_addElement script inject failed'))
-        });
+function addPageScriptElement(attributes) {
+    if (typeof GM_addElement === 'function') {
+        return GM_addElement(document.head || document.documentElement, 'script', attributes);
+    }
+    const script = document.createElement('script');
+    Object.entries(attributes || {}).forEach(([key, value]) => {
+        if (key === 'textContent') script.textContent = value;
+        else script.setAttribute(key, value);
     });
+    (document.head || document.documentElement).appendChild(script);
+    return script;
+}
+function readTarString(bytes, start, length) {
+    let output = '';
+    for (let index = start; index < start + length; index += 1) {
+        const value = bytes[index];
+        if (value === 0) break;
+        output += String.fromCharCode(value);
+    }
+    return output.replace(/\0.*$/, '').trim();
+}
+function readTarOctal(bytes, start, length) {
+    const raw = readTarString(bytes, start, length).replace(/\0/g, '').trim();
+    return raw ? parseInt(raw, 8) : 0;
+}
+function extractTarEntryBytes(buffer, targetName) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let offset = 0;
+    while (offset + 512 <= bytes.length) {
+        let empty = true;
+        for (let i = offset; i < offset + 512; i += 1) {
+            if (bytes[i] !== 0) {
+                empty = false;
+                break;
+            }
+        }
+        if (empty) break;
+        const name = readTarString(bytes, offset, 100).replace(/^\.?\//, '');
+        const size = readTarOctal(bytes, offset + 124, 12);
+        const dataStart = offset + 512;
+        const dataEnd = dataStart + size;
+        if (name === targetName || name.endsWith(`/${targetName}`)) return bytes.slice(dataStart, dataEnd);
+        offset = dataStart + Math.ceil(size / 512) * 512;
+    }
+    throw new Error(`tar entry not found: ${targetName}`);
+}
+function bytesToArrayBuffer(bytes) {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+function parsePaddleCharacterDictionary(ymlText) {
+    const chars = [''];
+    let inDict = false;
+    String(ymlText || '').split(/\r\n|\r|\n/).forEach((line) => {
+        if (/^\s*character_dict:\s*$/.test(line)) {
+            inDict = true;
+            return;
+        }
+        if (!inDict) return;
+        const match = line.match(/^\s*-\s?(.*)$/);
+        if (match) chars.push(match[1]);
+        else if (/^\S/.test(line)) inDict = false;
+    });
+    return chars;
+}
+async function blobToImageData(blob) {
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0);
+    if (typeof bitmap.close === 'function') bitmap.close();
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+async function loadOrtModule() {
+    const pageWin = getPageWindow();
+    if (pageWin.ort?.InferenceSession) return;
+    if (!pageWin.__cbOrtScriptInjected) {
+        await new Promise(async (resolve, reject) => {
+            const timer = window.setTimeout(() => {
+                pageWin.removeEventListener('cb-ort-ready', onReady);
+                reject(new Error('onnxruntime-web load timeout'));
+            }, 120000);
+            const onReady = () => {
+                window.clearTimeout(timer);
+                resolve();
+            };
+            pageWin.addEventListener('cb-ort-ready', onReady, { once: true });
+            try {
+                const ortScriptText = await gmFetchText(ORT_SCRIPT_URL, 120000);
+                addPageScriptElement({ textContent: ortScriptText });
+                const poll = () => {
+                    if (pageWin.ort?.InferenceSession) {
+                        pageWin.dispatchEvent(new CustomEvent('cb-ort-ready'));
+                    } else {
+                        window.setTimeout(poll, 50);
+                    }
+                };
+                poll();
+                pageWin.__cbOrtScriptInjected = true;
+            } catch (error) {
+                window.clearTimeout(timer);
+                pageWin.removeEventListener('cb-ort-ready', onReady);
+                reject(error);
+            }
+        });
+    }
+}
+async function ensureOrtWasmBlobPaths() {
+    if (ortWasmBlobPaths) return ortWasmBlobPaths;
+    const files = [
+        'ort-wasm-simd.wasm',
+        'ort-wasm.wasm',
+        'ort-wasm-simd-threaded.wasm'
+    ];
+    const entries = await Promise.all(files.map(async (file) => {
+        const buffer = await gmFetchArrayBuffer(`${ORT_WASM_BASE}${file}`, 120000);
+        const blobUrl = URL.createObjectURL(new Blob([buffer], { type: 'application/wasm' }));
+        return [file, blobUrl];
+    }));
+    ortWasmBlobPaths = Object.fromEntries(entries);
+    return ortWasmBlobPaths;
 }
 async function ensureSandboxCv() {
     const pageWin = getPageWindow();
@@ -417,15 +560,17 @@ async function ensureSandboxCv() {
         userscriptCvLoadPromise = (async () => {
             if (!pageWin.__cbOpencvInjected) {
                 await new Promise((resolve, reject) => {
-                    GM_addElement('script', {
-                        parent: document.head,
-                        src: OPENCV_SCRIPT_URL,
-                        onload: () => {
-                            pageWin.__cbOpencvInjected = true;
-                            resolve();
-                        },
-                        onerror: () => reject(new Error('opencv script load failed'))
-                    });
+                    const timer = window.setTimeout(() => reject(new Error('opencv script load timeout')), 120000);
+                    const script = addPageScriptElement({ src: OPENCV_SCRIPT_URL });
+                    script.addEventListener('load', () => {
+                        window.clearTimeout(timer);
+                        pageWin.__cbOpencvInjected = true;
+                        resolve();
+                    }, { once: true });
+                    script.addEventListener('error', () => {
+                        window.clearTimeout(timer);
+                        reject(new Error('opencv script load failed'));
+                    }, { once: true });
                 });
             }
             return waitForPageOpenCv();
@@ -436,16 +581,28 @@ async function ensureSandboxCv() {
     }
     return userscriptCvLoadPromise;
 }
-function ensureUserscriptOrt() {
-    if (!globalThis.ort?.InferenceSession) {
+async function ensureUserscriptOrt() {
+    await loadOrtModule();
+    const pageWin = getPageWindow();
+    const ortRef = pageWin.ort;
+    if (!ortRef?.InferenceSession) {
         throw new Error('onnxruntime-web 未加载（请在暴力猴中更新并启用本脚本）');
     }
     try {
-        getPageWindow().ort = globalThis.ort;
+        if (ortRef.env?.wasm) {
+            ortRef.env.wasm.wasmPaths = await ensureOrtWasmBlobPaths();
+            ortRef.env.wasm.numThreads = 1;
+            ortRef.env.wasm.proxy = false;
+        }
     } catch {
         /* ignore */
     }
-    return globalThis.ort;
+    try {
+        getPageWindow().ort = ortRef;
+    } catch {
+        /* ignore */
+    }
+    return ortRef;
 }
 function getAvatarOcrEngineStatusEl() {
     return document.querySelector('#nuke-spam-avatar-ocr-engine-status');
@@ -505,6 +662,10 @@ function isAvatarOcrEngineReady(engine) {
 function syncAvatarOcrEngineStatusForSelect(selectEl) {
     if (!selectEl) return;
     const engine = normalizeAvatarOcrEngine(selectEl.value);
+    if (engine === AVATAR_OCR_ENGINE_OFF) {
+        setAvatarOcrEngineUiStatus('idle');
+        return;
+    }
     if (isAvatarOcrEngineReady(engine)) {
         setAvatarOcrEngineUiStatus('ready', 100, engine === AVATAR_OCR_ENGINE_PADDLE ? 'PaddleOCR 已就绪' : 'Tesseract 已就绪');
         return;
@@ -552,6 +713,10 @@ function startPaddleUiProgressPulse(onProgress, fromPct = 52) {
 }
 async function preloadAvatarOcrEngineForUi(engine) {
     const normalized = normalizeAvatarOcrEngine(engine);
+    if (normalized === AVATAR_OCR_ENGINE_OFF) {
+        setAvatarOcrEngineUiStatus('idle');
+        return true;
+    }
     const token = prepareAvatarOcrEngineUiLoad(engine);
     if (isAvatarOcrEngineReady(normalized)) {
         setAvatarOcrEngineUiStatus('ready', 100);
@@ -627,24 +792,26 @@ const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null;
-let scriptConfig = {}, isConfigPanelBusy = false;
+let scriptConfig = {}, isConfigPanelBusy = false, debugConfigTriggerInstalled = false;
 const followerCountCache = new Map();
 const followerFetchPending = new Map();
 
 // --- STYLES ---
 GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel,.nuke-verify-modal{position:fixed;z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:0;margin:0}.nuke-verify-modal{top:50%;left:50%;transform:translate(-50%,-50%)}.nuke-config-panel{max-height:calc(100vh - 16px);overflow-y:auto;transform:none;top:0;left:0}.nuke-config-panel.nuke-dialog-dragging{user-select:none;will-change:left,top}.nuke-panel-header.nuke-dialog-drag-handle{cursor:grab;touch-action:none}.nuke-panel-header.nuke-dialog-drag-handle:active{cursor:grabbing}.nuke-config-panel::backdrop,.nuke-verify-modal::backdrop{background:rgba(91,112,131,0.45)}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea,.nuke-verify-textarea,.nuke-list-search,.nuke-setting-item input[type=number]{user-select:text;-webkit-user-select:text;pointer-events:auto}.nuke-config-textarea,.nuke-verify-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-verify-textarea{height:110px;line-height:1.5}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save,.nuke-config-button.copy{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover,.nuke-config-button.copy:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-block-reason{display:block;font-size:12px;color:#8899a6;margin-top:4px;line-height:1.4;word-break:break-word;white-space:normal}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer;flex-shrink:0;margin-left:8px}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item select{max-width:240px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-ocr-engine-item{align-items:center}.nuke-ocr-engine-controls{display:flex;align-items:center;gap:8px;flex-shrink:0}.nuke-ocr-engine-status{width:20px;height:20px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}.nuke-ocr-engine-status--idle{visibility:hidden;pointer-events:none}.nuke-ocr-engine-status svg{width:20px;height:20px;display:block}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-track{stroke:#38444d}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-progress{stroke:#1d9bf0;transition:stroke-dashoffset .25s ease}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-fill{fill:#f4212e}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-mark{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}.nuke-ocr-engine-status--error{cursor:help}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}.nuke-verify-note{font-size:14px;color:#8899a6;line-height:1.5;margin-bottom:10px}article[data-testid="tweet"].nuke-spam-identified{box-shadow:inset 0 0 0 1px rgba(255,173,31,.55);border-radius:12px}.nuke-spam-badge{display:inline-flex;align-items:center;margin:4px 12px 0;padding:2px 8px;font-size:12px;font-weight:700;color:#ffad1f;background:rgba(255,173,31,.12);border:1px solid rgba(255,173,31,.35);border-radius:9999px;cursor:help}`);
+GM_addStyle(`.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}`);
+GM_addStyle(`#nuke-spam-debug-config-trigger{position:fixed;right:12px;bottom:12px;z-index:100002;width:36px;height:36px;border-radius:9999px;border:1px solid #536471;background:#0f1419;color:#eff3f4;font:700 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.35);cursor:pointer}#nuke-spam-debug-config-trigger:hover{background:#1d9bf0;border-color:#1d9bf0;color:#fff}`);
+GM_addStyle(`.nuke-settings-module{border-top:1px solid #253341;padding-top:14px;margin-top:14px}.nuke-settings-module:first-child{border-top:0;padding-top:0;margin-top:0}.nuke-settings-module-title{font-size:13px;font-weight:700;color:#eff3f4;margin:0 0 10px}`);
 
 // --- CONFIGURATION MANAGEMENT ---
 async function loadConfig() {
     const defaultConfig = {
-        autoBlockEnabled: true,
-        effectiveUrls: ['https://x.com/*/status/*', 'https://x.com/search*', 'https://x.com/*'],
+        autoBlockEnabled: false,
+        autoBlockNukeModeVersion: AUTO_BLOCK_NUKE_MODE_VERSION,
         blockLogLimit: 500,
-        longNameFollowerExemptThreshold: DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD,
+        usernameRuleFollowerExemptThreshold: DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD,
         blockKeywordsStandard: [], // For any name
         spamIdentifyEnabled: true,
         spamIdentifyMinScore: DEFAULT_SPAM_IDENTIFY_MIN_SCORE,
-        spamAvatarOcrEnabled: true,
         spamAvatarOcrEngine: DEFAULT_AVATAR_OCR_ENGINE,
         spamAvatarKeywords: ['全国安排', '点击主页'],
         spamAutoExpandHidden: true
@@ -654,15 +821,21 @@ async function loadConfig() {
     if (migrated.promoTargetAutoNukeEnabled === true && migrated.autoBlockEnabled === false) {
         migrated.autoBlockEnabled = true;
     }
-    const legacyUrls = [
-        ...(Array.isArray(migrated.effectiveUrls) ? migrated.effectiveUrls : []),
-        ...(Array.isArray(migrated.autoBlockUrls) ? migrated.autoBlockUrls : []),
-        ...(Array.isArray(migrated.spamIdentifyUrls) ? migrated.spamIdentifyUrls : []),
-        ...(Array.isArray(migrated.promoTargetAutoNukeUrls) ? migrated.promoTargetAutoNukeUrls : [])
-    ].map((url) => String(url).trim()).filter(Boolean);
-    if (legacyUrls.length) migrated.effectiveUrls = [...new Set(legacyUrls)];
+    if (migrated.autoBlockNukeModeVersion !== AUTO_BLOCK_NUKE_MODE_VERSION) {
+        migrated.autoBlockEnabled = false;
+        migrated.autoBlockNukeModeVersion = AUTO_BLOCK_NUKE_MODE_VERSION;
+    }
+    if (migrated.usernameRuleFollowerExemptThreshold == null && migrated.longNameFollowerExemptThreshold != null) {
+        migrated.usernameRuleFollowerExemptThreshold = migrated.longNameFollowerExemptThreshold;
+    }
+    if (migrated.spamAvatarOcrEnabled === false) {
+        migrated.spamAvatarOcrEngine = AVATAR_OCR_ENGINE_OFF;
+    }
+    delete migrated.effectiveUrls;
     delete migrated.autoBlockUrls;
     delete migrated.spamIdentifyUrls;
+    delete migrated.longNameFollowerExemptThreshold;
+    delete migrated.spamAvatarOcrEnabled;
     delete migrated.promoTargetAutoNukeEnabled;
     delete migrated.promoTargetLearnOnNuke;
     delete migrated.promoTargetAutoNukeUrls;
@@ -671,6 +844,57 @@ async function loadConfig() {
 }
 async function saveConfig(config) { await GM_setValue(CONFIG_STORAGE_KEY, config); scriptConfig = config; }
 function updateMenuCommands() { GM_registerMenuCommand('配置与记录', showConfigPanel); }
+function shouldShowDebugConfigTrigger() {
+    const href = String(window.location.href || '');
+    const hash = String(window.location.hash || '');
+    return /(?:[?&#])cb_spam_debug=1(?:[&#]|$)/.test(href) || /(?:^|[#&])cb-spam-debug(?:=1)?(?:[&#]|$)/.test(hash);
+}
+function ensureDebugConfigTrigger() {
+    const existing = document.getElementById('nuke-spam-debug-config-trigger');
+    if (!shouldShowDebugConfigTrigger()) {
+        existing?.remove();
+        return;
+    }
+    if (existing || !document.body) return;
+    const button = document.createElement('button');
+    button.id = 'nuke-spam-debug-config-trigger';
+    button.type = 'button';
+    button.textContent = 'CB';
+    button.setAttribute('aria-label', '打开 Chain Blocker 调试配置');
+    button.title = '打开 Chain Blocker 调试配置';
+    button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void showConfigPanel();
+    });
+    document.body.appendChild(button);
+}
+function installDebugConfigTrigger() {
+    if (!debugConfigTriggerInstalled) {
+        debugConfigTriggerInstalled = true;
+        window.addEventListener('hashchange', ensureDebugConfigTrigger);
+        window.addEventListener('popstate', ensureDebugConfigTrigger);
+    }
+    ensureDebugConfigTrigger();
+}
+function handleUserscriptBuildRerun() {
+    try {
+        const pageWin = getPageWindow();
+        const previousBuild = pageWin.__cbSpamScannerBuild;
+        document.documentElement.dataset.cbSpamScannerBuild = SPAM_SCANNER_BUILD;
+        if (previousBuild && previousBuild !== SPAM_SCANNER_BUILD && pageWin.__cbSpamReloadingForBuild !== SPAM_SCANNER_BUILD) {
+            pageWin.__cbSpamReloadingForBuild = SPAM_SCANNER_BUILD;
+            window.setTimeout(() => {
+                window.location.reload();
+            }, 50);
+            return false;
+        }
+        pageWin.__cbSpamScannerBuild = SPAM_SCANNER_BUILD;
+    } catch {
+        /* ignore */
+    }
+    return true;
+}
 function closeDialogSurface(surface) {
     if (!surface) return;
     if (typeof surface.close === 'function' && surface.open) surface.close();
@@ -832,50 +1056,57 @@ async function showConfigPanel() {
                     <button class="nuke-config-tab" data-tab="promo">🎯 引流目标</button>
                 </div>
                 <div id="nuke-settings-content" class="nuke-config-tab-content">
-                    <div class="nuke-setting-item">
-                        <label for="nuke-auto-block-toggle">自动拉黑</label>
-                        <input type="checkbox" id="nuke-auto-block-toggle">
-                    </div>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-log-limit-input">拉黑记录最大条数 (0为不限制)</label>
-                        <input type="number" id="nuke-log-limit-input" min="0" step="100">
-                    </div>
-                    <label class="nuke-settings-label" for="nuke-keywords-standard-textarea">用户名无差别关键词 (无视长度与粉丝数, 每行一条; 支持纯文本或正则)</label>
-                    <textarea id="nuke-keywords-standard-textarea" class="nuke-config-textarea nuke-keywords-textarea" placeholder="例如: 点击主页&#10;💚(少妇|姐姐|妈妈)💚"></textarea>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-long-name-follower-input">长用户名粉丝数豁免 (粉丝数大于该值时不触发长用户名规则)</label>
-                        <input type="number" id="nuke-long-name-follower-input" min="0" step="1">
-                    </div>
-                    <label class="nuke-settings-label" for="nuke-effective-urls-textarea">生效 URL (自动拉黑 / 引流识别, 每行一条, 支持*):</label>
-                    <textarea id="nuke-effective-urls-textarea" class="nuke-config-textarea nuke-url-textarea"></textarea>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-spam-identify-toggle">引流识别 (仅页面黄标, 不拉黑)</label>
-                        <input type="checkbox" id="nuke-spam-identify-toggle">
-                    </div>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-spam-avatar-ocr-toggle">识别头像内文字 OCR (较慢, 并入引流识别)</label>
-                        <input type="checkbox" id="nuke-spam-avatar-ocr-toggle">
-                    </div>
-                    <div class="nuke-setting-item nuke-ocr-engine-item">
-                        <label for="nuke-spam-avatar-ocr-engine">头像 OCR 引擎</label>
-                        <div class="nuke-ocr-engine-controls">
-                            <span id="nuke-spam-avatar-ocr-engine-status" class="nuke-ocr-engine-status nuke-ocr-engine-status--idle" role="status" aria-live="polite" title=""></span>
-                            <select id="nuke-spam-avatar-ocr-engine">
-                                <option value="tesseract">Tesseract.js（默认，较轻）</option>
-                                <option value="paddle">PaddleOCR（paddleocr-browser，较准）</option>
-                            </select>
+                    <section class="nuke-settings-module">
+                        <h3 class="nuke-settings-module-title">执行模式</h3>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-auto-block-toggle">自动九族拉黑（关闭时仅标记）</label>
+                            <input type="checkbox" id="nuke-auto-block-toggle">
                         </div>
-                    </div>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-spam-auto-expand-toggle">推文页自动展开「可能的垃圾回复」</label>
-                        <input type="checkbox" id="nuke-spam-auto-expand-toggle">
-                    </div>
-                    <label class="nuke-settings-label" for="nuke-spam-avatar-keywords-textarea">头像 OCR 关键词 (每行一条; 留空则用用户名关键词; 另自动识别头像内「全国安排」)</label>
-                    <textarea id="nuke-spam-avatar-keywords-textarea" class="nuke-config-textarea nuke-keywords-textarea" placeholder="全国安排&#10;点击主页"></textarea>
-                    <div class="nuke-setting-item">
-                        <label for="nuke-spam-identify-score-input">推文引流识别最低得分</label>
-                        <input type="number" id="nuke-spam-identify-score-input" min="1" max="10" step="1">
-                    </div>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-log-limit-input">拉黑记录最大条数 (0为不限制)</label>
+                            <input type="number" id="nuke-log-limit-input" min="0" step="100">
+                        </div>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-spam-auto-expand-toggle">推文页自动展开「可能的垃圾回复」</label>
+                            <input type="checkbox" id="nuke-spam-auto-expand-toggle">
+                        </div>
+                    </section>
+                    <section class="nuke-settings-module">
+                        <h3 class="nuke-settings-module-title">用户名规则</h3>
+                        <label class="nuke-settings-label" for="nuke-keywords-standard-textarea">常规用户名关键词 (每行一条; 支持纯文本或正则)</label>
+                        <textarea id="nuke-keywords-standard-textarea" class="nuke-config-textarea nuke-keywords-textarea" placeholder="例如: 点击主页&#10;💚(少妇|姐姐|妈妈)💚"></textarea>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-username-rule-follower-input">常规用户名规则粉丝数豁免 (粉丝数大于该值时不触发用户名规则)</label>
+                            <input type="number" id="nuke-username-rule-follower-input" min="0" step="1">
+                        </div>
+                    </section>
+                    <section class="nuke-settings-module">
+                        <h3 class="nuke-settings-module-title">引流识别</h3>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-spam-identify-toggle">引流识别（命中后标记；自动九族开启时拉黑）</label>
+                            <input type="checkbox" id="nuke-spam-identify-toggle">
+                        </div>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-spam-identify-score-input">推文引流识别最低得分</label>
+                            <input type="number" id="nuke-spam-identify-score-input" min="1" max="10" step="1">
+                        </div>
+                    </section>
+                    <section class="nuke-settings-module">
+                        <h3 class="nuke-settings-module-title">头像 OCR</h3>
+                        <div class="nuke-setting-item nuke-ocr-engine-item">
+                            <label for="nuke-spam-avatar-ocr-engine">头像 OCR 引擎</label>
+                            <div class="nuke-ocr-engine-controls">
+                                <span id="nuke-spam-avatar-ocr-engine-status" class="nuke-ocr-engine-status nuke-ocr-engine-status--idle" role="status" aria-live="polite" title=""></span>
+                                <select id="nuke-spam-avatar-ocr-engine">
+                                    <option value="off">关闭头像 OCR</option>
+                                    <option value="tesseract">Tesseract.js（默认，较轻）</option>
+                                    <option value="paddle">PaddleOCR（paddleocr，较准）</option>
+                                </select>
+                            </div>
+                        </div>
+                        <label class="nuke-settings-label" for="nuke-spam-avatar-keywords-textarea">头像 OCR 关键词 (每行一条; 留空则用用户名关键词; 另自动识别头像内「全国安排」)</label>
+                        <textarea id="nuke-spam-avatar-keywords-textarea" class="nuke-config-textarea nuke-keywords-textarea" placeholder="全国安排&#10;点击主页"></textarea>
+                    </section>
                     <div class="nuke-config-button-container">
                         <button class="nuke-config-button save">保存设置</button>
                     </div>
@@ -889,7 +1120,7 @@ async function showConfigPanel() {
                     <div class="nuke-list"></div>
                 </div>
                 <div id="nuke-promo-content" class="nuke-config-tab-content hidden">
-                    <p class="nuke-verify-note">开启「自动拉黑」后，推文 @ 列表中账号会触发九族拉黑。手动九族拉黑时，推文里的 @ 会始终收录进此列表并立刻拉黑。</p>
+                    <p class="nuke-verify-note">开启「自动九族拉黑」后，推文 @ 列表中账号会触发九族拉黑；关闭时只标记命中项。手动九族拉黑时，推文里的 @ 会始终收录进此列表并立刻拉黑。</p>
                     <label class="nuke-settings-label" for="nuke-promo-targets-textarea">手动维护 @ (每行一个, 可带@):</label>
                     <textarea id="nuke-promo-targets-textarea" class="nuke-config-textarea nuke-url-textarea" placeholder="ChristineViu&#10;yeyebbz"></textarea>
                     <input type="search" class="nuke-list-search" id="nuke-promo-search" placeholder="搜索引流目标 @handle...">
@@ -901,17 +1132,17 @@ async function showConfigPanel() {
         enableDraggableDialog(panel);
         panel.querySelector('#nuke-auto-block-toggle').checked = config.autoBlockEnabled;
         panel.querySelector('#nuke-log-limit-input').value = config.blockLogLimit;
-        panel.querySelector('#nuke-effective-urls-textarea').value = (config.effectiveUrls || []).join('\n');
-        panel.querySelector('#nuke-long-name-follower-input').value = config.longNameFollowerExemptThreshold ?? DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD;
+        panel.querySelector('#nuke-username-rule-follower-input').value = config.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
         panel.querySelector('#nuke-keywords-standard-textarea').value = (config.blockKeywordsStandard || []).join('\n');
         panel.querySelector('#nuke-spam-identify-toggle').checked = config.spamIdentifyEnabled !== false;
-        panel.querySelector('#nuke-spam-avatar-ocr-toggle').checked = config.spamAvatarOcrEnabled !== false;
         const engineSelect = panel.querySelector('#nuke-spam-avatar-ocr-engine');
         engineSelect.value = normalizeAvatarOcrEngine(config.spamAvatarOcrEngine);
         engineSelect.addEventListener('change', () => {
-            void preloadAvatarOcrEngineForUi(normalizeAvatarOcrEngine(engineSelect.value));
+            const selectedEngine = normalizeAvatarOcrEngine(engineSelect.value);
+            if (selectedEngine === AVATAR_OCR_ENGINE_OFF) setAvatarOcrEngineUiStatus('idle');
+            else void preloadAvatarOcrEngineForUi(selectedEngine);
         });
-        if (config.spamAvatarOcrEnabled !== false) {
+        if (isAvatarOcrEnabled()) {
             syncAvatarOcrEngineStatusForSelect(engineSelect);
         } else {
             setAvatarOcrEngineUiStatus('idle');
@@ -931,8 +1162,7 @@ async function showConfigPanel() {
         panel.querySelector('.nuke-config-button.save').addEventListener('click', async () => {
             config.autoBlockEnabled = panel.querySelector('#nuke-auto-block-toggle').checked;
             config.blockLogLimit = parseInt(panel.querySelector('#nuke-log-limit-input').value, 10) || 500;
-            config.effectiveUrls = panel.querySelector('#nuke-effective-urls-textarea').value.split('\n').map(url => url.trim()).filter(Boolean);
-            config.longNameFollowerExemptThreshold = Math.max(0, parseInt(panel.querySelector('#nuke-long-name-follower-input').value, 10) || DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD);
+            config.usernameRuleFollowerExemptThreshold = Math.max(0, parseInt(panel.querySelector('#nuke-username-rule-follower-input').value, 10) || DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD);
             config.blockKeywordsStandard = panel.querySelector('#nuke-keywords-standard-textarea').value.split('\n').map(kw => kw.trim()).filter(Boolean);
             config.spamIdentifyEnabled = panel.querySelector('#nuke-spam-identify-toggle').checked;
             const nextEngine = normalizeAvatarOcrEngine(panel.querySelector('#nuke-spam-avatar-ocr-engine').value);
@@ -941,13 +1171,14 @@ async function showConfigPanel() {
                 avatarOcrCache.clear();
                 resetAvatarOcrRuntime();
             }
-            config.spamAvatarOcrEnabled = panel.querySelector('#nuke-spam-avatar-ocr-toggle').checked;
             config.spamAvatarOcrEngine = nextEngine;
+            delete config.spamAvatarOcrEnabled;
+            delete config.longNameFollowerExemptThreshold;
             config.spamAutoExpandHidden = panel.querySelector('#nuke-spam-auto-expand-toggle').checked;
             config.spamAvatarKeywords = panel.querySelector('#nuke-spam-avatar-keywords-textarea').value.split('\n').map((kw) => kw.trim()).filter(Boolean);
             config.spamIdentifyMinScore = Math.max(1, parseInt(panel.querySelector('#nuke-spam-identify-score-input').value, 10) || DEFAULT_SPAM_IDENTIFY_MIN_SCORE);
             await saveConfig(config);
-            if (config.spamAvatarOcrEnabled !== false) {
+            if (nextEngine !== AVATAR_OCR_ENGINE_OFF) {
                 void preloadAvatarOcrEngineForUi(nextEngine);
             } else {
                 setAvatarOcrEngineUiStatus('idle');
@@ -1300,15 +1531,36 @@ function markAvatarOcrEngineFailed(engine, error) {
     }
 }
 function textFromPaddleBrowserResult(result) {
-    if (!result) return '';
-    if (Array.isArray(result.parragraphs)) {
-        return normalizeOcrText(result.parragraphs.map((item) => item?.text || '').join(''));
+    return normalizeOcrText(collectPaddleOcrTexts(result).join(''));
+}
+function collectPaddleOcrTexts(value, texts = [], seen = new WeakSet()) {
+    if (!value) return texts;
+    if (typeof value === 'string') {
+        texts.push(value);
+        return texts;
     }
-    if (Array.isArray(result)) {
-        return normalizeOcrText(result.map((item) => (typeof item === 'string' ? item : item?.text || '')).join(''));
+    if (Array.isArray(value)) {
+        value.forEach((item) => collectPaddleOcrTexts(item, texts, seen));
+        return texts;
     }
-    if (typeof result.text === 'string') return normalizeOcrText(result.text);
-    return '';
+    if (typeof value !== 'object') return texts;
+    if (seen.has(value)) return texts;
+    seen.add(value);
+    if (typeof value.text === 'string') texts.push(value.text);
+    [
+        'parse',
+        'parragraphs',
+        'paragraphs',
+        'columns',
+        'src',
+        'lines',
+        'words',
+        'result',
+        'data'
+    ].forEach((key) => {
+        if (value[key] != null) collectPaddleOcrTexts(value[key], texts, seen);
+    });
+    return texts;
 }
 function publishPaddleUserscriptHandle(handle) {
     paddleUserscriptHandle = handle;
@@ -1343,34 +1595,34 @@ async function ensurePaddleUserscriptReadyInner(onProgress) {
     }
     if (!paddleUserscriptInitPromise) {
         paddleUserscriptInitPromise = (async () => {
-            report(8, '加载 OpenCV…');
-            const cv = await ensureSandboxCv();
-            if (!cv?.Mat) throw new Error('OpenCV 未就绪');
-            report(18, '加载 ONNX Runtime…');
-            const ortRef = ensureUserscriptOrt();
-            report(28, '加载识别引擎…');
+            report(8, '加载 PaddleOCR…');
             const Paddle = await loadPaddleModule();
+            report(18, '加载 ONNX Runtime…');
+            const ortRef = await ensureUserscriptOrt();
             report(32, '下载识别模型…');
             startPaddleUiProgressPulse(onProgress, 36);
-            const [dic, detPath, recPath] = await Promise.all([
-                gmFetchText(`${PADDLE_BROWSER_ASSETS}ppocr_keys_v1.txt`),
-                gmFetchBlobUrl(`${PADDLE_BROWSER_ASSETS}ppocr_det.onnx`),
-                gmFetchBlobUrl(`${PADDLE_BROWSER_ASSETS}ppocr_rec.onnx`)
+            const [detTar, recTar] = await Promise.all([
+                gmFetchArrayBuffer(PADDLE_DET_TAR_URL, 180000),
+                gmFetchArrayBuffer(PADDLE_REC_TAR_URL, 180000)
             ]);
-            report(52, '初始化 PaddleOCR…');
-            await Paddle.init({
-                detPath,
-                recPath,
-                dic,
+            report(58, '解包识别模型…');
+            const detModel = extractTarEntryBytes(detTar, 'inference.onnx');
+            const recModel = extractTarEntryBytes(recTar, 'inference.onnx');
+            const recYml = new TextDecoder().decode(extractTarEntryBytes(recTar, 'inference.yml'));
+            const charactersDictionary = parsePaddleCharacterDictionary(recYml);
+            report(68, '初始化 PaddleOCR…');
+            const service = await Paddle.PaddleOcrService.createInstance({
                 ort: ortRef,
-                node: false,
-                cv,
-                dev: false
+                detection: { modelBuffer: bytesToArrayBuffer(detModel) },
+                recognition: {
+                    modelBuffer: bytesToArrayBuffer(recModel),
+                    charactersDictionary
+                }
             });
             stopPaddleUiProgressPulse();
             return {
                 ready: true,
-                runOcr: (dataUrl) => Paddle.ocr(dataUrl)
+                runOcr: async (imageData) => service.processRecognition(await service.recognize(imageData))
             };
         })().then((handle) => {
             publishPaddleUserscriptHandle(handle);
@@ -1424,7 +1676,7 @@ async function getAvatarOcrWorkerInner() {
     return avatarOcrWorkerPromise;
 }
 function warmUpAvatarOcr() {
-    if (scriptConfig.spamIdentifyEnabled === false || scriptConfig.spamAvatarOcrEnabled === false) return;
+    if (scriptConfig.spamIdentifyEnabled === false || !isAvatarOcrEnabled()) return;
     const engine = getAvatarOcrEngine();
     const report = (pct, label) => {
         const selectEl = document.querySelector('#nuke-spam-avatar-ocr-engine');
@@ -1587,8 +1839,8 @@ async function recognizeAvatarWithTesseract(arrayBuffer, patterns = []) {
 async function recognizeAvatarWithPaddleBrowser(arrayBuffer) {
     const scaledBlob = await scaleAvatarBlobForOcr(arrayBuffer);
     const paddle = await ensurePaddleUserscriptReady();
-    const dataUrl = await blobToDataUrl(scaledBlob);
-    const result = await paddle.runOcr(dataUrl);
+    const imageData = await blobToImageData(scaledBlob);
+    const result = await paddle.runOcr(imageData);
     return textFromPaddleBrowserResult(result);
 }
 async function recognizeAvatarTextWithOcr(arrayBuffer, patterns = []) {
@@ -1627,7 +1879,18 @@ function ensureSpamBadge(article, detection, kind = 'text') {
         if (anchor?.parentElement) anchor.parentElement.insertBefore(badge, anchor);
         else article.prepend(badge);
     }
-    if (kind === 'avatar') {
+    if (kind === 'auto') {
+        const summary = detection.summary || '自动规则命中';
+        const badgeText = detection.badgeText || `自动标记 · ${summary}`;
+        const title = detection.title || summary;
+        if (badge.textContent) {
+            badge.title = `${badge.title || ''}\n${title}`.trim();
+            if (!badge.textContent.includes(badgeText)) badge.textContent = `${badge.textContent}；${badgeText}`;
+        } else {
+            badge.title = title;
+            badge.textContent = badgeText;
+        }
+    } else if (kind === 'avatar') {
         const avatarPart = `头像·${detection.summary}`;
         if (badge.textContent && badge.textContent.includes('疑似引流')) {
             badge.title = `${badge.title || ''}\n头像 OCR: ${detection.summary}`;
@@ -1640,6 +1903,24 @@ function ensureSpamBadge(article, detection, kind = 'text') {
         badge.title = `${detection.summary}\n得分: ${detection.score}`;
         badge.textContent = `疑似引流 · ${detection.score}分`;
     }
+}
+function isAutoNukeEnabled() {
+    return scriptConfig.autoBlockEnabled === true;
+}
+function markArticleForAutoRule(article, summary, title = summary) {
+    if (!article) return;
+    ensureSpamBadge(article, {
+        summary,
+        title,
+        badgeText: `自动标记 · ${summary}`
+    }, 'auto');
+}
+function triggerAutoNukeForMarkedArticle(article, trigger) {
+    if (!article || !isAutoNukeEnabled() || article.dataset.autoblockTriggered === 'true') return false;
+    article.dataset.autoblockTriggered = 'true';
+    article.dataset.autoblockChecked = 'complete';
+    void initiateNukeProcess(article, trigger);
+    return true;
 }
 function finalizeSpamArticleScan(article) {
     if (!article) return;
@@ -1700,13 +1981,19 @@ async function pumpAvatarOcrQueue() {
         }
         let matched = false;
         try {
-            if (scriptConfig.spamIdentifyEnabled === false || scriptConfig.spamAvatarOcrEnabled === false) {
+            if (scriptConfig.spamIdentifyEnabled === false || !isAvatarOcrEnabled()) {
                 if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
                 continue;
             }
             const analysis = await analyzeAvatarImageUrl(job.imageUrl, patterns);
             if (analysis.match) {
-                ensureSpamBadge(job.article, { match: true, score: 1, summary: analysis.hit || '头像关键词' }, 'avatar');
+                const hit = analysis.hit || '头像关键词';
+                ensureSpamBadge(job.article, { match: true, score: 1, summary: hit }, 'avatar');
+                triggerAutoNukeForMarkedArticle(job.article, {
+                    triggerMode: 'auto',
+                    autoReason: 'avatar_ocr',
+                    avatarOcrHit: hit
+                });
                 matched = true;
             }
         } catch (error) {
@@ -1730,10 +2017,21 @@ async function processSpamArticle(article) {
     const tweetText = getTweetTextFromArticle(article);
     if (tweetText) {
         const detection = detectSpamReply(tweetText);
-        if (detection.match) ensureSpamBadge(article, detection, 'text');
+        if (detection.match) {
+            ensureSpamBadge(article, detection, 'text');
+            if (triggerAutoNukeForMarkedArticle(article, {
+                triggerMode: 'auto',
+                autoReason: 'spam_identify',
+                spamSummary: detection.summary,
+                spamScore: detection.score
+            })) {
+                finalizeSpamArticleScan(article);
+                return;
+            }
+        }
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
-    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && scriptConfig.spamAvatarOcrEnabled !== false) {
+    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
         enqueueAvatarOcr(article, avatarUrl);
         return;
     }
@@ -1769,7 +2067,7 @@ function shouldSkipSpamArticleScan(article) {
     if (articleHasAvatarSpamBadge(article)) return true;
     const textBadge = article.querySelector('.nuke-spam-badge');
     if (textBadge && !/头像|全国安排/.test(textBadge.textContent || '')) return true;
-    if (scriptConfig.spamAvatarOcrEnabled !== false && getAvatarImageUrlFromArticle(article) && !shouldSkipAvatarOcrForArticle(article)) {
+    if (isAvatarOcrEnabled() && getAvatarImageUrlFromArticle(article) && !shouldSkipAvatarOcrForArticle(article)) {
         const failCount = parseInt(article.dataset.avatarOcrFailCount, 10) || 0;
         if (failCount < AVATAR_OCR_MAX_FAILS) {
             delete article.dataset.spamScanned;
@@ -1803,7 +2101,6 @@ function scheduleSpamRescanDebounced() {
 }
 function scanSpamIdentifyContent() {
     if (!currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
-    if (!isUrlMatch(window.location.href, scriptConfig.effectiveUrls || [])) return;
     resetSpamScanMarkersForBuildUpgrade();
     markStatusRootTweetArticles();
     tryExpandHiddenSpamReplies();
@@ -1839,7 +2136,7 @@ async function inspectTweetArticleForSpam(article) {
         }
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
-    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && scriptConfig.spamAvatarOcrEnabled !== false) {
+    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
         try {
             const analysis = await analyzeAvatarImageUrl(avatarUrl, resolveAvatarKeywordPatterns());
             if (analysis.match) {
@@ -1880,7 +2177,8 @@ function resolveAuthorBlockReason(trigger = {}) {
     if (trigger.triggerMode === 'manual') return 'manual_author';
     if (trigger.autoReason === 'promo_target_mention') return 'auto_promo_target';
     if (trigger.autoReason === 'standard_keywords') return 'auto_author_keyword';
-    if (trigger.autoReason === 'long_name_structure') return 'auto_author_long_name';
+    if (trigger.autoReason === 'spam_identify') return 'auto_spam_identify';
+    if (trigger.autoReason === 'avatar_ocr') return 'auto_avatar_ocr';
     return 'manual_author';
 }
 function buildAuthorBlockNote(trigger, context = {}) {
@@ -1889,7 +2187,8 @@ function buildAuthorBlockNote(trigger, context = {}) {
         manual_author: '九族拉黑·主推',
         auto_promo_target: '自动九族·引流目标',
         auto_author_keyword: '自动拉黑·关键词',
-        auto_author_long_name: '自动拉黑·长用户名'
+        auto_spam_identify: '自动九族·引流识别',
+        auto_avatar_ocr: '自动九族·头像OCR'
     };
     const handle = context.authorHandle ? `@${context.authorHandle}` : '该用户';
     let blockNote = `${reasonLabels[reason] || '拉黑·主推'} ${handle} 的推文${formatTweetContextSuffix(context)}`.trim();
@@ -1898,6 +2197,13 @@ function buildAuthorBlockNote(trigger, context = {}) {
     }
     if (reason === 'auto_author_keyword' && trigger.suspiciousDisplayName) {
         blockNote += `（显示名: ${truncateBlockContextText(trigger.suspiciousDisplayName, 60)}）`;
+    }
+    if (reason === 'auto_spam_identify' && trigger.spamSummary) {
+        const score = Number.isFinite(Number(trigger.spamScore)) ? `，${trigger.spamScore}分` : '';
+        blockNote += `（${truncateBlockContextText(trigger.spamSummary, 60)}${score}）`;
+    }
+    if (reason === 'auto_avatar_ocr' && trigger.avatarOcrHit) {
+        blockNote += `（头像 OCR: ${truncateBlockContextText(trigger.avatarOcrHit, 60)}）`;
     }
     return { blockReason: reason, blockNote };
 }
@@ -2108,20 +2414,14 @@ function matchesStandardKeywords(userNameText, patterns) {
         }
     });
 }
-function matchesLongNameStructure(userNameText) {
-    if (!userNameText || userNameText.length <= USERNAME_LENGTH_THRESHOLD) return false;
-    const hasChinese = /[\u4e00-\u9fa5]/.test(userNameText);
-    const slashCount = (userNameText.match(/\//g) || []).length;
-    return hasChinese && slashCount >= 2;
+function getUsernameRuleFollowerExemptThreshold() {
+    return scriptConfig.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
 }
 function getAutoBlockDecision(userNameText, followerCount) {
-    const exemptThreshold = scriptConfig.longNameFollowerExemptThreshold ?? DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD;
-    if (matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || [])) {
-        return { block: true, reason: 'standard_keywords' };
-    }
-    if (!matchesLongNameStructure(userNameText)) return { block: false, reason: 'no_match' };
+    const exemptThreshold = getUsernameRuleFollowerExemptThreshold();
+    if (!matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || [])) return { block: false, reason: 'no_match' };
     if (followerCount == null || Number.isNaN(followerCount)) return { block: false, reason: 'follower_unknown' };
-    if (followerCount <= exemptThreshold) return { block: true, reason: 'long_name_structure' };
+    if (followerCount <= exemptThreshold) return { block: true, reason: 'standard_keywords' };
     return { block: false, reason: 'follower_exempt' };
 }
 function getScreenNameFromProfileHref(href) {
@@ -2157,14 +2457,11 @@ async function getCachedFollowerCount(screenName) {
 }
 async function maybeAutoBlockTarget(targetArticle, userNameText, screenName) {
     if (!userNameText) return;
-    if (matchesLongNameStructure(userNameText) && !matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []) && !screenName) {
-        console.warn('[CB] 长用户名规则命中但无法解析 @handle，已跳过自动拉黑');
-        return;
-    }
+    if (!isAutoNukeEnabled()) return;
     const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
     if (!decision.block) {
         if (decision.reason === 'follower_exempt') {
-            console.log(`[CB] 跳过长用户名自动拉黑 @${screenName} (粉丝数 ${followerCount} > 阈值 ${scriptConfig.longNameFollowerExemptThreshold ?? DEFAULT_LONG_NAME_FOLLOWER_EXEMPT_THRESHOLD})`);
+            console.log(`[CB] 跳过常规用户名规则自动拉黑 @${screenName || '未知'} (粉丝数高于阈值 ${getUsernameRuleFollowerExemptThreshold()})`);
         }
         return;
     }
@@ -2531,7 +2828,6 @@ async function initiateNukeProcess(targetArticle, trigger = { triggerMode: 'manu
 }
 
 // --- UI SCANNING & AUTOMATION ---
-function isUrlMatch(url, patterns) { return patterns.some(p => new RegExp('^' + p.replace(/\*/g, '.*') + '$').test(url)); }
 function getUsernameFromElement(element) {
     if (!element) return '';
     const clone = element.cloneNode(true);
@@ -2558,10 +2854,15 @@ function getDisplayNameFromUserLink(userLink) {
     return raw.replace(new RegExp(`@?${handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'), '').trim() || raw;
 }
 async function evaluateUsernameAutoBlock(userNameText, screenName) {
-    const needsFollowerCheck = matchesLongNameStructure(userNameText) && !matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []);
+    const needsFollowerCheck = matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []);
     let followerCount = null;
     if (needsFollowerCheck && screenName) followerCount = await getCachedFollowerCount(screenName);
     return getAutoBlockDecision(userNameText, followerCount);
+}
+function getAutoBlockRuleLabel(reason) {
+    if (reason === 'standard_keywords') return '用户名关键词';
+    if (reason === 'promo_target_mention') return '引流目标';
+    return '自动规则';
 }
 async function processAutoBlockArticle(article, userData) {
     if (article.dataset.autoblockTriggered === 'true') return;
@@ -2573,12 +2874,16 @@ async function processAutoBlockArticle(article, userData) {
     if (userNameText) {
         const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
         if (decision.block) {
-            article.dataset.autoblockTriggered = 'true';
-            article.dataset.autoblockChecked = 'complete';
+            const label = getAutoBlockRuleLabel(decision.reason);
+            if (!isAutoNukeEnabled()) {
+                markArticleForAutoRule(article, label, `命中${label}: ${userNameText}`);
+                article.dataset.autoblockChecked = 'complete';
+                return;
+            }
             if (screenName) {
                 showToast(`nuke-auto-trigger-toast-${Date.now()}`, '🤖 自动执行拉黑', `检测到可疑用户名: ${screenName}`, 4000);
             }
-            void initiateNukeProcess(article, { triggerMode: 'auto', autoReason: decision.reason, suspiciousDisplayName: userNameText });
+            triggerAutoNukeForMarkedArticle(article, { triggerMode: 'auto', autoReason: decision.reason, suspiciousDisplayName: userNameText });
             return;
         }
     }
@@ -2586,9 +2891,12 @@ async function processAutoBlockArticle(article, userData) {
     if (tweetText && userData?.promoTargets?.length) {
         const matched = getMatchedPromoTargetInTweet(tweetText, userData.promoTargets);
         if (matched) {
-            article.dataset.autoblockTriggered = 'true';
-            article.dataset.autoblockChecked = 'complete';
-            void initiateNukeProcess(article, {
+            if (!isAutoNukeEnabled()) {
+                markArticleForAutoRule(article, `引流目标 @${matched}`, `推文提及引流目标 @${matched}`);
+                article.dataset.autoblockChecked = 'complete';
+                return;
+            }
+            triggerAutoNukeForMarkedArticle(article, {
                 triggerMode: 'auto',
                 autoReason: 'promo_target_mention',
                 promoTargetHandle: matched
@@ -2605,13 +2913,14 @@ async function processAutoBlockArticle(article, userData) {
 }
 function scanAndProcessContent() {
     document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
-    if (!currentUserId || !scriptConfig.autoBlockEnabled || !isUrlMatch(window.location.href, scriptConfig.effectiveUrls || [])) return;
+    if (!currentUserId) return;
     void loadUserData().then((userData) => {
         if (!userData) return;
         document.querySelectorAll('article[data-testid="tweet"]:not([data-autoblock-checked])').forEach((article) => {
             void processAutoBlockArticle(article, userData);
         });
     });
+    if (!isAutoNukeEnabled()) return;
     document.querySelectorAll('div[data-testid="UserCell"]:not([data-autoblock-checked])').forEach(cell => {
         cell.dataset.autoblockChecked = 'true';
         const userLink = cell.querySelector('a[role="link"]');
@@ -2721,6 +3030,7 @@ function onCbSpamProbeRequest(event) {
     }
     if (detail.action === 'saveEngine' && detail.engine) {
         scriptConfig.spamAvatarOcrEngine = normalizeAvatarOcrEngine(detail.engine);
+        delete scriptConfig.spamAvatarOcrEnabled;
         void saveConfig(scriptConfig);
     }
 }
@@ -2742,6 +3052,7 @@ function exposePageSpamProbe() {
 // --- INITIALIZATION & EXECUTION ---
 async function initialize() {
     console.log("[Chain Blocker] Initializing...");
+    if (!handleUserscriptBuildRerun()) return;
     await loadConfig();
     try {
         delete document.documentElement.dataset.cbSpamOcrLastError;
@@ -2752,6 +3063,7 @@ async function initialize() {
     }
     exposePageSpamProbe();
     updateMenuCommands();
+    installDebugConfigTrigger();
     const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
     if (!profileLink) { setTimeout(initialize, 500); return; }
     try {
@@ -2763,9 +3075,14 @@ async function initialize() {
         currentUserScreenName = user.legacy.screen_name;
         console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
         await updateStatusToast();
-        if (processIntervalId) clearInterval(processIntervalId);
-        processIntervalId = setInterval(processQueue, PROCESS_CHECK_INTERVAL_MS);
-        setTimeout(processQueue, 1000);
+        if (shouldShowDebugConfigTrigger()) {
+            document.documentElement.dataset.cbSpamDebugMode = '1';
+        } else {
+            delete document.documentElement.dataset.cbSpamDebugMode;
+            if (processIntervalId) clearInterval(processIntervalId);
+            processIntervalId = setInterval(processQueue, PROCESS_CHECK_INTERVAL_MS);
+            setTimeout(processQueue, 1000);
+        }
     } catch (error) {
         if (error?.status === 429) {
             console.warn(`[CB] API rate limit hit. Retrying in ${API_RETRY_DELAY_MS / 60000} minutes.`);
