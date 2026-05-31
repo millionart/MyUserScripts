@@ -2,7 +2,7 @@
 // @name         BOSS Zhipin Job Tools
 // @name:zh-CN   BOSS直聘职位忽略与活跃排序
 // @namespace    https://github.com/milli/youtube-subscription-category-manager
-// @version      0.1.99
+// @version      0.1.100
 // @description  在 BOSS 直聘职位列表详情区添加忽略、隐藏筛选，并支持按发布者活跃时间排序当前已加载职位。
 // @author       Codex
 // @license      MIT
@@ -21,7 +21,7 @@
     'use strict';
 
     const APP_ID = 'bzjt';
-    const SCRIPT_VERSION = '0.1.99';
+    const SCRIPT_VERSION = '0.1.100';
     const STORAGE_KEY = 'boss-zhipin-job-tools:ignored-jobs';
     const ACTIVE_TIME_CACHE_STORAGE_KEY = 'boss-zhipin-job-tools:active-time-cache';
     const HIDDEN_FILTER_SETTINGS_STORAGE_KEY = 'boss-zhipin-job-tools:hidden-filter-settings';
@@ -4080,6 +4080,7 @@
 
         const after = JSON.stringify(serializeRecordMap(state.jobCache));
         if (after !== before) saveJobCache();
+        updateClearCacheButtonLabel();
     }
 
     function clearDetailPrefetchTimer() {
@@ -4285,8 +4286,16 @@
             renderCardActiveBadge(card, getCardActiveTimeText(card));
         }
         renderCachedJobCards({ allowDuringScroll: true });
+        updateClearCacheButtonLabel();
         updateToolbarStatus('');
         showToast(`\u5df2\u6e05\u9664 ${jobCacheCount} \u6761\u804c\u4f4d\u7f13\u5b58\u548c ${activeTimeCount} \u6761\u6d3b\u8dc3\u7f13\u5b58`);
+    }
+
+    function updateClearCacheButtonLabel(toolbar = document.querySelector(`.${APP_ID}-toolbar`)) {
+        const button = toolbar?.querySelector(`.${APP_ID}-clear-cache-btn`);
+        if (!button) return;
+        const count = state.jobCache.size;
+        button.textContent = `清除缓存(${count})`;
     }
 
     function renderCachedJobCards(options = {}) {
@@ -4655,6 +4664,7 @@
             });
         }
         syncToolbarButtonStyle(toolbar, anchor);
+        updateClearCacheButtonLabel(toolbar);
         let version = toolbar.querySelector(`.${APP_ID}-version`);
         if (!version) {
             version = document.createElement('span');
