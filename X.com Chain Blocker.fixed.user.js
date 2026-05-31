@@ -2,10 +2,10 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.14.58
+// @version      2.14.86
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
-// @author       Gemini 2.5 Pro
+// @author       codex
 // @license      MIT
 // @match        *://x.com/*
 // @match        *://twitter.com/*
@@ -41,7 +41,7 @@ const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const BLOCK_INTERVAL_MS = 10 * 1000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
 const USERNAME_LENGTH_THRESHOLD = 25;
-const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 500;
+const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 1000;
 const BLOCK_CONTEXT_TEXT_MAX = 120;
 const DEFAULT_SPAM_IDENTIFY_MIN_SCORE = 3;
 const AVATAR_OCR_CACHE_MS = 30 * 60 * 1000;
@@ -56,7 +56,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.14.58';
+const SPAM_SCANNER_BUILD = '2.14.86';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -768,6 +768,7 @@ function resetSpamScanMarkersForBuildUpgrade() {
         delete article.dataset.avatarOcrPending;
         delete article.dataset.avatarOcrQueuedAt;
         delete article.dataset.avatarOcrFailCount;
+        delete article.dataset.spamTextScannedBuild;
         article.classList.remove('nuke-spam-identified');
         article.querySelector('.nuke-spam-badge')?.remove();
     });
@@ -781,20 +782,28 @@ function markStatusRootTweetArticles() {
     });
     if (first) first.dataset.cbSpamRootTweet = 'true';
 }
-function shouldSkipAvatarOcrForArticle(article) {
+function isStatusRootTweetArticle(article) {
     return article?.dataset?.cbSpamRootTweet === 'true';
+}
+function shouldSkipAvatarOcrForArticle(article) {
+    return isStatusRootTweetArticle(article);
+}
+function shouldSkipSpamIdentifyForArticle(article) {
+    return isStatusRootTweetArticle(article);
 }
 function extractTwitterProfileImageId(url) {
     const match = String(url || '').match(/profile_images\/(\d+)\//);
     return match ? match[1] : '';
 }
 const FOLLOWER_COUNT_CACHE_MS = 10 * 60 * 1000;
+const FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS = 4500;
 const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null;
 let manualDetectedNukeRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false;
+const aggregatedToastState = new Map();
 const followerCountCache = new Map();
 const followerFetchPending = new Map();
 
@@ -802,6 +811,7 @@ const followerFetchPending = new Map();
 GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel,.nuke-verify-modal{position:fixed;z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:0;margin:0}.nuke-verify-modal{top:50%;left:50%;transform:translate(-50%,-50%)}.nuke-config-panel{max-height:calc(100vh - 16px);overflow-y:auto;transform:none;top:0;left:0}.nuke-config-panel.nuke-dialog-dragging{user-select:none;will-change:left,top}.nuke-panel-header.nuke-dialog-drag-handle{cursor:grab;touch-action:none}.nuke-panel-header.nuke-dialog-drag-handle:active{cursor:grabbing}.nuke-config-panel::backdrop,.nuke-verify-modal::backdrop{background:rgba(91,112,131,0.45)}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea,.nuke-verify-textarea,.nuke-list-search,.nuke-setting-item input[type=number]{user-select:text;-webkit-user-select:text;pointer-events:auto}.nuke-config-textarea,.nuke-verify-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-verify-textarea{height:110px;line-height:1.5}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save,.nuke-config-button.copy{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover,.nuke-config-button.copy:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-block-reason{display:block;font-size:12px;color:#8899a6;margin-top:4px;line-height:1.4;word-break:break-word;white-space:normal}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer;flex-shrink:0;margin-left:8px}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item select{max-width:240px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-ocr-engine-item{align-items:center}.nuke-ocr-engine-controls{display:flex;align-items:center;gap:8px;flex-shrink:0}.nuke-ocr-engine-status{width:20px;height:20px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}.nuke-ocr-engine-status--idle{visibility:hidden;pointer-events:none}.nuke-ocr-engine-status svg{width:20px;height:20px;display:block}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-track{stroke:#38444d}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-progress{stroke:#1d9bf0;transition:stroke-dashoffset .25s ease}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-fill{fill:#f4212e}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-mark{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}.nuke-ocr-engine-status--error{cursor:help}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}.nuke-verify-note{font-size:14px;color:#8899a6;line-height:1.5;margin-bottom:10px}article[data-testid="tweet"].nuke-spam-identified{box-shadow:inset 0 0 0 1px rgba(255,173,31,.55);border-radius:12px}.nuke-spam-badge{display:inline-flex;align-items:center;margin:4px 12px 0;padding:2px 8px;font-size:12px;font-weight:700;color:#ffad1f;background:rgba(255,173,31,.12);border:1px solid rgba(255,173,31,.35);border-radius:9999px;cursor:help}`);
 GM_addStyle(`.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}`);
 GM_addStyle(`.nuke-settings-module{border-top:1px solid #253341;padding-top:14px;margin-top:14px}.nuke-settings-module:first-child{border-top:0;padding-top:0;margin-top:0}.nuke-settings-module-title{font-size:13px;font-weight:700;color:#eff3f4;margin:0 0 10px}`);
+GM_addStyle(`.nuke-aggregated-toast-summary{font-weight:700;margin-bottom:4px}.nuke-aggregated-toast-line{color:#d7dbdc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}`);
 GM_addStyle(`#nuke-manual-detected-nuke-button{position:fixed;right:20px;bottom:146px;z-index:100002;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-manual-detected-nuke-button:hover:not(:disabled){background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg{width:32px;height:32px;display:block}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
 
 // --- CONFIGURATION MANAGEMENT ---
@@ -811,6 +821,7 @@ async function loadConfig() {
         autoBlockNukeModeVersion: AUTO_BLOCK_NUKE_MODE_VERSION,
         blockLogLimit: 500,
         usernameRuleFollowerExemptThreshold: DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD,
+        blueVerifiedExemptEnabled: true,
         blockKeywordsStandard: [], // For any name
         spamIdentifyEnabled: true,
         spamIdentifyMinScore: DEFAULT_SPAM_IDENTIFY_MIN_SCORE,
@@ -1059,15 +1070,19 @@ async function showConfigPanel() {
                             <label for="nuke-spam-auto-expand-toggle">推文页自动展开「可能的垃圾回复」</label>
                             <input type="checkbox" id="nuke-spam-auto-expand-toggle">
                         </div>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-username-rule-follower-input">粉丝数豁免</label>
+                            <input type="number" id="nuke-username-rule-follower-input" min="0" step="1">
+                        </div>
+                        <div class="nuke-setting-item">
+                            <label for="nuke-blue-verified-exempt-toggle">蓝 V 用户自动豁免</label>
+                            <input type="checkbox" id="nuke-blue-verified-exempt-toggle">
+                        </div>
                     </section>
                     <section class="nuke-settings-module">
                         <h3 class="nuke-settings-module-title">用户名规则</h3>
                         <label class="nuke-settings-label" for="nuke-keywords-standard-textarea">常规用户名关键词 (每行一条; 支持纯文本或正则)</label>
                         <textarea id="nuke-keywords-standard-textarea" class="nuke-config-textarea nuke-keywords-textarea" placeholder="例如: 点击主页&#10;💚(少妇|姐姐|妈妈)💚"></textarea>
-                        <div class="nuke-setting-item">
-                            <label for="nuke-username-rule-follower-input">常规用户名规则粉丝数豁免 (粉丝数大于该值时不触发用户名规则)</label>
-                            <input type="number" id="nuke-username-rule-follower-input" min="0" step="1">
-                        </div>
                     </section>
                     <section class="nuke-settings-module">
                         <h3 class="nuke-settings-module-title">引流识别</h3>
@@ -1122,6 +1137,7 @@ async function showConfigPanel() {
         panel.querySelector('#nuke-auto-block-toggle').checked = config.autoBlockEnabled;
         panel.querySelector('#nuke-log-limit-input').value = config.blockLogLimit;
         panel.querySelector('#nuke-username-rule-follower-input').value = config.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
+        panel.querySelector('#nuke-blue-verified-exempt-toggle').checked = config.blueVerifiedExemptEnabled !== false;
         panel.querySelector('#nuke-keywords-standard-textarea').value = (config.blockKeywordsStandard || []).join('\n');
         panel.querySelector('#nuke-spam-identify-toggle').checked = config.spamIdentifyEnabled !== false;
         const engineSelect = panel.querySelector('#nuke-spam-avatar-ocr-engine');
@@ -1152,6 +1168,7 @@ async function showConfigPanel() {
             config.autoBlockEnabled = panel.querySelector('#nuke-auto-block-toggle').checked;
             config.blockLogLimit = parseInt(panel.querySelector('#nuke-log-limit-input').value, 10) || 500;
             config.usernameRuleFollowerExemptThreshold = Math.max(0, parseInt(panel.querySelector('#nuke-username-rule-follower-input').value, 10) || DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD);
+            config.blueVerifiedExemptEnabled = panel.querySelector('#nuke-blue-verified-exempt-toggle').checked;
             config.blockKeywordsStandard = panel.querySelector('#nuke-keywords-standard-textarea').value.split('\n').map(kw => kw.trim()).filter(Boolean);
             config.spamIdentifyEnabled = panel.querySelector('#nuke-spam-identify-toggle').checked;
             const nextEngine = normalizeAvatarOcrEngine(panel.querySelector('#nuke-spam-avatar-ocr-engine').value);
@@ -1197,18 +1214,28 @@ function escapeHtml(text) {
 }
 const SPAM_ZERO_WIDTH_RE = /[\u200b-\u200d\u2060\ufeff\u00ad]/g;
 const SPAM_CJK_PUNCT_RE = /[·•・|，,。.!！?？:：;；\-—_~～*＊/\\[\]【】()（）「」『』《》〈〉"'‘’“”\s]/g;
+const SPAM_ASCII_NOISE_BETWEEN_CJK_RE = /([\u4e00-\u9fff])[a-z0-9]{1,8}(?=[\u4e00-\u9fff])/gi;
+function isShortDatingInviteCompact(compact) {
+    return compact.length <= 12 && (/^(?:来)?聊聊在线等$/.test(compact) || (/见见吗/.test(compact) && /睡不着/.test(compact)) || (/想找/.test(compact) && /会疼人|疼人的|哥哥|姐姐|妹妹/.test(compact)));
+}
 const SPAM_SIGNAL_DEFS = [
     { id: 'scroll_time', label: '刷帖/逛推时长', weight: 1, test: (compact) => /(?:刷|逛|翻|看|扫).{0,12}?(?:半天|一晚|一天|一晚上|好久|很久|许久|好一会|一会儿|一会|小时)/.test(compact) || /刚.{0,4}?(?:刷|逛|翻)完/.test(compact) },
-    { id: 'platform_ref', label: '提及X/推特', weight: 1, test: (compact) => /(?:^|[^a-z])x(?:[^a-z]|$)/i.test(compact) || /推特|小蓝鸟|twitter/.test(compact) },
+    { id: 'platform_ref', label: '提及X/推特', weight: 1, test: (compact) => /(?:^|[^a-z0-9])x(?:[^a-z0-9]|$)/i.test(compact) || /推特|小蓝鸟|twitter/.test(compact) },
     { id: 'profile_cta', label: '主页/空间导流', weight: 1, test: (compact) => /主页|个人页|主頁|空间|置顶|简介|资料|链接在|点主页|戳主页|看她主页|看他主页|她主页|他主页/.test(compact) },
-    { id: 'adult_euphemism', label: '色情暗语/飞机', weight: 1, test: (compact, raw) => /打.{0,3}?飞|能飞|起飞|开飞|✈|🛫|🛩|飞机|打飞机|打飞機/.test(compact + raw) || /舅舅|涩涩|资源|福利|懂的都懂/.test(compact) },
-    { id: 'age_tag', label: '年龄标签(30+等)', weight: 1, test: (compact, raw) => /\d{2}\+/.test(compact + raw) || /(?:20|30|40|五十|四十|三十|二十)多/.test(compact) || /三十加|四十加|二十加/.test(compact) },
+    { id: 'adult_euphemism', label: '色情暗语/飞机', weight: 1, test: (compact, raw) => /打.{0,3}?飞|能飞|起飞|开飞|✈|🛫|🛩|飞机|打飞机|打飞機/.test(compact + raw) || /舅舅|涩涩|福利|懂的都懂|(?:擦边|私房|色色|涩涩|成人).{0,4}?资源/.test(compact) },
+    { id: 'adult_persona', label: '成人人设暗语', weight: 1, test: (compact) => /福利[鸡姬]/.test(compact) },
+    { id: 'age_tag', label: '年龄标签(30+等)', weight: 1, test: (compact, raw) => /(?:^|[^\d])(?:1[89]|[2-5]\d|60)\+/.test(compact + raw) || /(?:20|30|40|五十|四十|三十|二十)多/.test(compact) || /三十加|四十加|二十加/.test(compact) },
     { id: 'persona_role', label: '职业/人设套词', weight: 1, test: (compact) => /体制内|女老师|老师|护士|御姐|人妻|空姐|校花|女大|熟女|少妇|萝莉|模特|舞蹈生|考研生|女高|单亲|宝妈/.test(compact) },
     { id: 'explore_tease', label: '探路/花样暗示', weight: 1, test: (compact) => /已探路|探过路|探路|花样多|花样不少|玩法多|会玩|懂玩|经验丰富|去过都说|真会玩/.test(compact) },
+    { id: 'contrast_tease', label: '反差/返差暗示', weight: 1, test: (compact) => /反差|返差/.test(compact) },
+    { id: 'offline_lewd_claim', label: '线下色情经历', weight: 1, test: (compact) => /线下/.test(compact) && /日过|曰过|睡过|约过/.test(compact) },
     { id: 'lewd_reaction', label: '色情反应话术', weight: 1, test: (compact) => /太涩|好涩|真涩|涩了|色了|太色|好色|顶不住|受不了|扛不住|绷不住|把持不住|定力不够|真顶|顶不住/.test(compact) },
-    { id: 'lewd_slang', label: '骚/谐音sao', weight: 1, test: (compact) => /骚货|骚的很|很骚|太骚|真骚|骚死|骚批|比.*?骚/.test(compact) || /sao货|sao的很|sao死|sao批|很sao|真sao|太sao|巨sao|sao女|sao姐|sao哥/.test(compact) || /比她sao|比他还sao|没人比.{0,8}?sao|比.*sao/.test(compact) },
+    { id: 'lewd_slang', label: '骚/谐音sao', weight: 1, test: (compact) => /骚货|骚的很|很骚|太骚|真骚|骚死|骚批|比.*?骚/.test(compact) || /[这那][4么麼]?么?骚/.test(compact) || /sao货|sao的很|sao死|sao批|很sao|真sao|太sao|巨sao|sao女|sao姐|sao哥/.test(compact) || /比她sao|比他还sao|没人比.{0,8}?sao|比.*sao/.test(compact) || /第一(?:骚|sao)|第1(?:骚|sao)|最(?:骚|sao)|巨(?:骚|sao)/.test(compact) },
     { id: 'mention_promo', label: '@导流', weight: 1, test: (compact, raw) => /@[a-z0-9_]{2,}/i.test(raw) || /就.{0,8}?@|去@|看@|戳@|关注@/.test(compact) },
     { id: 'dating_hook', label: '交友/同城套词', weight: 1, test: (compact) => /同城|附近|搭子|固炮|真人|线下|见面|私聊|dd|约会|少妇|姐姐|妹妹/.test(compact) },
+    { id: 'adult_experience_claim', label: '线下体验暗示', weight: 1, test: (compact) => /线下|真人|真实/.test(compact) && /宝宝|妹妹|姐姐|身材|福利/.test(compact) && /我(?:试|試)过|(?:试|試)过了|真的?很不错|身材(?:特棒|很好|不错)|特棒/.test(compact) },
+    { id: 'short_dating_invite', label: '短句交友导流', weight: 3, test: (compact) => isShortDatingInviteCompact(compact) },
+    { id: 'course_funnel', label: '课程/教程导流', weight: 3, test: (compact) => /英语|外语|日语|韩语|西班牙语|语言学习|任何语言|流利学会/.test(compact) && /公开课|这堂课|课程|教程|底层方法论|唯一正确|秘诀|快速学会|强烈建议刷|早知道.{0,12}?方法|别再.{0,12}?(?:不科学|浪费时间)|学会任何语言|流利学会任何语言/.test(compact) },
     { id: 'drive_link', label: '网盘链接', weight: 2, test: (compact, raw) => /pan\.quark\.cn|drive\.uc\.cn|aliyundrive\.com|115\.com|lanzou|mega\.nz/i.test(raw) },
     { id: 'core_template', label: '核心话术模板', weight: 2, test: (compact) => /刷.{0,18}?(?:半天|一晚|一天|一晚上|好久|很久).{0,24}?(?:x|推特|小蓝鸟).{0,18}?(?:她|他|这)?.{0,18}?主.?页.{0,24}?(?:打.{0,4}?飞|✈|起飞|能飞)/.test(compact) || /刷.{0,12}?(?:x|推特).{0,18}?主.?页.{0,18}?(?:打.{0,4}?飞|✈)/.test(compact) }
 ];
@@ -1222,16 +1249,23 @@ function normalizeSpamText(text) {
 function compactSpamText(text) {
     return normalizeSpamText(text).replace(SPAM_CJK_PUNCT_RE, '').toLowerCase();
 }
+function compactSpamTextVariants(text) {
+    const compact = compactSpamText(text);
+    const folded = compact.replace(SPAM_ASCII_NOISE_BETWEEN_CJK_RE, '$1');
+    return folded && folded !== compact ? [compact, folded] : [compact];
+}
 function detectSpamReply(text, options = {}) {
     const minScore = options.minScore ?? scriptConfig.spamIdentifyMinScore ?? DEFAULT_SPAM_IDENTIFY_MIN_SCORE;
     const raw = normalizeSpamText(text);
-    if (!raw || raw.length < 8) return { match: false, score: 0, signals: [], summary: '' };
-    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw)) return { match: false, score: 0, signals: [], summary: '' };
     const compact = compactSpamText(raw);
+    const compactVariants = compactSpamTextVariants(raw);
+    const shortDatingInvite = isShortDatingInviteCompact(compact);
+    if (!raw || (raw.length < 8 && !shortDatingInvite)) return { match: false, score: 0, signals: [], summary: '' };
+    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw)) return { match: false, score: 0, signals: [], summary: '' };
     const signals = [];
     let score = 0;
     for (const def of SPAM_SIGNAL_DEFS) {
-        if (def.test(compact, raw)) {
+        if (compactVariants.some((candidate) => def.test(candidate, raw))) {
             signals.push({ id: def.id, label: def.label, weight: def.weight });
             score += def.weight;
         }
@@ -1874,7 +1908,8 @@ function ensureSpamBadge(article, detection, kind = 'text') {
         const badgeText = detection.badgeText || `自动标记 · ${summary}`;
         const title = detection.title || summary;
         if (badge.textContent) {
-            badge.title = `${badge.title || ''}\n${title}`.trim();
+            const existingTitle = badge.title || '';
+            if (title && !existingTitle.includes(title)) badge.title = `${existingTitle}\n${title}`.trim();
             if (!badge.textContent.includes(badgeText)) badge.textContent = `${badge.textContent}；${badgeText}`;
         } else {
             badge.title = title;
@@ -1923,6 +1958,47 @@ function isDetectedNukeTargetArticle(article) {
 }
 function getDetectedNukeTargetArticles() {
     return Array.from(document.querySelectorAll('article[data-testid="tweet"]')).filter(isDetectedNukeTargetArticle);
+}
+function parseCompactEngagementCount(text) {
+    const normalized = String(text || '').replace(/,/g, '').trim();
+    if (!normalized) return 0;
+    const match = normalized.match(/(\d+(?:\.\d+)?)\s*([万千kKmM]?)/);
+    if (!match) return 0;
+    const value = Number(match[1]);
+    if (!Number.isFinite(value)) return 0;
+    const unit = match[2] || '';
+    if (unit === '万') return Math.round(value * 10000);
+    if (unit === '千') return Math.round(value * 1000);
+    if (unit.toLowerCase() === 'k') return Math.round(value * 1000);
+    if (unit.toLowerCase() === 'm') return Math.round(value * 1000000);
+    return Math.round(value);
+}
+function getEngagementCountFromAction(article, testIds) {
+    if (!article) return null;
+    const selector = testIds.map(testId => `[data-testid="${testId}"]`).join(',');
+    const action = article.querySelector(selector);
+    if (!action) return null;
+    const label = action.getAttribute('aria-label') || action.querySelector('[aria-label]')?.getAttribute('aria-label') || '';
+    const text = action.textContent || '';
+    return parseCompactEngagementCount(`${label} ${text}`);
+}
+function getArticleEngagementCounts(article) {
+    return {
+        replies: getEngagementCountFromAction(article, ['reply']),
+        retweets: getEngagementCountFromAction(article, ['retweet', 'unretweet']),
+        likes: getEngagementCountFromAction(article, ['like', 'unlike'])
+    };
+}
+function isZeroEngagementNukeTarget(resolvedTarget) {
+    const counts = resolvedTarget?.engagementCounts;
+    return !!counts && counts.replies === 0 && counts.retweets === 0 && counts.likes === 0;
+}
+function sortResolvedNukeTargetsForDirectBlock(resolvedTargets) {
+    return resolvedTargets.slice().sort((left, right) => {
+        const zeroPriority = Number(isZeroEngagementNukeTarget(right)) - Number(isZeroEngagementNukeTarget(left));
+        if (zeroPriority) return zeroPriority;
+        return (left.manualOrder ?? 0) - (right.manualOrder ?? 0);
+    });
 }
 function buildManualDetectedNukeTrigger(article) {
     const badge = article?.querySelector?.('.nuke-spam-badge');
@@ -1986,16 +2062,54 @@ async function executeManualNukeForDetectedTargets() {
     }
     manualDetectedNukeRunning = true;
     updateManualDetectedNukeButton();
-    showToast('nuke-manual-detected-toast', '手动执行九族拉黑', `正在处理 ${articles.length} 个已检测目标`, 3500);
+    showToast('nuke-manual-detected-toast', '建立九族列表', `正在收集 ${articles.length} 个已检测目标的关联用户`, null);
     try {
+        const userData = await loadUserData();
+        if (!userData) throw new Error("无法加载用户数据");
+        const whitelistIds = new Set(userData.whitelist.map(u => u.userId));
+        const queueById = new Map();
+        const resolvedTargets = [];
+        const onCollectProgress = status => showToast('nuke-manual-detected-toast', '建立九族列表', status, null);
         for (const article of articles) {
             if (!isDetectedNukeTargetArticle(article)) continue;
             article.dataset.autoblockTriggered = 'true';
             article.dataset.autoblockChecked = 'complete';
-            await initiateNukeProcess(article, buildManualDetectedNukeTrigger(article));
+            hideElement(article);
+            try {
+                const resolvedTarget = await resolveNukeTarget(article, buildManualDetectedNukeTrigger(article));
+                resolvedTargets.push({ ...resolvedTarget, manualOrder: resolvedTargets.length });
+                await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress);
+            } catch (error) {
+                console.error('[CB] 手动九族建立列表失败:', error);
+            }
+            updateManualDetectedNukeButton();
+            await new Promise((resolve) => window.setTimeout(resolve, 250));
+        }
+        const targetAuthorIds = mergeUserIdSets(resolvedTargets.map((target) => buildChainSkipUserIds(target)));
+        const chainExemptHandles = [...new Set(resolvedTargets.flatMap((target) => getChainExemptHandlesForTarget(target.targetArticle)))];
+        const pendingChainQueueEntries = selectNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, targetAuthorIds);
+        const directBlockTargets = sortResolvedNukeTargetsForDirectBlock(resolvedTargets);
+        showToast('nuke-manual-detected-toast', '直接拉黑标记用户', `已建立 ${pendingChainQueueEntries.length} 个后台九族目标，正在直接拉黑 ${directBlockTargets.length} 个标记用户（0互动优先）`, null);
+        let blockedAuthors = 0;
+        const handledAuthorIds = new Set();
+        for (const resolvedTarget of directBlockTargets) {
+            if (resolvedTarget.authorId && handledAuthorIds.has(resolvedTarget.authorId)) continue;
+            if (resolvedTarget.authorId) handledAuthorIds.add(resolvedTarget.authorId);
+            if (await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) blockedAuthors += 1;
+            await saveUserData(userData);
             updateManualDetectedNukeButton();
             await new Promise((resolve) => window.setTimeout(resolve, 350));
         }
+        if (pendingChainQueueEntries.length > 0) {
+            addNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, targetAuthorIds);
+            await saveUserData(userData);
+        }
+        await updateStatusToast();
+        showToast('nuke-manual-detected-toast', '手动执行完成', `已直接拉黑 ${blockedAuthors} 个标记用户，后台九族队列新增 ${pendingChainQueueEntries.length} 个用户`, 4500);
+        setTimeout(processQueue, 1000);
+    } catch (error) {
+        console.error('[CB] 手动执行九族拉黑失败:', error);
+        showToast('nuke-manual-detected-toast', '手动执行失败', error.message, 5000);
     } finally {
         manualDetectedNukeRunning = false;
         updateManualDetectedNukeButton();
@@ -2066,14 +2180,18 @@ async function pumpAvatarOcrQueue() {
             }
             const analysis = await analyzeAvatarImageUrl(job.imageUrl, patterns);
             if (analysis.match) {
-                const hit = analysis.hit || '头像关键词';
-                ensureSpamBadge(job.article, { match: true, score: 1, summary: hit }, 'avatar');
-                triggerAutoNukeForMarkedArticle(job.article, {
-                    triggerMode: 'auto',
-                    autoReason: 'avatar_ocr',
-                    avatarOcrHit: hit
-                });
-                matched = true;
+                if (await shouldExemptArticleByTrustedAuthor(job.article, 'avatar_ocr')) {
+                    matched = true;
+                } else {
+                    const hit = analysis.hit || '头像关键词';
+                    ensureSpamBadge(job.article, { match: true, score: 1, summary: hit }, 'avatar');
+                    triggerAutoNukeForMarkedArticle(job.article, {
+                        triggerMode: 'auto',
+                        autoReason: 'avatar_ocr',
+                        avatarOcrHit: hit
+                    });
+                    matched = true;
+                }
             }
         } catch (error) {
             noteAvatarOcrError(error);
@@ -2092,11 +2210,21 @@ async function pumpAvatarOcrQueue() {
     if (avatarOcrQueue.length) void pumpAvatarOcrQueue();
 }
 async function processSpamArticle(article) {
+    if (shouldSkipSpamIdentifyForArticle(article)) {
+        clearSpamIdentifyTextBadge(article);
+        finalizeSpamArticleScan(article);
+        return;
+    }
     if (shouldSkipSpamArticleScan(article)) return;
     const tweetText = getTweetTextFromArticle(article);
     if (tweetText) {
         const detection = detectSpamReply(tweetText);
+        article.dataset.spamTextScannedBuild = SPAM_SCANNER_BUILD;
         if (detection.match) {
+            if (await shouldExemptArticleByTrustedAuthor(article, 'spam_identify')) {
+                finalizeSpamArticleScan(article);
+                return;
+            }
             ensureSpamBadge(article, detection, 'text');
             if (triggerAutoNukeForMarkedArticle(article, {
                 triggerMode: 'auto',
@@ -2136,12 +2264,19 @@ function articleHasAvatarSpamBadge(article) {
     const badge = article?.querySelector('.nuke-spam-badge');
     return !!(badge && /头像|全国安排/.test(badge.textContent || ''));
 }
+function clearSpamIdentifyTextBadge(article) {
+    const badge = article?.querySelector('.nuke-spam-badge');
+    if (!badge || !/^疑似引流/.test(badge.textContent || '')) return;
+    badge.remove();
+    if (!article.querySelector('.nuke-spam-badge')) article.classList.remove('nuke-spam-identified');
+}
 function shouldSkipSpamArticleScan(article) {
     if (hasStaleAvatarOcrPending(article)) {
         releaseAvatarOcrForRetry(article);
         return false;
     }
-    if (article.dataset.avatarOcrPending === 'true') return true;
+    const hasPendingTextScan = !!getTweetTextFromArticle(article) && article.dataset.spamTextScannedBuild !== SPAM_SCANNER_BUILD && !article.querySelector('.nuke-spam-badge:not([data-avatar-ocr-badge])');
+    if (article.dataset.avatarOcrPending === 'true') return !hasPendingTextScan;
     if (article.dataset.spamScanned !== 'complete') return false;
     if (articleHasAvatarSpamBadge(article)) return true;
     const textBadge = article.querySelector('.nuke-spam-badge');
@@ -2207,8 +2342,9 @@ async function inspectTweetArticleForSpam(article) {
     const userLink = article.querySelector('div[data-testid="User-Name"] a[role="link"]');
     const screenName = getScreenNameFromProfileHref(userLink?.href) || '未知';
     const tweetText = getTweetTextFromArticle(article);
+    const followerExempt = await shouldExemptArticleByTrustedAuthor(article, 'manual_spam_inspect');
     let summary = '';
-    if (tweetText) {
+    if (!followerExempt && tweetText) {
         const detection = detectSpamReply(tweetText);
         if (detection.match) {
             ensureSpamBadge(article, detection, 'text');
@@ -2216,7 +2352,7 @@ async function inspectTweetArticleForSpam(article) {
         }
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
-    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
+    if (!followerExempt && avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
         try {
             const analysis = await analyzeAvatarImageUrl(avatarUrl, resolveAvatarKeywordPatterns());
             if (analysis.match) {
@@ -2257,6 +2393,7 @@ function resolveAuthorBlockReason(trigger = {}) {
     if (trigger.triggerMode === 'manual') return 'manual_author';
     if (trigger.autoReason === 'promo_target_mention') return 'auto_promo_target';
     if (trigger.autoReason === 'standard_keywords') return 'auto_author_keyword';
+    if (trigger.autoReason === 'display_name_spam') return 'auto_display_name_spam';
     if (trigger.autoReason === 'spam_identify') return 'auto_spam_identify';
     if (trigger.autoReason === 'avatar_ocr') return 'auto_avatar_ocr';
     if (trigger.autoReason === 'manual_detected_target') return 'auto_manual_detected';
@@ -2268,6 +2405,7 @@ function buildAuthorBlockNote(trigger, context = {}) {
         manual_author: '九族拉黑·主推',
         auto_promo_target: '自动九族·引流目标',
         auto_author_keyword: '自动拉黑·关键词',
+        auto_display_name_spam: '自动拉黑·昵称引流',
         auto_spam_identify: '自动九族·引流识别',
         auto_avatar_ocr: '自动九族·头像OCR',
         auto_manual_detected: '手动九族·已检测目标'
@@ -2499,15 +2637,32 @@ function matchesStandardKeywords(userNameText, patterns) {
         }
     });
 }
+function matchesBuiltInDisplayNameSpam(userNameText) {
+    const normalized = String(userNameText || '').replace(/\s+/g, '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '').toLowerCase();
+    if (!normalized) return false;
+    return /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized);
+}
 function getUsernameRuleFollowerExemptThreshold() {
     return scriptConfig.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
 }
+function isBlueVerifiedExemptEnabled() {
+    return scriptConfig.blueVerifiedExemptEnabled !== false;
+}
+function isFollowerCountExempt(followerCount) {
+    if (followerCount == null || Number.isNaN(followerCount)) return false;
+    return followerCount > getUsernameRuleFollowerExemptThreshold();
+}
 function getAutoBlockDecision(userNameText, followerCount) {
     const exemptThreshold = getUsernameRuleFollowerExemptThreshold();
-    if (!matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || [])) return { block: false, reason: 'no_match' };
-    if (followerCount == null || Number.isNaN(followerCount)) return { block: false, reason: 'follower_unknown' };
-    if (followerCount <= exemptThreshold) return { block: true, reason: 'standard_keywords' };
-    return { block: false, reason: 'follower_exempt' };
+    const keywordMatch = matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []);
+    const builtInDisplayNameMatch = matchesBuiltInDisplayNameSpam(userNameText);
+    if (!keywordMatch && !builtInDisplayNameMatch) return { block: false, reason: 'no_match' };
+    if (followerCount == null || Number.isNaN(followerCount)) {
+        if (builtInDisplayNameMatch) return { block: true, reason: 'display_name_spam' };
+        return { block: false, reason: 'follower_unknown' };
+    }
+    if (followerCount <= exemptThreshold) return { block: true, reason: builtInDisplayNameMatch ? 'display_name_spam' : 'standard_keywords', followerCount, exemptThreshold };
+    return { block: false, reason: 'follower_exempt', followerCount, exemptThreshold };
 }
 function getScreenNameFromProfileHref(href) {
     if (!href) return '';
@@ -2518,12 +2673,41 @@ function getScreenNameFromProfileHref(href) {
         return href.split('/').pop()?.split('?')[0] || '';
     }
 }
+function getArticleAuthorScreenName(article) {
+    const userLink = article?.querySelector('div[data-testid="User-Name"] a[role="link"]');
+    return getScreenNameFromProfileHref(userLink?.href);
+}
+function isTwitterBlueColor(value) {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text || text === 'none' || text === 'currentcolor') return false;
+    if (text === '#1d9bf0' || text === 'rgb(29, 155, 240)' || text === 'rgba(29, 155, 240, 1)') return true;
+    const match = text.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!match) return false;
+    const [, r, g, b] = match.map(Number);
+    return Math.abs(r - 29) <= 8 && Math.abs(g - 155) <= 10 && Math.abs(b - 240) <= 10;
+}
+function isBlueVerifiedUserElement(userElement) {
+    if (!isBlueVerifiedExemptEnabled() || !userElement) return false;
+    const candidates = [userElement, ...userElement.querySelectorAll('[aria-label], [data-testid], svg, path')];
+    return candidates.some((node) => {
+        const label = String(node.getAttribute?.('aria-label') || node.parentElement?.getAttribute?.('aria-label') || '').toLowerCase();
+        const testId = String(node.getAttribute?.('data-testid') || node.parentElement?.getAttribute?.('data-testid') || '').toLowerCase();
+        const hasVerifiedSignal = /verified|认证|已认证/.test(label) || /verified/.test(testId);
+        if (!hasVerifiedSignal) return false;
+        const style = getComputedStyle(node);
+        const parentStyle = node.parentElement ? getComputedStyle(node.parentElement) : null;
+        return [style.color, style.fill, style.stroke, parentStyle?.color, parentStyle?.fill, parentStyle?.stroke].some(isTwitterBlueColor);
+    });
+}
+function isArticleBlueVerified(article) {
+    return isBlueVerifiedUserElement(article?.querySelector('div[data-testid="User-Name"]'));
+}
 async function getCachedFollowerCount(screenName) {
     if (!screenName) return null;
     const key = screenName.toLowerCase();
     const cached = followerCountCache.get(key);
     if (cached && Date.now() - cached.at < FOLLOWER_COUNT_CACHE_MS) return cached.count;
-    if (followerFetchPending.has(key)) return followerFetchPending.get(key);
+    if (followerFetchPending.has(key)) return withFollowerCountTimeout(followerFetchPending.get(key));
     const pending = (async () => {
         try {
             const userResult = await getUserDataByScreenName(screenName);
@@ -2538,11 +2722,37 @@ async function getCachedFollowerCount(screenName) {
         }
     })();
     followerFetchPending.set(key, pending);
-    return pending;
+    return withFollowerCountTimeout(pending);
+}
+function withFollowerCountTimeout(promise) {
+    return Promise.race([
+        promise,
+        new Promise((resolve) => window.setTimeout(() => resolve(null), FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS))
+    ]);
+}
+async function shouldExemptArticleByFollowerCount(article, reason) {
+    const screenName = getArticleAuthorScreenName(article);
+    if (!screenName) return false;
+    const followerCount = await getCachedFollowerCount(screenName);
+    if (!isFollowerCountExempt(followerCount)) return false;
+    console.log(`[CB] 跳过${reason || '自动标记'} @${screenName} (粉丝数 ${followerCount} 高于阈值 ${getUsernameRuleFollowerExemptThreshold()})`);
+    return true;
+}
+function shouldExemptArticleByBlueVerified(article, reason) {
+    if (!isStatusRootTweetArticle(article)) return false;
+    if (!isArticleBlueVerified(article)) return false;
+    const screenName = getArticleAuthorScreenName(article) || '未知';
+    console.log(`[CB] 跳过${reason || '自动标记'} @${screenName} (蓝 V 主贴作者自动豁免)`);
+    return true;
+}
+async function shouldExemptArticleByTrustedAuthor(article, reason) {
+    if (shouldExemptArticleByBlueVerified(article, reason)) return true;
+    return shouldExemptArticleByFollowerCount(article, reason);
 }
 async function maybeAutoBlockTarget(targetArticle, userNameText, screenName) {
     if (!userNameText) return;
     if (!isAutoNukeEnabled()) return;
+    if (shouldExemptArticleByBlueVerified(targetArticle, 'auto_rule')) return;
     const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
     if (!decision.block) {
         if (decision.reason === 'follower_exempt') {
@@ -2551,7 +2761,7 @@ async function maybeAutoBlockTarget(targetArticle, userNameText, screenName) {
         return;
     }
     if (screenName) {
-        showToast(`nuke-auto-trigger-toast-${Date.now()}`, '🤖 自动执行拉黑', `检测到可疑用户名: ${screenName}`, 4000);
+        showAggregatedToast('nuke-auto-trigger-toast', '🤖 自动执行拉黑', `检测到可疑用户名: ${screenName}`, 4000);
     }
     void initiateNukeProcess(targetArticle, { triggerMode: 'auto', autoReason: decision.reason, suspiciousDisplayName: userNameText });
 }
@@ -2662,6 +2872,11 @@ async function saveUserData(data) {
 }
 
 // --- UI & FEEDBACK ---
+function layoutToasts() {
+    Array.from(document.querySelectorAll('.nuke-toast:not(.fading-out)')).forEach((toast, index) => {
+        toast.style.top = `${20 + index * 70}px`;
+    });
+}
 function showToast(id, title, status, duration = null) {
     let toast = document.getElementById(id);
     if (!toast) {
@@ -2670,25 +2885,40 @@ function showToast(id, title, status, duration = null) {
         toast.className = 'nuke-toast';
         document.body.appendChild(toast);
     }
-    const existingToasts = document.querySelectorAll('.nuke-toast:not([style*="display: none"])');
-    toast.style.top = `${20 + (existingToasts.length - 1) * 70}px`;
+    if (toast._nukeToastTimer) clearTimeout(toast._nukeToastTimer);
+    if (toast._nukeToastRemoveTimer) clearTimeout(toast._nukeToastRemoveTimer);
     toast.classList.remove('fading-out');
     toast.innerHTML = `<div class="nuke-toast-title">${title}</div><div class="nuke-toast-status">${status}</div>`;
-    const reorderToasts = () => {
-        const remainingToasts = Array.from(document.querySelectorAll('.nuke-toast')).filter(t => t.id !== id);
-        remainingToasts.forEach((t, index) => {
-            t.style.top = `${20 + index * 70}px`;
-        });
-    };
+    layoutToasts();
     if (duration) {
-        setTimeout(() => {
+        toast._nukeToastTimer = setTimeout(() => {
             toast.classList.add('fading-out');
-            setTimeout(() => {
+            toast._nukeToastRemoveTimer = setTimeout(() => {
                 toast.remove();
-                reorderToasts();
+                layoutToasts();
             }, 500);
         }, duration);
     }
+}
+function stripToastHtml(status) {
+    const div = document.createElement('div');
+    div.innerHTML = String(status || '');
+    return div.textContent?.replace(/\s+/g, ' ').trim() || '';
+}
+function showAggregatedToast(id, title, status, duration = 4000) {
+    const now = Date.now();
+    const state = aggregatedToastState.get(id) || { count: 0, lines: [], startedAt: now };
+    if (now - state.startedAt > 15000) {
+        state.count = 0;
+        state.lines = [];
+        state.startedAt = now;
+    }
+    state.count += 1;
+    const line = stripToastHtml(status);
+    if (line) state.lines = [line, ...state.lines.filter((item) => item !== line)].slice(0, 5);
+    aggregatedToastState.set(id, state);
+    const linesHtml = state.lines.map((item) => `<div class="nuke-aggregated-toast-line">${escapeHtml(item)}</div>`).join('');
+    showToast(id, title, `<div class="nuke-aggregated-toast-summary">本轮 ${state.count} 条操作</div>${linesHtml}`, duration);
 }
 async function updateStatusToast() {
     const userData = await loadUserData();
@@ -2813,7 +3043,7 @@ async function handleVerifiedUserName(userNameText) {
 
 // --- CORE LOGIC ---
 async function processQueue() {
-    if (isProcessingQueue || !currentUserId) return;
+    if (isProcessingQueue || manualDetectedNukeRunning || !currentUserId) return;
     const userData = await loadUserData();
     if (!userData || userData.queue.length === 0 || (Date.now() - userData.lastBlockTimestamp < BLOCK_INTERVAL_MS)) return;
     isProcessingQueue = true;
@@ -2843,65 +3073,137 @@ async function processQueue() {
         isProcessingQueue = false;
     }
 }
-function getExemptHandles() {
-    const exemptHandles = [];
-    const pathParts = window.location.pathname.split('/');
-    if (pathParts[2] === 'status') {
-        exemptHandles.push(pathParts[1]);
+function getArticleAuthorHandle(article) {
+    const userLink = article?.querySelector?.('div[data-testid="User-Name"] a[role="link"]');
+    return normalizePromoHandle(getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/')?.pop()?.split('?')?.[0] || '');
+}
+function getStatusRootTweetArticle() {
+    if (window.location.pathname.split('/')[2] !== 'status') return null;
+    markStatusRootTweetArticles();
+    const articles = Array.from(document.querySelectorAll('[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]'));
+    return articles.find((article) => article.dataset.cbSpamRootTweet === 'true') || articles[0] || null;
+}
+function getRootTweetAuthorHandle() {
+    return getArticleAuthorHandle(getStatusRootTweetArticle());
+}
+function getChainExemptHandlesForTarget(targetArticle) {
+    const rootAuthorHandle = getRootTweetAuthorHandle();
+    const targetAuthorHandle = getArticleAuthorHandle(targetArticle);
+    return rootAuthorHandle && rootAuthorHandle !== targetAuthorHandle ? [rootAuthorHandle] : [];
+}
+function buildChainSkipUserIds(resolvedTarget) {
+    const ids = new Set();
+    if (resolvedTarget?.authorId) ids.add(resolvedTarget.authorId);
+    if (resolvedTarget?.rootAuthorId && resolvedTarget.rootAuthorId !== resolvedTarget.authorId) ids.add(resolvedTarget.rootAuthorId);
+    return ids;
+}
+function mergeUserIdSets(sets = []) {
+    const merged = new Set();
+    sets.forEach((set) => {
+        if (!set) return;
+        Array.from(set).forEach((id) => {
+            if (id) merged.add(id);
+        });
+    });
+    return merged;
+}
+function trimBlockedLogToLimit(userData) {
+    const limit = scriptConfig.blockLogLimit || 500;
+    if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
+}
+async function resolveNukeTarget(targetArticle, trigger) {
+    const userLink = targetArticle.querySelector('div[data-testid="User-Name"] a[role="link"]');
+    const authorHandle = getArticleAuthorHandle(targetArticle) || getScreenNameFromProfileHref(userLink?.href) || userLink?.href.split('/').pop()?.split('?')[0];
+    const authorUserNameText = targetArticle.querySelector('div[data-testid="User-Name"] a[role="link"] span')?.textContent?.trim() || authorHandle;
+    if (!authorHandle) throw new Error("无法确定作者 handle");
+    const tweetContext = getTweetContextFromTarget(targetArticle, authorHandle);
+    const rootAuthorHandle = getRootTweetAuthorHandle();
+    let authorId = null;
+    let rootAuthorId = null;
+    try {
+        const authorData = await getUserDataByScreenName(authorHandle);
+        authorId = authorData?.rest_id || null;
+        if (!authorId) throw new Error(`无法获取 @${authorHandle} 的用户ID`);
+    } catch (authorError) {
+        console.error(`[CB] 获取作者 @${authorHandle} 失败:`, authorError);
     }
-    return exemptHandles;
+    if (rootAuthorHandle && rootAuthorHandle === authorHandle) {
+        rootAuthorId = authorId;
+    } else if (rootAuthorHandle) {
+        try {
+            const rootAuthorData = await getUserDataByScreenName(rootAuthorHandle);
+            rootAuthorId = rootAuthorData?.rest_id || null;
+        } catch (rootAuthorError) {
+            console.warn(`[CB] 获取主贴作者 @${rootAuthorHandle} 失败，将仅按 handle 豁免`, rootAuthorError);
+        }
+    }
+    return { targetArticle, trigger, authorHandle, authorUserNameText, tweetContext, authorId, rootAuthorHandle, rootAuthorId, engagementCounts: getArticleEngagementCounts(targetArticle) };
+}
+async function blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptHandles) {
+    const { authorId, authorHandle, authorUserNameText, trigger, tweetContext } = resolvedTarget;
+    if (!authorId) {
+        console.error(`[CB] 拉黑作者 @${authorHandle} 失败:`, new Error("无法获取作者用户ID"));
+        return false;
+    }
+    if (whitelistIds.has(authorId) || exemptHandles.includes(authorHandle)) {
+        showToast('nuke-fetch-toast', '🛡️ 用户在白名单或豁免列表', `已跳过拉黑 @${authorHandle}`, 4000);
+        return false;
+    }
+    await blockUserById(authorId);
+    userData.blockedLog.push(createAuthorLogEntry(authorId, authorHandle, authorUserNameText, trigger, tweetContext));
+    trimBlockedLogToLimit(userData);
+    showToast('nuke-fetch-toast', '✅ 作者已拉黑并记录', `已立刻拉黑 @${authorHandle}`, 2000);
+    return true;
+}
+async function collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress) {
+    const { authorId, tweetContext } = resolvedTarget;
+    const tweetId = tweetContext.tweetId;
+    if (!tweetId) return 0;
+    const beforeSize = queueById.size;
+    const favoritersPromise = getFavoritersData(tweetId, onCollectProgress).catch(error => {
+        console.warn('[CB] 获取点赞列表失败，将跳过点赞关联用户', error);
+        return [];
+    });
+    const [retweeters, repliers, favoriters] = await Promise.all([
+        getRetweetersData(tweetId, onCollectProgress),
+        getRepliersData(tweetId, onCollectProgress),
+        favoritersPromise
+    ]);
+    addUsersToChainQueue(queueById, retweeters, 'retweet', tweetContext);
+    addUsersToChainQueue(queueById, repliers, 'reply', tweetContext);
+    addUsersToChainQueue(queueById, favoriters, 'like', tweetContext);
+    if (authorId) queueById.delete(authorId);
+    return Math.max(0, queueById.size - beforeSize);
+}
+function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
+    const existingUserIds = new Set([...userData.queue.map(u => u.userId), ...userData.blockedLog.map(u => u.userId), ...whitelistIds, ...skipUserIds]);
+    const exemptHandleSet = new Set((exemptHandles || []).map(normalizePromoHandle).filter(Boolean));
+    return Array.from(queueById.values()).filter(u => u.userId && u.userId !== currentUserId && !existingUserIds.has(u.userId) && !exemptHandleSet.has(normalizePromoHandle(u.screenName)));
+}
+function addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
+    const newUsersToQueue = selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds);
+    if (newUsersToQueue.length > 0) userData.queue.push(...newUsersToQueue);
+    return newUsersToQueue;
 }
 async function initiateNukeProcess(targetArticle, trigger = { triggerMode: 'manual' }) {
-    const exemptHandles = getExemptHandles();
     showToast('nuke-fetch-toast', '🚀 九族拉黑已启动', '正在处理...', null);
     hideElement(targetArticle);
     try {
-        const userLink = targetArticle.querySelector('div[data-testid="User-Name"] a[role="link"]');
-        const authorHandle = getScreenNameFromProfileHref(userLink?.href) || userLink?.href.split('/').pop()?.split('?')[0];
-        const authorUserNameText = targetArticle.querySelector('div[data-testid="User-Name"] a[role="link"] span')?.textContent?.trim() || authorHandle;
-        if (!authorHandle) throw new Error("无法确定作者 handle");
-        const tweetContext = getTweetContextFromTarget(targetArticle, authorHandle);
         const userData = await loadUserData();
         if (!userData) throw new Error("无法加载用户数据");
         const whitelistIds = new Set(userData.whitelist.map(u => u.userId));
-        let authorId = null;
-        try {
-            const authorData = await getUserDataByScreenName(authorHandle);
-            authorId = authorData?.rest_id;
-            if (!authorId) throw new Error(`无法获取 @${authorHandle} 的用户ID`);
-            if (whitelistIds.has(authorId) || exemptHandles.includes(authorHandle)) {
-                showToast('nuke-fetch-toast', '🛡️ 用户在白名单或豁免列表', `已跳过拉黑 @${authorHandle}`, 4000);
-            } else {
-                await blockUserById(authorId);
-                userData.blockedLog.push(createAuthorLogEntry(authorId, authorHandle, authorUserNameText, trigger, tweetContext));
-                const limit = scriptConfig.blockLogLimit || 500;
-                if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
-                await saveUserData(userData);
-                showToast('nuke-fetch-toast', '✅ 作者已拉黑并记录', `已立刻拉黑 @${authorHandle}`, 2000);
-            }
-        } catch (authorError) { console.error(`[CB] 拉黑作者 @${authorHandle} 失败:`, authorError); }
-        await processPromoMentionsFromArticle(targetArticle, tweetContext, userData, authorHandle, whitelistIds, exemptHandles);
-        const tweetId = tweetContext.tweetId;
-        if (!tweetId) return;
+        const resolvedTarget = await resolveNukeTarget(targetArticle, trigger);
+        await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, []);
+        await saveUserData(userData);
+        const chainExemptHandles = getChainExemptHandlesForTarget(resolvedTarget.targetArticle);
+        await processPromoMentionsFromArticle(targetArticle, resolvedTarget.tweetContext, userData, resolvedTarget.authorHandle, whitelistIds, chainExemptHandles);
+        if (!resolvedTarget.tweetContext.tweetId) return;
         const onCollectProgress = status => showToast('nuke-fetch-toast', '收集中...', status, null);
-        const favoritersPromise = getFavoritersData(tweetId, onCollectProgress).catch(error => {
-            console.warn('[CB] 获取点赞列表失败，将跳过点赞关联用户', error);
-            return [];
-        });
-        const [retweeters, repliers, favoriters] = await Promise.all([
-            getRetweetersData(tweetId, onCollectProgress),
-            getRepliersData(tweetId, onCollectProgress),
-            favoritersPromise
-        ]);
         const queueById = new Map();
-        addUsersToChainQueue(queueById, retweeters, 'retweet', tweetContext);
-        addUsersToChainQueue(queueById, repliers, 'reply', tweetContext);
-        addUsersToChainQueue(queueById, favoriters, 'like', tweetContext);
-        if (authorId) queueById.delete(authorId);
-        const existingUserIds = new Set([...userData.queue.map(u => u.userId), ...userData.blockedLog.map(u => u.userId), ...whitelistIds]);
-        const newUsersToQueue = Array.from(queueById.values()).filter(u => u.userId && u.userId !== currentUserId && !existingUserIds.has(u.userId) && !exemptHandles.includes(u.screenName));
+        await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress);
+        const skipUserIds = buildChainSkipUserIds(resolvedTarget);
+        const newUsersToQueue = addNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, skipUserIds);
         if (newUsersToQueue.length > 0) {
-            userData.queue.push(...newUsersToQueue);
             await saveUserData(userData);
             showToast('nuke-fetch-toast', '✅ 操作成功', `已将 ${newUsersToQueue.length} 个相关用户加入拉黑队列。`, 4000);
         } else {
@@ -2939,13 +3241,14 @@ function getDisplayNameFromUserLink(userLink) {
     return raw.replace(new RegExp(`@?${handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'), '').trim() || raw;
 }
 async function evaluateUsernameAutoBlock(userNameText, screenName) {
-    const needsFollowerCheck = matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []);
+    const needsFollowerCheck = matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []) || matchesBuiltInDisplayNameSpam(userNameText);
     let followerCount = null;
     if (needsFollowerCheck && screenName) followerCount = await getCachedFollowerCount(screenName);
     return getAutoBlockDecision(userNameText, followerCount);
 }
 function getAutoBlockRuleLabel(reason) {
     if (reason === 'standard_keywords') return '用户名关键词';
+    if (reason === 'display_name_spam') return '昵称引流';
     if (reason === 'promo_target_mention') return '引流目标';
     return '自动规则';
 }
@@ -2955,6 +3258,11 @@ async function processAutoBlockArticle(article, userData) {
     const userNameText = getDisplayNameFromUserLink(userLink);
     const screenName = getScreenNameFromProfileHref(userLink?.href);
     const tweetText = getTweetTextFromArticle(article);
+
+    if (shouldExemptArticleByBlueVerified(article, 'auto_rule')) {
+        article.dataset.autoblockChecked = 'complete';
+        return;
+    }
 
     if (userNameText) {
         const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
@@ -2966,10 +3274,13 @@ async function processAutoBlockArticle(article, userData) {
                 return;
             }
             if (screenName) {
-                showToast(`nuke-auto-trigger-toast-${Date.now()}`, '🤖 自动执行拉黑', `检测到可疑用户名: ${screenName}`, 4000);
+                showAggregatedToast('nuke-auto-trigger-toast', '🤖 自动执行拉黑', `检测到可疑用户名: ${screenName}`, 4000);
             }
             triggerAutoNukeForMarkedArticle(article, { triggerMode: 'auto', autoReason: decision.reason, suspiciousDisplayName: userNameText });
             return;
+        }
+        if (decision.reason === 'follower_exempt') {
+            console.log(`[CB] 跳过auto_rule @${screenName || '未知'} (粉丝数 ${decision.followerCount} 高于阈值 ${decision.exemptThreshold})`);
         }
     }
 
@@ -2999,6 +3310,7 @@ async function processAutoBlockArticle(article, userData) {
 function scanAndProcessContent() {
     document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
     if (!currentUserId) return;
+    markStatusRootTweetArticles();
     void loadUserData().then((userData) => {
         if (!userData) return;
         document.querySelectorAll('article[data-testid="tweet"]:not([data-autoblock-checked])').forEach((article) => {
@@ -3122,6 +3434,9 @@ function onCbSpamProbeRequest(event) {
     if (detail.action === 'manualNukeDetected') {
         void executeManualNukeForDetectedTargets();
     }
+    if (detail.action === 'toastAggregate') {
+        showAggregatedToast('nuke-auto-trigger-toast', '🤖 自动执行拉黑', detail.status || '调试聚合提示', 5000);
+    }
 }
 function exposePageSpamProbe() {
     try {
@@ -3139,6 +3454,9 @@ function exposePageSpamProbe() {
             },
             manualNukeDetected: () => {
                 document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'manualNukeDetected' } }));
+            },
+            toastAggregate: (status) => {
+                document.dispatchEvent(new CustomEvent('cb-spam-probe', { detail: { action: 'toastAggregate', status } }));
             }
         };
     } catch {
