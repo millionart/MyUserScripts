@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.14.86
+// @version      2.15.6
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -47,16 +47,24 @@ const DEFAULT_SPAM_IDENTIFY_MIN_SCORE = 3;
 const AVATAR_OCR_CACHE_MS = 30 * 60 * 1000;
 const AVATAR_OCR_MAX_FAILS = 4;
 const AVATAR_OCR_STALE_PENDING_MS = 5 * 60 * 1000;
+const AVATAR_IMAGE_FETCH_TIMEOUT_MS = 20000;
+const AVATAR_OCR_JOB_TIMEOUT_MS = 45000;
+const PADDLE_OCR_VARIANT_TIMEOUT_MS = 6000;
+const AVATAR_OCR_PUMP_STALL_GRACE_MS = 10000;
+const AVATAR_OCR_VISIBLE_REQUEUE_MS = 8000;
 const avatarOcrCache = new Map();
 const avatarOcrQueue = [];
 let avatarOcrPumpRunning = false;
+let avatarOcrPumpRunId = 0;
+let avatarOcrActiveStartedAt = 0;
+let avatarOcrActiveArticle = null;
 let avatarOcrTesseractFailed = false;
 let avatarOcrPaddleFailed = false;
 let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.14.86';
+const SPAM_SCANNER_BUILD = '2.15.6';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -69,6 +77,7 @@ const AVATAR_OCR_ENGINE_TESSERACT = 'tesseract';
 const AVATAR_OCR_ENGINE_PADDLE = 'paddle';
 const AVATAR_OCR_ENGINE_OFF = 'off';
 const DEFAULT_AVATAR_OCR_ENGINE = AVATAR_OCR_ENGINE_TESSERACT;
+const BUILT_IN_AVATAR_OCR_KEYWORDS = ['全国安排'];
 const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist';
 const TESSERACT_CORE_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1';
 const PADDLE_OCR_JS_URL = 'https://cdn.jsdelivr.net/npm/paddleocr@1.0.6/dist/index.js';
@@ -98,6 +107,48 @@ function isAvatarOcrEngineFailed() {
     const engine = getAvatarOcrEngine();
     if (engine === AVATAR_OCR_ENGINE_OFF) return false;
     return engine === AVATAR_OCR_ENGINE_PADDLE ? avatarOcrPaddleFailed : avatarOcrTesseractFailed;
+}
+function withAvatarOcrJobTimeout(promise) {
+    return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+            const error = new Error('avatar OCR job timeout');
+            error.name = 'AvatarOcrJobTimeoutError';
+            reject(error);
+        }, AVATAR_OCR_JOB_TIMEOUT_MS);
+        Promise.resolve(promise)
+            .then((value) => {
+                window.clearTimeout(timer);
+                resolve(value);
+            })
+            .catch((error) => {
+                window.clearTimeout(timer);
+                reject(error);
+            });
+    });
+}
+function withAvatarOcrStepTimeout(promise, timeoutMs, message = 'avatar OCR step timeout') {
+    return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+            const error = new Error(message);
+            error.name = message === 'paddle OCR variant timeout' ? 'PaddleOcrVariantTimeoutError' : 'AvatarOcrStepTimeoutError';
+            reject(error);
+        }, timeoutMs);
+        Promise.resolve(promise)
+            .then((value) => {
+                window.clearTimeout(timer);
+                resolve(value);
+            })
+            .catch((error) => {
+                window.clearTimeout(timer);
+                reject(error);
+            });
+    });
+}
+function isAvatarOcrJobTimeout(error) {
+    return error?.name === 'AvatarOcrJobTimeoutError';
+}
+function isPaddleOcrVariantTimeout(error) {
+    return error?.name === 'PaddleOcrVariantTimeoutError';
 }
 function shouldDeferBackgroundAvatarOcr() {
     if (!isAvatarOcrEnabled() || scriptConfig.spamIdentifyEnabled === false) return false;
@@ -495,12 +546,81 @@ function parsePaddleCharacterDictionary(ymlText) {
     });
     return chars;
 }
+function detectAvatarImageMimeType(arrayBuffer) {
+    const bytes = arrayBuffer instanceof Uint8Array
+        ? arrayBuffer
+        : new Uint8Array(arrayBuffer || new ArrayBuffer(0));
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+        && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+    return 'image/jpeg';
+}
+async function decodeImageBitmapFromBlob(blob) {
+    if (typeof createImageBitmap === 'function') {
+        try {
+            return await createImageBitmap(blob);
+        } catch {
+            /* fall back to Image decoding below */
+        }
+    }
+    if (typeof Image === 'undefined' || typeof URL?.createObjectURL !== 'function') {
+        throw new Error('avatar image decode unavailable');
+    }
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        const cleanup = () => {
+            try {
+                URL.revokeObjectURL(url);
+            } catch {
+                /* ignore */
+            }
+        };
+        img.onload = () => {
+            cleanup();
+            resolve(img);
+        };
+        img.onerror = () => {
+            cleanup();
+            reject(new Error('avatar image decode failed'));
+        };
+        img.src = url;
+    });
+}
+function loadAvatarImageElementForOcr(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        let settled = false;
+        const timer = window.setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error('avatar image direct decode timeout'));
+        }, 30000);
+        img.crossOrigin = 'anonymous';
+        img.decoding = 'async';
+        img.onload = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            resolve(img);
+        };
+        img.onerror = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            reject(new Error('avatar image direct decode failed'));
+        };
+        img.src = url;
+    });
+}
 async function blobToImageData(blob) {
-    const bitmap = await createImageBitmap(blob);
+    const bitmap = await decodeImageBitmapFromBlob(blob);
     const canvas = document.createElement('canvas');
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('canvas unavailable');
     ctx.drawImage(bitmap, 0, 0);
     if (typeof bitmap.close === 'function') bitmap.close();
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -1216,12 +1336,16 @@ const SPAM_ZERO_WIDTH_RE = /[\u200b-\u200d\u2060\ufeff\u00ad]/g;
 const SPAM_CJK_PUNCT_RE = /[·•・|，,。.!！?？:：;；\-—_~～*＊/\\[\]【】()（）「」『』《》〈〉"'‘’“”\s]/g;
 const SPAM_ASCII_NOISE_BETWEEN_CJK_RE = /([\u4e00-\u9fff])[a-z0-9]{1,8}(?=[\u4e00-\u9fff])/gi;
 function isShortDatingInviteCompact(compact) {
-    return compact.length <= 12 && (/^(?:来)?聊聊在线等$/.test(compact) || (/见见吗/.test(compact) && /睡不着/.test(compact)) || (/想找/.test(compact) && /会疼人|疼人的|哥哥|姐姐|妹妹/.test(compact)));
+    const text = String(compact || '').replace(/[^\u4e00-\u9fffa-z0-9@]/gi, '');
+    return text.length <= 12 && (/^(?:来)?聊聊在线等$/.test(text) || (/见见吗/.test(text) && /睡不着/.test(text)) || (/想找/.test(text) && /会疼人|疼人的|哥哥|姐姐|妹妹/.test(text)) || /^(?:求求了|求求)?(?:好|我)?寂寞(?:在线|在吗|求聊|想聊|聊聊|等你|等聊)?$/.test(text) || /^嘿嘿有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^想要[呀啊嘛吗]?有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^有点(?:难受|寂寞)(?:在线|求聊|想聊)$/.test(text));
+}
+function hasStandaloneDd(compact) {
+    return /(^|[^a-z0-9])dd([^a-z0-9]|$)/i.test(String(compact || ''));
 }
 const SPAM_SIGNAL_DEFS = [
     { id: 'scroll_time', label: '刷帖/逛推时长', weight: 1, test: (compact) => /(?:刷|逛|翻|看|扫).{0,12}?(?:半天|一晚|一天|一晚上|好久|很久|许久|好一会|一会儿|一会|小时)/.test(compact) || /刚.{0,4}?(?:刷|逛|翻)完/.test(compact) },
     { id: 'platform_ref', label: '提及X/推特', weight: 1, test: (compact) => /(?:^|[^a-z0-9])x(?:[^a-z0-9]|$)/i.test(compact) || /推特|小蓝鸟|twitter/.test(compact) },
-    { id: 'profile_cta', label: '主页/空间导流', weight: 1, test: (compact) => /主页|个人页|主頁|空间|置顶|简介|资料|链接在|点主页|戳主页|看她主页|看他主页|她主页|他主页/.test(compact) },
+    { id: 'profile_cta', label: '主页/空间导流', weight: 1, test: (compact) => /主页|个人页|主頁|置顶|简介|资料|链接在|点主页|戳主页|看她主页|看他主页|她主页|他主页/.test(compact) || (/空间/.test(compact) && !/收益空间/.test(compact)) },
     { id: 'adult_euphemism', label: '色情暗语/飞机', weight: 1, test: (compact, raw) => /打.{0,3}?飞|能飞|起飞|开飞|✈|🛫|🛩|飞机|打飞机|打飞機/.test(compact + raw) || /舅舅|涩涩|福利|懂的都懂|(?:擦边|私房|色色|涩涩|成人).{0,4}?资源/.test(compact) },
     { id: 'adult_persona', label: '成人人设暗语', weight: 1, test: (compact) => /福利[鸡姬]/.test(compact) },
     { id: 'age_tag', label: '年龄标签(30+等)', weight: 1, test: (compact, raw) => /(?:^|[^\d])(?:1[89]|[2-5]\d|60)\+/.test(compact + raw) || /(?:20|30|40|五十|四十|三十|二十)多/.test(compact) || /三十加|四十加|二十加/.test(compact) },
@@ -1229,20 +1353,21 @@ const SPAM_SIGNAL_DEFS = [
     { id: 'explore_tease', label: '探路/花样暗示', weight: 1, test: (compact) => /已探路|探过路|探路|花样多|花样不少|玩法多|会玩|懂玩|经验丰富|去过都说|真会玩/.test(compact) },
     { id: 'contrast_tease', label: '反差/返差暗示', weight: 1, test: (compact) => /反差|返差/.test(compact) },
     { id: 'offline_lewd_claim', label: '线下色情经历', weight: 1, test: (compact) => /线下/.test(compact) && /日过|曰过|睡过|约过/.test(compact) },
-    { id: 'lewd_reaction', label: '色情反应话术', weight: 1, test: (compact) => /太涩|好涩|真涩|涩了|色了|太色|好色|顶不住|受不了|扛不住|绷不住|把持不住|定力不够|真顶|顶不住/.test(compact) },
+    { id: 'lewd_reaction', label: '色情反应话术', weight: 1, test: (compact) => /太涩|好涩|真涩|很涩|涩的很|涩了|色了|太色|好色|很色|色的很|顶不住|受不了|扛不住|绷不住|把持不住|定力不够|真顶|顶不住/.test(compact) },
     { id: 'lewd_slang', label: '骚/谐音sao', weight: 1, test: (compact) => /骚货|骚的很|很骚|太骚|真骚|骚死|骚批|比.*?骚/.test(compact) || /[这那][4么麼]?么?骚/.test(compact) || /sao货|sao的很|sao死|sao批|很sao|真sao|太sao|巨sao|sao女|sao姐|sao哥/.test(compact) || /比她sao|比他还sao|没人比.{0,8}?sao|比.*sao/.test(compact) || /第一(?:骚|sao)|第1(?:骚|sao)|最(?:骚|sao)|巨(?:骚|sao)/.test(compact) },
     { id: 'mention_promo', label: '@导流', weight: 1, test: (compact, raw) => /@[a-z0-9_]{2,}/i.test(raw) || /就.{0,8}?@|去@|看@|戳@|关注@/.test(compact) },
-    { id: 'dating_hook', label: '交友/同城套词', weight: 1, test: (compact) => /同城|附近|搭子|固炮|真人|线下|见面|私聊|dd|约会|少妇|姐姐|妹妹/.test(compact) },
+    { id: 'dating_hook', label: '交友/同城套词', weight: 1, test: (compact) => /同城|附近|搭子|固炮|真人|线下|见面|私聊|约会|少妇|姐姐|妹妹/.test(compact) || hasStandaloneDd(compact) },
     { id: 'adult_experience_claim', label: '线下体验暗示', weight: 1, test: (compact) => /线下|真人|真实/.test(compact) && /宝宝|妹妹|姐姐|身材|福利/.test(compact) && /我(?:试|試)过|(?:试|試)过了|真的?很不错|身材(?:特棒|很好|不错)|特棒/.test(compact) },
     { id: 'short_dating_invite', label: '短句交友导流', weight: 3, test: (compact) => isShortDatingInviteCompact(compact) },
     { id: 'course_funnel', label: '课程/教程导流', weight: 3, test: (compact) => /英语|外语|日语|韩语|西班牙语|语言学习|任何语言|流利学会/.test(compact) && /公开课|这堂课|课程|教程|底层方法论|唯一正确|秘诀|快速学会|强烈建议刷|早知道.{0,12}?方法|别再.{0,12}?(?:不科学|浪费时间)|学会任何语言|流利学会任何语言/.test(compact) },
+    { id: 'gray_money_funnel', label: '灰产/赚钱导流', weight: 3, test: (compact) => /交易所|okx|返佣|长期套利|收益空间|网赚|副业|偏门|跑分|灰产|日结|快钱|搞钱|洗钱|外汇/.test(compact) && /联系我|私聊|有兴趣了解|兴趣了解|可以联系|可以玩|稳定长期|每天都有收益|稳定执行|流程清晰|带你|稳赚/.test(compact) },
     { id: 'drive_link', label: '网盘链接', weight: 2, test: (compact, raw) => /pan\.quark\.cn|drive\.uc\.cn|aliyundrive\.com|115\.com|lanzou|mega\.nz/i.test(raw) },
     { id: 'core_template', label: '核心话术模板', weight: 2, test: (compact) => /刷.{0,18}?(?:半天|一晚|一天|一晚上|好久|很久).{0,24}?(?:x|推特|小蓝鸟).{0,18}?(?:她|他|这)?.{0,18}?主.?页.{0,24}?(?:打.{0,4}?飞|✈|起飞|能飞)/.test(compact) || /刷.{0,12}?(?:x|推特).{0,18}?主.?页.{0,18}?(?:打.{0,4}?飞|✈)/.test(compact) }
 ];
 function normalizeSpamText(text) {
     let s = String(text || '');
     try { s = s.normalize('NFKC'); } catch { /* ignore */ }
-    s = s.replace(SPAM_ZERO_WIDTH_RE, '').replace(/[Ⅹⅹ❌✖️]/g, 'x').replace(/[＠﹫]/g, '@').replace(/[ｘＸ]/g, 'x').replace(/\uFE0F/g, '').replace(/\s+/g, ' ').trim();
+    s = s.replace(SPAM_ZERO_WIDTH_RE, '').replace(/[Ⅹⅹ❌✖]/g, 'x').replace(/[＠﹫]/g, '@').replace(/[ｘＸ]/g, 'x').replace(/\uFE0F/g, '').replace(/\s+/g, ' ').trim();
     s = s.replace(/\s+\d+\s*(?:[iyh]|s)\s*$/i, '').trim();
     return s;
 }
@@ -1417,8 +1542,14 @@ function getAvatarImageUrlFromArticle(article) {
 }
 function resolveAvatarKeywordPatterns() {
     const dedicated = scriptConfig.spamAvatarKeywords;
-    if (Array.isArray(dedicated) && dedicated.length) return dedicated.filter(Boolean);
-    return (scriptConfig.blockKeywordsStandard || []).filter(Boolean);
+    const configured = Array.isArray(dedicated) && dedicated.length
+        ? dedicated.filter(Boolean)
+        : (scriptConfig.blockKeywordsStandard || []).filter(Boolean);
+    const patterns = [...configured];
+    BUILT_IN_AVATAR_OCR_KEYWORDS.forEach((keyword) => {
+        if (keyword && !patterns.includes(keyword)) patterns.push(keyword);
+    });
+    return patterns;
 }
 function hasRegexMeta(text) {
     return /[\\^$.*+?()[\]{}|]/.test(String(text || ''));
@@ -1478,6 +1609,16 @@ function matchesFuzzyOcrKeyword(compact, keyword) {
     }
     return false;
 }
+function matchesSplitOcrKeywordParts(compact, keyword) {
+    const target = normalizeOcrText(keyword);
+    if (target.length < 4 || hasRegexMeta(target)) return false;
+    const firstPart = target.slice(0, 2);
+    const lastPart = target.slice(-2);
+    const firstIndex = compact.indexOf(firstPart);
+    if (firstIndex < 0) return false;
+    const lastIndex = compact.indexOf(lastPart, firstIndex + firstPart.length);
+    return lastIndex >= 0 && lastIndex - firstIndex <= 120;
+}
 function matchesAvatarOcrKeywords(ocrText, patterns = []) {
     const compact = normalizeOcrText(ocrText);
     if (!compact) return { match: false, hit: '' };
@@ -1490,6 +1631,7 @@ function matchesAvatarOcrKeywords(ocrText, patterns = []) {
             if (compact.toLowerCase().includes(String(pattern).toLowerCase())) return { match: true, hit: pattern };
         }
         if (matchesFuzzyOcrKeyword(compact, pattern)) return { match: true, hit: pattern };
+        if (matchesSplitOcrKeywordParts(compact, pattern)) return { match: true, hit: pattern };
     }
     return { match: false, hit: '' };
 }
@@ -1507,6 +1649,7 @@ function fetchImageArrayBuffer(url) {
             method: 'GET',
             url,
             responseType: 'arraybuffer',
+            timeout: AVATAR_IMAGE_FETCH_TIMEOUT_MS,
             onload: (response) => {
                 if (response.status >= 200 && response.status < 300 && response.response?.byteLength > 64) {
                     resolve(response.response);
@@ -1514,7 +1657,8 @@ function fetchImageArrayBuffer(url) {
                     reject(new Error(`avatar fetch ${response.status}`));
                 }
             },
-            onerror: () => reject(new Error('avatar fetch network error'))
+            onerror: () => reject(new Error('avatar fetch network error')),
+            ontimeout: () => reject(new Error('avatar fetch timeout'))
         });
     });
 }
@@ -1685,7 +1829,7 @@ async function getAvatarOcrWorkerInner() {
             .then((opts) => Tesseract.createWorker('chi_sim', 1, opts))
             .then(async (worker) => {
                 if (typeof worker.setParameters === 'function') {
-                    await worker.setParameters({ tessedit_pageseg_mode: '11' });
+                    await worker.setParameters({ tessedit_pageseg_mode: '6' });
                 }
                 avatarOcrTesseractReady = true;
                 return worker;
@@ -1733,6 +1877,8 @@ function warmUpAvatarOcr() {
         .catch(() => { /* noted in getAvatarOcrWorker */ });
 }
 const AVATAR_OCR_IMAGE_SCALE = 2.25;
+const PADDLE_OCR_IMAGE_MAX_SIZE = 400;
+const PADDLE_OCR_IMAGE_MIN_SIZE = 192;
 async function canvasToBlob(canvas, type = 'image/png', quality) {
     return new Promise((resolve, reject) => {
         canvas.toBlob((blob) => {
@@ -1767,7 +1913,14 @@ function otsuThreshold(values) {
     }
     return best;
 }
-function processedAvatarCanvas(source, width, height, { channel = 'gray', invert = false, threshold = false } = {}) {
+function processedAvatarCanvas(source, width, height, {
+    channel = 'gray',
+    invert = false,
+    threshold = false,
+    thresholdValue = null,
+    normalize = true,
+    blackText = false
+} = {}) {
     const values = new Uint8ClampedArray(width * height);
     let min = 255;
     let max = 0;
@@ -1776,18 +1929,21 @@ function processedAvatarCanvas(source, width, height, { channel = 'gray', invert
         const r = source.data[j];
         const g = source.data[j + 1];
         const b = source.data[j + 2];
-        let value = channel === 'min' ? Math.min(r, g, b) : Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+        let value;
+        if (channel === 'min') value = Math.min(r, g, b);
+        else if (channel === 'redGreen') value = Math.min(r, g);
+        else value = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
         if (invert) value = 255 - value;
         values[i] = value;
         if (value < min) min = value;
         if (value > max) max = value;
     }
-    if (max > min) {
+    if (normalize && max > min) {
         for (let i = 0; i < values.length; i += 1) {
             values[i] = Math.max(0, Math.min(255, Math.round((values[i] - min) * 255 / (max - min))));
         }
     }
-    const thresholdValue = threshold ? otsuThreshold(values) : null;
+    const resolvedThreshold = Number.isFinite(thresholdValue) ? thresholdValue : (threshold ? otsuThreshold(values) : null);
     const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
@@ -1795,7 +1951,11 @@ function processedAvatarCanvas(source, width, height, { channel = 'gray', invert
     if (!ctx) throw new Error('canvas unavailable');
     const output = ctx.createImageData(width, height);
     for (let i = 0; i < values.length; i += 1) {
-        const value = thresholdValue == null ? values[i] : (values[i] >= thresholdValue ? 255 : 0);
+        let value = values[i];
+        if (resolvedThreshold != null) {
+            const high = value >= resolvedThreshold;
+            value = blackText ? (high ? 0 : 255) : (high ? 255 : 0);
+        }
         const j = i * 4;
         output.data[j] = value;
         output.data[j + 1] = value;
@@ -1805,29 +1965,104 @@ function processedAvatarCanvas(source, width, height, { channel = 'gray', invert
     ctx.putImageData(output, 0, 0);
     return canvas;
 }
-async function createAvatarOcrImageBlobs(arrayBuffer) {
-    const blob = new Blob([arrayBuffer], { type: 'image/jpeg' });
-    if (typeof createImageBitmap !== 'function') return [blob];
-    const bitmap = await createImageBitmap(blob);
-    const sourceSize = Math.max(bitmap.width || 0, bitmap.height || 0);
+async function createAvatarOcrImageBlobsFromImageSource(imageSource) {
+    const sourceWidth = imageSource.naturalWidth || imageSource.videoWidth || imageSource.width || 0;
+    const sourceHeight = imageSource.naturalHeight || imageSource.videoHeight || imageSource.height || 0;
+    const sourceSize = Math.max(sourceWidth, sourceHeight);
     const size = Math.max(576, Math.round(sourceSize * AVATAR_OCR_IMAGE_SCALE));
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return [blob];
+    if (!ctx) {
+        if (typeof imageSource.close === 'function') imageSource.close();
+        throw new Error('canvas unavailable');
+    }
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, size, size);
-    ctx.drawImage(bitmap, 0, 0, size, size);
-    if (typeof bitmap.close === 'function') bitmap.close();
+    ctx.drawImage(imageSource, 0, 0, size, size);
+    if (typeof imageSource.close === 'function') imageSource.close();
     const source = ctx.getImageData(0, 0, size, size);
     return [
         await canvasToBlob(canvas, 'image/jpeg', 0.95),
         await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'gray' })),
         await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'gray', invert: true, threshold: true })),
-        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'min' }))
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'min' })),
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'min', normalize: false, thresholdValue: 200, blackText: true })),
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'redGreen', thresholdValue: 200, blackText: true }))
     ];
+}
+async function createAvatarPaddleOcrImageBlobsFromImageSource(imageSource) {
+    const sourceWidth = imageSource.naturalWidth || imageSource.videoWidth || imageSource.width || 0;
+    const sourceHeight = imageSource.naturalHeight || imageSource.videoHeight || imageSource.height || 0;
+    const sourceSize = Math.max(sourceWidth, sourceHeight);
+    const size = Math.min(PADDLE_OCR_IMAGE_MAX_SIZE, Math.max(PADDLE_OCR_IMAGE_MIN_SIZE, sourceSize || PADDLE_OCR_IMAGE_MIN_SIZE));
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+        if (typeof imageSource.close === 'function') imageSource.close();
+        throw new Error('canvas unavailable');
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.drawImage(imageSource, 0, 0, size, size);
+    if (typeof imageSource.close === 'function') imageSource.close();
+    const source = ctx.getImageData(0, 0, size, size);
+    return [
+        await canvasToBlob(canvas, 'image/jpeg', 0.92),
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'gray' })),
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'min', normalize: false, thresholdValue: 200, blackText: true })),
+        await canvasToBlob(processedAvatarCanvas(source, size, size, { channel: 'redGreen', thresholdValue: 200, blackText: true }))
+    ];
+}
+async function createAvatarOcrImageBlobsFromUrl(imageUrl) {
+    let lastError = null;
+    for (const url of avatarImageFetchCandidates(imageUrl)) {
+        try {
+            const img = await loadAvatarImageElementForOcr(url);
+            return createAvatarOcrImageBlobsFromImageSource(img);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error('avatar image direct decode failed');
+}
+async function createAvatarPaddleOcrImageBlobsFromUrl(imageUrl) {
+    let lastError = null;
+    for (const url of avatarImageFetchCandidates(imageUrl)) {
+        try {
+            const img = await loadAvatarImageElementForOcr(url);
+            return createAvatarPaddleOcrImageBlobsFromImageSource(img);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error('avatar image direct decode failed');
+}
+async function createAvatarOcrImageBlobs(arrayBuffer, imageUrl = '') {
+    const blob = new Blob([arrayBuffer], { type: detectAvatarImageMimeType(arrayBuffer) });
+    try {
+        const bitmap = await decodeImageBitmapFromBlob(blob);
+        return await createAvatarOcrImageBlobsFromImageSource(bitmap);
+    } catch {
+        if (imageUrl) return createAvatarOcrImageBlobsFromUrl(imageUrl);
+        return [blob];
+    }
+}
+async function createAvatarPaddleOcrImageBlobs(arrayBuffer, imageUrl = '') {
+    const blob = new Blob([arrayBuffer], { type: detectAvatarImageMimeType(arrayBuffer) });
+    try {
+        const bitmap = await decodeImageBitmapFromBlob(blob);
+        return await createAvatarPaddleOcrImageBlobsFromImageSource(bitmap);
+    } catch {
+        if (imageUrl) return createAvatarPaddleOcrImageBlobsFromUrl(imageUrl);
+        return [blob];
+    }
 }
 async function scaleAvatarBlobForOcr(arrayBuffer) {
     const blobs = await createAvatarOcrImageBlobs(arrayBuffer);
@@ -1841,8 +2076,8 @@ async function blobToDataUrl(blob) {
         reader.readAsDataURL(blob);
     });
 }
-async function recognizeAvatarWithTesseract(arrayBuffer, patterns = []) {
-    const blobs = await createAvatarOcrImageBlobs(arrayBuffer);
+async function recognizeAvatarWithTesseract(arrayBuffer, patterns = [], imageUrl = '') {
+    const blobs = await createAvatarOcrImageBlobs(arrayBuffer, imageUrl);
     const worker = await getAvatarOcrWorker();
     const texts = [];
     let lastError = null;
@@ -1860,16 +2095,48 @@ async function recognizeAvatarWithTesseract(arrayBuffer, patterns = []) {
     if (!texts.length && lastError) throw lastError;
     return texts.join('\n');
 }
-async function recognizeAvatarWithPaddleBrowser(arrayBuffer) {
-    const scaledBlob = await scaleAvatarBlobForOcr(arrayBuffer);
+async function recognizeAvatarWithPaddleBrowser(arrayBuffer, patterns = [], imageUrl = '') {
+    const texts = [];
+    let lastError = null;
+    if (patterns?.length) {
+        try {
+            const tesseractGuardText = await recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
+            if (matchesAvatarOcrKeywords(tesseractGuardText, patterns).match) return tesseractGuardText;
+            if (tesseractGuardText) texts.push(tesseractGuardText);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    const blobs = await createAvatarPaddleOcrImageBlobs(arrayBuffer, imageUrl);
     const paddle = await ensurePaddleUserscriptReady();
-    const imageData = await blobToImageData(scaledBlob);
-    const result = await paddle.runOcr(imageData);
-    return textFromPaddleBrowserResult(result);
+    for (const blob of blobs) {
+        try {
+            const imageData = await blobToImageData(blob);
+            const result = await withAvatarOcrStepTimeout(paddle.runOcr(imageData), PADDLE_OCR_VARIANT_TIMEOUT_MS, 'paddle OCR variant timeout');
+            const text = textFromPaddleBrowserResult(result);
+            if (text && !texts.includes(text)) texts.push(text);
+            const combined = texts.join('\n');
+            if (matchesAvatarOcrKeywords(combined, patterns).match) return combined;
+        } catch (error) {
+            lastError = error;
+            if (isPaddleOcrVariantTimeout(error)) break;
+        }
+    }
+    const paddleText = texts.join('\n');
+    if (patterns?.length) {
+        try {
+            const fallbackText = await recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
+            return [paddleText, fallbackText].filter(Boolean).join('\n');
+        } catch (error) {
+            if (!paddleText) lastError = error;
+        }
+    }
+    if (!paddleText && lastError) throw lastError;
+    return paddleText;
 }
-async function recognizeAvatarTextWithOcr(arrayBuffer, patterns = []) {
-    if (getAvatarOcrEngine() === AVATAR_OCR_ENGINE_PADDLE) return recognizeAvatarWithPaddleBrowser(arrayBuffer);
-    return recognizeAvatarWithTesseract(arrayBuffer, patterns);
+async function recognizeAvatarTextWithOcr(arrayBuffer, patterns = [], imageUrl = '') {
+    if (getAvatarOcrEngine() === AVATAR_OCR_ENGINE_PADDLE) return recognizeAvatarWithPaddleBrowser(arrayBuffer, patterns, imageUrl);
+    return recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
 }
 async function analyzeAvatarImageBuffer(arrayBuffer, patterns, imageUrl = '') {
     const imageId = extractTwitterProfileImageId(imageUrl);
@@ -1877,7 +2144,7 @@ async function analyzeAvatarImageBuffer(arrayBuffer, patterns, imageUrl = '') {
         return { match: false, hit: '', source: 'none', imageId, ocrOk: false, ocrText: '' };
     }
     try {
-        const ocrText = await recognizeAvatarTextWithOcr(arrayBuffer, patterns);
+        const ocrText = await recognizeAvatarTextWithOcr(arrayBuffer, patterns, imageUrl);
         const signature = detectPromoAvatarSignature(imageUrl, ocrText, patterns);
         return { ...signature, ocrOk: true, ocrText };
     } catch (error) {
@@ -1951,6 +2218,7 @@ function triggerAutoNukeForMarkedArticle(article, trigger) {
 function isDetectedNukeTargetArticle(article) {
     return !!(
         article?.isConnected &&
+        !isStatusRootTweetArticle(article) &&
         article.querySelector('.nuke-spam-badge') &&
         article.dataset.autoblockTriggered !== 'true' &&
         article.style.display !== 'none'
@@ -2136,19 +2404,36 @@ function removeAvatarOcrJobsForArticle(article) {
         if (avatarOcrQueue[i]?.article === article) avatarOcrQueue.splice(i, 1);
     }
 }
+function isAvatarOcrJobQueuedForArticle(article) {
+    return !!article && avatarOcrQueue.some((job) => job?.article === article);
+}
+function isAvatarOcrJobActiveForArticle(article) {
+    return !!article && avatarOcrActiveArticle === article;
+}
 function enqueueAvatarOcr(article, imageUrl) {
-    if (article.dataset.avatarOcrPending === 'true' || article.dataset.avatarOcrQueued === 'true') return;
+    const visible = isArticleInViewport(article);
+    if ((article.dataset.avatarOcrPending === 'true' || article.dataset.avatarOcrQueued === 'true') && !visible) return;
+    if (isAvatarOcrJobActiveForArticle(article)) return;
     removeAvatarOcrJobsForArticle(article);
     article.dataset.avatarOcrQueued = 'true';
     article.dataset.avatarOcrPending = 'true';
     article.dataset.avatarOcrQueuedAt = String(Date.now());
-    avatarOcrQueue.push({ article, imageUrl });
+    const job = { article, imageUrl };
+    if (visible) avatarOcrQueue.unshift(job);
+    else avatarOcrQueue.push(job);
     void pumpAvatarOcrQueue();
 }
 function hasStaleAvatarOcrPending(article) {
     if (article?.dataset?.avatarOcrPending !== 'true') return false;
     const queuedAt = parseInt(article.dataset.avatarOcrQueuedAt, 10) || 0;
     return !queuedAt || Date.now() - queuedAt > AVATAR_OCR_STALE_PENDING_MS;
+}
+function shouldPromoteVisibleAvatarOcrPending(article) {
+    if (article?.dataset?.avatarOcrPending !== 'true') return false;
+    if (!isArticleInViewport(article) || isAvatarOcrJobActiveForArticle(article)) return false;
+    if (isAvatarOcrJobQueuedForArticle(article)) return true;
+    const queuedAt = parseInt(article.dataset.avatarOcrQueuedAt, 10) || 0;
+    return !queuedAt || Date.now() - queuedAt > AVATAR_OCR_VISIBLE_REQUEUE_MS;
 }
 function isArticleInViewport(article) {
     if (!article?.isConnected) return false;
@@ -2160,54 +2445,113 @@ function takeNextAvatarOcrJob() {
     if (visibleIndex > 0) return avatarOcrQueue.splice(visibleIndex, 1)[0];
     return avatarOcrQueue.shift();
 }
+function shouldDeferAvatarOcrJob(job) {
+    return !isArticleInViewport(job?.article) && shouldDeferBackgroundAvatarOcr();
+}
+function hasVisibleAvatarOcrJobWaiting() {
+    return avatarOcrQueue.some((job) => isArticleInViewport(job?.article));
+}
+function updateAvatarOcrPumpProbe(state = '') {
+    try {
+        document.documentElement.dataset.cbSpamOcrPumpRunning = avatarOcrPumpRunning ? '1' : '0';
+        document.documentElement.dataset.cbSpamOcrPumpState = state;
+        document.documentElement.dataset.cbSpamOcrActiveAge = avatarOcrActiveStartedAt ? String(Date.now() - avatarOcrActiveStartedAt) : '0';
+    } catch {
+        /* probe only */
+    }
+}
+function recoverStalledAvatarOcrPump() {
+    if (!avatarOcrQueue.length) return;
+    if (!avatarOcrPumpRunning) {
+        void pumpAvatarOcrQueue();
+        return;
+    }
+    if (!avatarOcrActiveStartedAt) return;
+    const activeAge = Date.now() - avatarOcrActiveStartedAt;
+    const hasVisibleJobWaiting = hasVisibleAvatarOcrJobWaiting() && !isArticleInViewport(avatarOcrActiveArticle);
+    const maxActiveAge = hasVisibleJobWaiting ? AVATAR_OCR_VISIBLE_REQUEUE_MS : AVATAR_OCR_JOB_TIMEOUT_MS + AVATAR_OCR_PUMP_STALL_GRACE_MS;
+    if (activeAge <= maxActiveAge) return;
+    avatarOcrPumpRunId += 1;
+    avatarOcrPumpRunning = false;
+    avatarOcrActiveStartedAt = 0;
+    avatarOcrActiveArticle = null;
+    updateAvatarOcrPumpProbe(hasVisibleJobWaiting ? 'preempt-visible' : 'recovered');
+    void pumpAvatarOcrQueue();
+}
 async function pumpAvatarOcrQueue() {
     if (avatarOcrPumpRunning) return;
     avatarOcrPumpRunning = true;
+    const pumpRunId = ++avatarOcrPumpRunId;
+    updateAvatarOcrPumpProbe('running');
     const patterns = resolveAvatarKeywordPatterns();
-    while (avatarOcrQueue.length) {
-        const job = takeNextAvatarOcrJob();
-        if (!job?.article?.isConnected) continue;
-        if (shouldDeferBackgroundAvatarOcr()) {
-            avatarOcrQueue.unshift(job);
-            await new Promise((resolve) => window.setTimeout(resolve, 400));
-            continue;
-        }
-        let matched = false;
-        try {
-            if (scriptConfig.spamIdentifyEnabled === false || !isAvatarOcrEnabled()) {
-                if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
+    try {
+        while (avatarOcrQueue.length && pumpRunId === avatarOcrPumpRunId) {
+            const job = takeNextAvatarOcrJob();
+            if (!job?.article?.isConnected) continue;
+            if (shouldDeferAvatarOcrJob(job)) {
+                avatarOcrQueue.unshift(job);
+                updateAvatarOcrPumpProbe('deferred');
+                await new Promise((resolve) => window.setTimeout(resolve, 400));
                 continue;
             }
-            const analysis = await analyzeAvatarImageUrl(job.imageUrl, patterns);
-            if (analysis.match) {
-                if (await shouldExemptArticleByTrustedAuthor(job.article, 'avatar_ocr')) {
-                    matched = true;
-                } else {
-                    const hit = analysis.hit || '头像关键词';
-                    ensureSpamBadge(job.article, { match: true, score: 1, summary: hit }, 'avatar');
-                    triggerAutoNukeForMarkedArticle(job.article, {
-                        triggerMode: 'auto',
-                        autoReason: 'avatar_ocr',
-                        avatarOcrHit: hit
-                    });
-                    matched = true;
+            let matched = false;
+            avatarOcrActiveStartedAt = Date.now();
+            avatarOcrActiveArticle = job.article;
+            updateAvatarOcrPumpProbe('active');
+            try {
+                if (scriptConfig.spamIdentifyEnabled === false || !isAvatarOcrEnabled()) {
+                    if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
+                    continue;
+                }
+                const analysis = await withAvatarOcrJobTimeout(analyzeAvatarImageUrl(job.imageUrl, patterns));
+                if (pumpRunId !== avatarOcrPumpRunId) return;
+                if (analysis.match) {
+                    const trustedExempt = await shouldExemptArticleByTrustedAuthor(job.article, 'avatar_ocr');
+                    if (pumpRunId !== avatarOcrPumpRunId) return;
+                    if (trustedExempt) {
+                        matched = true;
+                    } else {
+                        const hit = analysis.hit || '头像关键词';
+                        ensureSpamBadge(job.article, { match: true, score: 1, summary: hit }, 'avatar');
+                        triggerAutoNukeForMarkedArticle(job.article, {
+                            triggerMode: 'auto',
+                            autoReason: 'avatar_ocr',
+                            avatarOcrHit: hit
+                        });
+                        matched = true;
+                    }
+                }
+            } catch (error) {
+                if (pumpRunId !== avatarOcrPumpRunId) return;
+                noteAvatarOcrError(error);
+                const failCount = (parseInt(job.article.dataset.avatarOcrFailCount, 10) || 0) + 1;
+                job.article.dataset.avatarOcrFailCount = String(failCount);
+                console.warn(`[CB] 头像识别失败 (${failCount}/${AVATAR_OCR_MAX_FAILS})`, job.imageUrl, error);
+                if (!isAvatarOcrJobTimeout(error) && failCount < AVATAR_OCR_MAX_FAILS) {
+                    releaseAvatarOcrForRetry(job.article);
+                    continue;
+                }
+            } finally {
+                if (pumpRunId === avatarOcrPumpRunId) {
+                    avatarOcrActiveStartedAt = 0;
+                    avatarOcrActiveArticle = null;
+                    updateAvatarOcrPumpProbe('idle');
                 }
             }
-        } catch (error) {
-            noteAvatarOcrError(error);
-            const failCount = (parseInt(job.article.dataset.avatarOcrFailCount, 10) || 0) + 1;
-            job.article.dataset.avatarOcrFailCount = String(failCount);
-            console.warn(`[CB] 头像识别失败 (${failCount}/${AVATAR_OCR_MAX_FAILS})`, job.imageUrl, error);
-            if (failCount < AVATAR_OCR_MAX_FAILS) {
-                releaseAvatarOcrForRetry(job.article);
-                continue;
+            if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+    } finally {
+        if (pumpRunId === avatarOcrPumpRunId) {
+            avatarOcrPumpRunning = false;
+            avatarOcrActiveStartedAt = 0;
+            avatarOcrActiveArticle = null;
+            updateAvatarOcrPumpProbe('stopped');
+            if (avatarOcrQueue.length) {
+                void pumpAvatarOcrQueue();
             }
         }
-        if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
-        await new Promise((resolve) => window.setTimeout(resolve, 100));
     }
-    avatarOcrPumpRunning = false;
-    if (avatarOcrQueue.length) void pumpAvatarOcrQueue();
 }
 async function processSpamArticle(article) {
     if (shouldSkipSpamIdentifyForArticle(article)) {
@@ -2271,6 +2615,10 @@ function clearSpamIdentifyTextBadge(article) {
     if (!article.querySelector('.nuke-spam-badge')) article.classList.remove('nuke-spam-identified');
 }
 function shouldSkipSpamArticleScan(article) {
+    if (shouldPromoteVisibleAvatarOcrPending(article)) {
+        releaseAvatarOcrForRetry(article);
+        return false;
+    }
     if (hasStaleAvatarOcrPending(article)) {
         releaseAvatarOcrForRetry(article);
         return false;
@@ -2315,12 +2663,14 @@ function scheduleSpamRescanDebounced() {
 }
 function scanSpamIdentifyContent() {
     if (!currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
+    recoverStalledAvatarOcrPump();
     resetSpamScanMarkersForBuildUpgrade();
     markStatusRootTweetArticles();
     tryExpandHiddenSpamReplies();
     document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
         void processSpamArticle(article);
     });
+    recoverStalledAvatarOcrPump();
     try {
         const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
         let avatarHits = 0;
@@ -2460,6 +2810,8 @@ function createQueueEntryFromUser(userResult, chainSources, context) {
         sourceTweetUrl: context.tweetUrl || '',
         sourceTweetText: truncateBlockContextText(context.tweetText),
         sourceAuthorHandle: context.authorHandle || '',
+        sourceRootAuthorHandle: context.rootAuthorHandle || '',
+        sourceRootAuthorId: context.rootAuthorId || null,
         blockReason: meta.blockReason,
         blockNote: meta.blockNote
     };
@@ -2640,7 +2992,7 @@ function matchesStandardKeywords(userNameText, patterns) {
 function matchesBuiltInDisplayNameSpam(userNameText) {
     const normalized = String(userNameText || '').replace(/\s+/g, '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '').toLowerCase();
     if (!normalized) return false;
-    return /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized);
+    return /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized) || ((/赚钱|挣钱|搞钱|网赚|兼职|副业|快钱|日结/.test(normalized) && /跑分|灰产|偏门|洗钱|返佣|外汇|区块链|币圈/.test(normalized)) || /跑分灰产|灰产副业|网赚兼职|快钱日结/.test(normalized));
 }
 function getUsernameRuleFollowerExemptThreshold() {
     return scriptConfig.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
@@ -3041,6 +3393,17 @@ async function handleVerifiedUserName(userNameText) {
     showVerificationModal(userNameText);
 }
 
+function isQueueEntryProtectedRootAuthor(entry) {
+    if (!entry) return false;
+    const entryHandle = normalizePromoHandle(entry.screenName);
+    const sourceAuthorHandle = normalizePromoHandle(entry.sourceAuthorHandle);
+    if (sourceAuthorHandle && entryHandle === sourceAuthorHandle) return true;
+    const sourceRootAuthorId = entry.sourceRootAuthorId ? String(entry.sourceRootAuthorId) : '';
+    if (sourceRootAuthorId && String(entry.userId || '') === sourceRootAuthorId) return true;
+    const sourceRootAuthorHandle = normalizePromoHandle(entry.sourceRootAuthorHandle);
+    return !!(sourceRootAuthorHandle && entryHandle === sourceRootAuthorHandle);
+}
+
 // --- CORE LOGIC ---
 async function processQueue() {
     if (isProcessingQueue || manualDetectedNukeRunning || !currentUserId) return;
@@ -3057,6 +3420,11 @@ async function processQueue() {
             } catch (fetchError) {
                 console.warn(`[CB] 获取用户 ${userToBlock.userId} 的详细信息失败，将使用现有数据继续。`, fetchError);
             }
+        }
+        if (isQueueEntryProtectedRootAuthor(userToBlock)) {
+            console.warn(`[CB] 跳过队列中的主贴作者 @${userToBlock.screenName || userToBlock.userId}`);
+            userData.queue.shift();
+            return;
         }
         await blockUserById(userToBlock.userId);
         userData.queue.shift();
@@ -3091,11 +3459,29 @@ function getChainExemptHandlesForTarget(targetArticle) {
     const targetAuthorHandle = getArticleAuthorHandle(targetArticle);
     return rootAuthorHandle && rootAuthorHandle !== targetAuthorHandle ? [rootAuthorHandle] : [];
 }
+function isResolvedTargetRootAuthor(resolvedTarget) {
+    const authorHandle = normalizePromoHandle(resolvedTarget?.authorHandle);
+    const rootAuthorHandle = normalizePromoHandle(resolvedTarget?.rootAuthorHandle);
+    if (authorHandle && rootAuthorHandle && authorHandle === rootAuthorHandle) return true;
+    return !!(resolvedTarget?.authorId && resolvedTarget?.rootAuthorId && resolvedTarget.authorId === resolvedTarget.rootAuthorId);
+}
+function isDirectManualRootAuthorBlock(resolvedTarget) {
+    return isResolvedTargetRootAuthor(resolvedTarget) && resolvedTarget?.trigger?.triggerMode === 'manual';
+}
 function buildChainSkipUserIds(resolvedTarget) {
     const ids = new Set();
     if (resolvedTarget?.authorId) ids.add(resolvedTarget.authorId);
     if (resolvedTarget?.rootAuthorId && resolvedTarget.rootAuthorId !== resolvedTarget.authorId) ids.add(resolvedTarget.rootAuthorId);
     return ids;
+}
+function removeProtectedAuthorsFromChainQueue(queueById, resolvedTarget) {
+    if (!queueById) return;
+    buildChainSkipUserIds(resolvedTarget).forEach((id) => queueById.delete(id));
+    const protectedHandles = new Set([resolvedTarget?.authorHandle, resolvedTarget?.rootAuthorHandle].map(normalizePromoHandle).filter(Boolean));
+    if (!protectedHandles.size) return;
+    for (const [userId, entry] of queueById.entries()) {
+        if (protectedHandles.has(normalizePromoHandle(entry?.screenName))) queueById.delete(userId);
+    }
 }
 function mergeUserIdSets(sets = []) {
     const merged = new Set();
@@ -3137,12 +3523,19 @@ async function resolveNukeTarget(targetArticle, trigger) {
             console.warn(`[CB] 获取主贴作者 @${rootAuthorHandle} 失败，将仅按 handle 豁免`, rootAuthorError);
         }
     }
+    tweetContext.rootAuthorHandle = rootAuthorHandle || '';
+    tweetContext.rootAuthorId = rootAuthorId || null;
     return { targetArticle, trigger, authorHandle, authorUserNameText, tweetContext, authorId, rootAuthorHandle, rootAuthorId, engagementCounts: getArticleEngagementCounts(targetArticle) };
 }
 async function blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptHandles) {
     const { authorId, authorHandle, authorUserNameText, trigger, tweetContext } = resolvedTarget;
     if (!authorId) {
         console.error(`[CB] 拉黑作者 @${authorHandle} 失败:`, new Error("无法获取作者用户ID"));
+        return false;
+    }
+    if (isResolvedTargetRootAuthor(resolvedTarget) && !isDirectManualRootAuthorBlock(resolvedTarget)) {
+        console.warn(`[CB] 跳过拉黑主贴作者 @${authorHandle}：非直接手动主贴操作`);
+        showToast('nuke-fetch-toast', '🛡️ 已跳过主贴作者', `非直接手动操作，不拉黑 @${authorHandle}`, 4000);
         return false;
     }
     if (whitelistIds.has(authorId) || exemptHandles.includes(authorHandle)) {
@@ -3172,7 +3565,7 @@ async function collectChainUsersForResolvedTarget(resolvedTarget, queueById, onC
     addUsersToChainQueue(queueById, retweeters, 'retweet', tweetContext);
     addUsersToChainQueue(queueById, repliers, 'reply', tweetContext);
     addUsersToChainQueue(queueById, favoriters, 'like', tweetContext);
-    if (authorId) queueById.delete(authorId);
+    removeProtectedAuthorsFromChainQueue(queueById, resolvedTarget);
     return Math.max(0, queueById.size - beforeSize);
 }
 function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
@@ -3258,6 +3651,11 @@ async function processAutoBlockArticle(article, userData) {
     const userNameText = getDisplayNameFromUserLink(userLink);
     const screenName = getScreenNameFromProfileHref(userLink?.href);
     const tweetText = getTweetTextFromArticle(article);
+
+    if (isStatusRootTweetArticle(article)) {
+        article.dataset.autoblockChecked = 'complete';
+        return;
+    }
 
     if (shouldExemptArticleByBlueVerified(article, 'auto_rule')) {
         article.dataset.autoblockChecked = 'complete';
