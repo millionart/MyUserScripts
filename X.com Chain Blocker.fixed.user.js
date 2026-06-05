@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.6
+// @version      2.15.13
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -64,7 +64,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.6';
+const SPAM_SCANNER_BUILD = '2.15.13';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -908,8 +908,12 @@ function isStatusRootTweetArticle(article) {
 function shouldSkipAvatarOcrForArticle(article) {
     return isStatusRootTweetArticle(article);
 }
-function shouldSkipSpamIdentifyForArticle(article) {
-    return isStatusRootTweetArticle(article);
+function isRootTweetAllowedSpamDetection(detection) {
+    return !!(detection?.match && detection.signals?.some((s) => s.id === 'emoji_only_bait'));
+}
+function shouldSkipSpamIdentifyForArticle(article, detection = null) {
+    if (!isStatusRootTweetArticle(article)) return false;
+    return !isRootTweetAllowedSpamDetection(detection);
 }
 function extractTwitterProfileImageId(url) {
     const match = String(url || '').match(/profile_images\/(\d+)\//);
@@ -1342,6 +1346,55 @@ function isShortDatingInviteCompact(compact) {
 function hasStandaloneDd(compact) {
     return /(^|[^a-z0-9])dd([^a-z0-9]|$)/i.test(String(compact || ''));
 }
+function extractSpamEmojiChars(text) {
+    return Array.from(String(text || '').matchAll(/\p{Extended_Pictographic}/gu), (match) => match[0]);
+}
+function spamEmojiBucket(emoji) {
+    const codePoint = Array.from(String(emoji || '')).find((char) => {
+        const cp = char.codePointAt(0) || 0;
+        return cp > 0xff && cp !== 0xfe0f && cp !== 0x200d;
+    })?.codePointAt(0) || 0;
+    return codePoint ? Math.floor(codePoint / 0x40) : 0;
+}
+function isEmojiOnlyBaitText(text) {
+    const raw = String(text || '').replace(/\r\n?/g, '\n');
+    const hasLeadingMention = /^\s*(?:@[a-z0-9_]{1,20}\s*)+/i.test(raw);
+    const source = raw
+        .trim()
+        .replace(/^(?:@[a-z0-9_]{1,20}\s*)+/i, '')
+        .trim();
+    if (!source) return false;
+    const emojis = extractSpamEmojiChars(source);
+    if (emojis.length < 4 || new Set(emojis).size < 3) return false;
+    const groups = source.split(/\n+/).map((part) => part.trim()).filter(Boolean);
+    const nonEmoji = source.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\u200b-\u200d\u2060\ufeff\u00ad\ufe0f\s]/g, '');
+    if (nonEmoji) return false;
+    const clusters = source.split(/[\s\u200b-\u200d\u2060\ufeff\u00ad]+/).map((part) => part.trim()).filter(Boolean);
+    const bucketCount = new Set(emojis.map(spamEmojiBucket).filter(Boolean)).size;
+    const newlineLayout = groups.length >= 3 && bucketCount >= 2;
+    const mentionRandomLayout = hasLeadingMention && emojis.length >= 5 && new Set(emojis).size >= 4 && clusters.length >= 4 && bucketCount >= 3;
+    return newlineLayout || mentionRandomLayout;
+}
+function isShortLocationInviteCompact(compact) {
+    const text = String(compact || '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '');
+    if (text.length > 18) return false;
+    return /^(?:有|有没有)[\u4e00-\u9fff]{0,8}(?:线下|同城|附近的?)(?:吗|嘛|不)[a-z0-9]{0,3}$/i.test(text);
+}
+function isPetRoleInviteCompact(compact) {
+    const text = String(compact || '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '');
+    if (text.length > 18) return false;
+    return /^(?:小狗|狗狗|修狗|小猫|猫猫)(?:求|找|想要).{0,4}(?:主人|主|哥哥|姐姐).{0,4}(?:抱抱|摸摸|收留|带走|领养)[a-z0-9]{0,3}$/i.test(text);
+}
+function isIncidentClipFunnelCompact(compact) {
+    const text = String(compact || '').toLowerCase();
+    const platform = '(?:快手|抖音|小红书|视频号|微博|b站|bilibili)';
+    const accountDiscovery = new RegExp(`${platform}(?:号|账号|帐号).{0,20}?(?:被扒|扒出来|被曝光|曝光了?|曝光出来|找到了?|搜到了?|搜出来)|(?:被扒|扒出来|被曝光|曝光了?|曝光出来|找到了?|搜到了?|搜出来).{0,20}?${platform}(?:号|账号|帐号)`).test(text);
+    const hotspotContext = /凶手|嫌疑人|犯人|肇事|施暴|行凶|涉事|当事|受害|遇害|被害|死亡|死者|老师|校长|学生|司机|女生|男生|网红|塌房|突发|出事|大事|热点|新闻|事件|事故|爆炸|跳楼|坠楼|车祸|杀|砍|打人|瓜/.test(text);
+    const clipLure = /(?:第一视角|本人录|本人拍|作案|行凶|现场|完整(?:版)?|原(?:版|视频)?|监控|录像|录屏|偷拍视频|后续|全过程|全程|未删减|高清|瓜).{0,10}?视频|视频.{0,10}?(?:第一视角|本人录|本人拍|作案|行凶|现场|完整(?:版)?|原(?:版|视频)?|监控|录像|录屏|偷拍视频|后续|全过程|全程|未删减|高清|还在|没删|没封|能看)/.test(text);
+    const stillVisible = /(?:现在|视频|里面|原视频|完整视频|录屏|监控|现场).{0,10}?(?:还在|没删|没封|还能看|能看|可以看)|(?:去|可以|你们|大家|自己|快去|好奇去|我去搜了?一下).{0,12}?(?:看看|搜|搜索|围观|去看)|搜.{0,8}?(?:一下|看看|就有|还真有)/.test(text);
+    const platformNeglect = new RegExp(`${platform}.{0,8}?(?:居然|竟然)?(?:不封号|不删|没封|没删)`).test(text);
+    return accountDiscovery && hotspotContext && clipLure && (stillVisible || platformNeglect);
+}
 const SPAM_SIGNAL_DEFS = [
     { id: 'scroll_time', label: '刷帖/逛推时长', weight: 1, test: (compact) => /(?:刷|逛|翻|看|扫).{0,12}?(?:半天|一晚|一天|一晚上|好久|很久|许久|好一会|一会儿|一会|小时)/.test(compact) || /刚.{0,4}?(?:刷|逛|翻)完/.test(compact) },
     { id: 'platform_ref', label: '提及X/推特', weight: 1, test: (compact) => /(?:^|[^a-z0-9])x(?:[^a-z0-9]|$)/i.test(compact) || /推特|小蓝鸟|twitter/.test(compact) },
@@ -1361,6 +1414,10 @@ const SPAM_SIGNAL_DEFS = [
     { id: 'short_dating_invite', label: '短句交友导流', weight: 3, test: (compact) => isShortDatingInviteCompact(compact) },
     { id: 'course_funnel', label: '课程/教程导流', weight: 3, test: (compact) => /英语|外语|日语|韩语|西班牙语|语言学习|任何语言|流利学会/.test(compact) && /公开课|这堂课|课程|教程|底层方法论|唯一正确|秘诀|快速学会|强烈建议刷|早知道.{0,12}?方法|别再.{0,12}?(?:不科学|浪费时间)|学会任何语言|流利学会任何语言/.test(compact) },
     { id: 'gray_money_funnel', label: '灰产/赚钱导流', weight: 3, test: (compact) => /交易所|okx|返佣|长期套利|收益空间|网赚|副业|偏门|跑分|灰产|日结|快钱|搞钱|洗钱|外汇/.test(compact) && /联系我|私聊|有兴趣了解|兴趣了解|可以联系|可以玩|稳定长期|每天都有收益|稳定执行|流程清晰|带你|稳赚/.test(compact) },
+    { id: 'incident_clip_funnel', label: '事件视频导流', weight: 3, test: (compact) => isIncidentClipFunnelCompact(compact) },
+    { id: 'emoji_only_bait', label: '纯 emoji 诱导', weight: 3, test: (compact, raw, source) => isEmojiOnlyBaitText(source) },
+    { id: 'short_location_invite', label: '短句位置邀约', weight: 3, test: (compact) => isShortLocationInviteCompact(compact) },
+    { id: 'pet_role_invite', label: '宠物角色邀约', weight: 3, test: (compact) => isPetRoleInviteCompact(compact) },
     { id: 'drive_link', label: '网盘链接', weight: 2, test: (compact, raw) => /pan\.quark\.cn|drive\.uc\.cn|aliyundrive\.com|115\.com|lanzou|mega\.nz/i.test(raw) },
     { id: 'core_template', label: '核心话术模板', weight: 2, test: (compact) => /刷.{0,18}?(?:半天|一晚|一天|一晚上|好久|很久).{0,24}?(?:x|推特|小蓝鸟).{0,18}?(?:她|他|这)?.{0,18}?主.?页.{0,24}?(?:打.{0,4}?飞|✈|起飞|能飞)/.test(compact) || /刷.{0,12}?(?:x|推特).{0,18}?主.?页.{0,18}?(?:打.{0,4}?飞|✈)/.test(compact) }
 ];
@@ -1381,16 +1438,18 @@ function compactSpamTextVariants(text) {
 }
 function detectSpamReply(text, options = {}) {
     const minScore = options.minScore ?? scriptConfig.spamIdentifyMinScore ?? DEFAULT_SPAM_IDENTIFY_MIN_SCORE;
-    const raw = normalizeSpamText(text);
+    const rawInput = String(text || '');
+    const raw = normalizeSpamText(rawInput);
     const compact = compactSpamText(raw);
     const compactVariants = compactSpamTextVariants(raw);
     const shortDatingInvite = isShortDatingInviteCompact(compact);
-    if (!raw || (raw.length < 8 && !shortDatingInvite)) return { match: false, score: 0, signals: [], summary: '' };
-    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw)) return { match: false, score: 0, signals: [], summary: '' };
+    const emojiOnlyBait = isEmojiOnlyBaitText(rawInput);
+    if (!raw || (raw.length < 8 && !shortDatingInvite && !emojiOnlyBait)) return { match: false, score: 0, signals: [], summary: '' };
+    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw) && !emojiOnlyBait) return { match: false, score: 0, signals: [], summary: '' };
     const signals = [];
     let score = 0;
     for (const def of SPAM_SIGNAL_DEFS) {
-        if (compactVariants.some((candidate) => def.test(candidate, raw))) {
+        if (compactVariants.some((candidate) => def.test(candidate, raw, rawInput))) {
             signals.push({ id: def.id, label: def.label, weight: def.weight });
             score += def.weight;
         }
@@ -1419,7 +1478,34 @@ function detectSpamReply(text, options = {}) {
     return { match, score, signals, summary: signals.map((s) => s.label).join('、') };
 }
 function getTweetTextFromArticle(article) {
-    return article?.querySelector('[data-testid="tweetText"]')?.textContent?.trim() || '';
+    const textNodes = article?.querySelectorAll('[data-testid="tweetText"]');
+    if (!textNodes?.length) return '';
+    return Array.from(textNodes).map(textContentWithImageAlt).filter(Boolean).join('\n').trim();
+}
+function textContentWithImageAlt(root) {
+    if (!root) return '';
+    const parts = [];
+    const visit = (node) => {
+        if (!node) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+            parts.push(node.textContent || '');
+            return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        const element = node;
+        if (element.tagName === 'IMG') {
+            const alt = element.getAttribute('alt') || '';
+            if (alt) parts.push(alt);
+            return;
+        }
+        element.childNodes.forEach(visit);
+    };
+    visit(root);
+    return parts.join('')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[ \t\f\v]+/g, ' ')
+        .replace(/ *\n+ */g, '\n')
+        .trim();
 }
 function normalizePromoHandle(handle) {
     return String(handle || '').trim().replace(/^@+/, '').toLowerCase();
@@ -2554,15 +2640,16 @@ async function pumpAvatarOcrQueue() {
     }
 }
 async function processSpamArticle(article) {
-    if (shouldSkipSpamIdentifyForArticle(article)) {
+    const tweetText = getTweetTextFromArticle(article);
+    const textDetection = tweetText ? detectSpamReply(tweetText) : null;
+    if (shouldSkipSpamIdentifyForArticle(article, textDetection)) {
         clearSpamIdentifyTextBadge(article);
         finalizeSpamArticleScan(article);
         return;
     }
     if (shouldSkipSpamArticleScan(article)) return;
-    const tweetText = getTweetTextFromArticle(article);
     if (tweetText) {
-        const detection = detectSpamReply(tweetText);
+        const detection = textDetection || detectSpamReply(tweetText);
         article.dataset.spamTextScannedBuild = SPAM_SCANNER_BUILD;
         if (detection.match) {
             if (await shouldExemptArticleByTrustedAuthor(article, 'spam_identify')) {
@@ -2787,7 +2874,6 @@ function buildChainBlockNote(chainSources, context = {}) {
     return { blockReason, blockNote };
 }
 function getTweetContextFromTarget(targetArticle, authorHandle) {
-    const tweetTextEl = targetArticle?.querySelector?.('[data-testid="tweetText"]');
     const statusLink = targetArticle ? Array.from(targetArticle.querySelectorAll('a')).find(a => /\/status\/\d+/.test(a.href)) : null;
     const tweetId = statusLink?.href.match(/\/status\/(\d+)/)?.[1] || null;
     const handle = authorHandle || getScreenNameFromProfileHref(statusLink?.href) || '';
@@ -2795,7 +2881,7 @@ function getTweetContextFromTarget(targetArticle, authorHandle) {
     return {
         tweetId,
         tweetUrl,
-        tweetText: truncateBlockContextText(tweetTextEl?.textContent?.trim() || ''),
+        tweetText: truncateBlockContextText(getTweetTextFromArticle(targetArticle)),
         authorHandle: handle
     };
 }
