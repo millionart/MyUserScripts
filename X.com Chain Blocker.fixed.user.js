@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.16
+// @version      2.15.25
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -39,6 +39,7 @@ const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4
 const STORAGE_KEY = 'CHAIN_BLOCKER_DATA';
 const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const BLOCK_INTERVAL_MS = 10 * 1000;
+const API_REQUEST_TIMEOUT_MS = 12000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
 const USERNAME_LENGTH_THRESHOLD = 25;
 const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 1000;
@@ -52,19 +53,26 @@ const AVATAR_OCR_JOB_TIMEOUT_MS = 45000;
 const PADDLE_OCR_VARIANT_TIMEOUT_MS = 6000;
 const AVATAR_OCR_PUMP_STALL_GRACE_MS = 10000;
 const AVATAR_OCR_VISIBLE_REQUEUE_MS = 8000;
+const PROFILE_BIO_SCAN_TIMEOUT_MS = 6500;
+const PROFILE_BIO_STALE_PENDING_MS = 30000;
 const avatarOcrCache = new Map();
 const avatarOcrQueue = [];
+const profileBioCache = new Map();
+const profileBioFetchPending = new Map();
+const profileBioQueue = [];
 let avatarOcrPumpRunning = false;
 let avatarOcrPumpRunId = 0;
 let avatarOcrActiveStartedAt = 0;
 let avatarOcrActiveArticle = null;
+let profileBioPumpRunning = false;
+let profileBioActiveArticle = null;
 let avatarOcrTesseractFailed = false;
 let avatarOcrPaddleFailed = false;
 let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.16';
+const SPAM_SCANNER_BUILD = '2.15.25';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -888,19 +896,65 @@ function resetSpamScanMarkersForBuildUpgrade() {
         delete article.dataset.avatarOcrPending;
         delete article.dataset.avatarOcrQueuedAt;
         delete article.dataset.avatarOcrFailCount;
+        delete article.dataset.profileBioPending;
+        delete article.dataset.profileBioQueued;
+        delete article.dataset.profileBioQueuedAt;
+        delete article.dataset.profileBioFailCount;
+        delete article.dataset.profileBioScannedBuild;
         delete article.dataset.spamTextScannedBuild;
         article.classList.remove('nuke-spam-identified');
         article.querySelector('.nuke-spam-badge')?.remove();
     });
 }
+function getStatusTweetIdFromHref(href) {
+    const source = String(href || '');
+    if (!source) return '';
+    try {
+        const pathname = new URL(source, window.location.origin).pathname;
+        return pathname.match(/\/status\/(\d+)/i)?.[1] || '';
+    } catch {
+        return source.match(/\/status\/(\d+)/i)?.[1] || '';
+    }
+}
+function getCurrentStatusPageInfo() {
+    const parts = window.location.pathname.split('/').filter(Boolean);
+    const statusIndex = parts.findIndex((part) => part.toLowerCase() === 'status');
+    const tweetId = statusIndex >= 0 ? (parts[statusIndex + 1]?.match(/^\d+/)?.[0] || '') : '';
+    const rawHandle = statusIndex > 0 ? decodeURIComponent(parts[statusIndex - 1] || '') : '';
+    const handle = normalizePromoHandle(rawHandle);
+    const authorHandle = handle && !['i', 'web'].includes(handle) ? handle : '';
+    return { tweetId, authorHandle };
+}
+function getArticleOwnStatusId(article) {
+    const timeLink = article?.querySelector?.('a[href*="/status/"] time')?.closest('a');
+    const timeStatusId = getStatusTweetIdFromHref(timeLink?.href);
+    if (timeStatusId) return timeStatusId;
+    const ids = [...new Set(Array.from(article?.querySelectorAll?.('a[href*="/status/"]') || [])
+        .map((link) => getStatusTweetIdFromHref(link.href))
+        .filter(Boolean))];
+    return ids.length === 1 ? ids[0] : '';
+}
 function markStatusRootTweetArticles() {
-    if (!/\/status\/\d+/i.test(window.location.pathname)) return;
-    const column = document.querySelector('[data-testid="primaryColumn"]');
-    const first = column?.querySelector('article[data-testid="tweet"]');
-    document.querySelectorAll('[data-testid="primaryColumn"] article[data-testid="tweet"]').forEach((article) => {
+    const info = getCurrentStatusPageInfo();
+    const articles = document.querySelectorAll('[data-testid="primaryColumn"] article[data-testid="tweet"]');
+    articles.forEach((article) => {
         delete article.dataset.cbSpamRootTweet;
     });
-    if (first) first.dataset.cbSpamRootTweet = 'true';
+    if (!info.tweetId) {
+        statusRootTweetCache = { tweetId: '', authorHandle: '' };
+        return;
+    }
+    let rootArticle = null;
+    articles.forEach((article) => {
+        if (getArticleOwnStatusId(article) === info.tweetId) rootArticle = article;
+    });
+    if (rootArticle) {
+        rootArticle.dataset.cbSpamRootTweet = 'true';
+        const authorHandle = getArticleAuthorHandle(rootArticle) || info.authorHandle;
+        if (authorHandle) statusRootTweetCache = { tweetId: info.tweetId, authorHandle };
+    } else if (info.authorHandle) {
+        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: info.authorHandle };
+    }
 }
 function isStatusRootTweetArticle(article) {
     return article?.dataset?.cbSpamRootTweet === 'true';
@@ -924,9 +978,10 @@ const FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS = 4500;
 const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
-let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null;
+let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null;
 let manualDetectedNukeRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false;
+let statusRootTweetCache = { tweetId: '', authorHandle: '' };
 const aggregatedToastState = new Map();
 const followerCountCache = new Map();
 const followerFetchPending = new Map();
@@ -1341,7 +1396,7 @@ const SPAM_CJK_PUNCT_RE = /[·•・|，,。.!！?？:：;；\-—_~～*＊/\\[\
 const SPAM_ASCII_NOISE_BETWEEN_CJK_RE = /([\u4e00-\u9fff])[a-z0-9]{1,8}(?=[\u4e00-\u9fff])/gi;
 function isShortDatingInviteCompact(compact) {
     const text = String(compact || '').replace(/[^\u4e00-\u9fffa-z0-9@]/gi, '');
-    return text.length <= 12 && (/^(?:来)?聊聊在线等$/.test(text) || (/见见吗/.test(text) && /睡不着/.test(text)) || (/想找/.test(text) && /会疼人|疼人的|哥哥|姐姐|妹妹/.test(text)) || /^(?:求求了|求求)?(?:好|我)?寂寞(?:在线|在吗|求聊|想聊|聊聊|等你|等聊)?$/.test(text) || /^嘿嘿有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^想要[呀啊嘛吗]?有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^有点(?:难受|寂寞)(?:在线|求聊|想聊)$/.test(text));
+    return text.length <= 14 && (/^(?:来)?聊聊在线等$/.test(text) || (/见见吗/.test(text) && /睡不着/.test(text)) || (/想找/.test(text) && /会疼人|疼人的|哥哥|姐姐|妹妹/.test(text)) || /^(?:嘻嘻|嘿嘿|哈哈)?(?:求求了|求求)?(?:好|我)?寂寞(?:在线|在吗|求聊|想聊|聊聊|等你|等聊)?[a-z0-9]{0,2}$/.test(text) || /^嘿嘿有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^想要[呀啊嘛吗]?有点(?:难受|寂寞)(?:在线|求聊|想聊)?$/.test(text) || /^有点(?:难受|寂寞)(?:在线|求聊|想聊)$/.test(text) || /^想被(?:抱紧|抱抱|疼|宠|陪|哄|摸摸)(?:在线|在吗|求聊|想聊|聊聊)?[a-z0-9]{0,2}$/.test(text) || /^(?:在线等)?想找人(?:疼|宠|陪|抱抱|哄)[a-z0-9]{0,2}$/.test(text) || /^[a-z0-9]{1,2}夜深了(?:嘿嘿|嘻嘻)[a-z0-9]{0,2}$/.test(text));
 }
 function hasStandaloneDd(compact) {
     return /(^|[^a-z0-9])dd([^a-z0-9]|$)/i.test(String(compact || ''));
@@ -1395,6 +1450,40 @@ function isIncidentClipFunnelCompact(compact) {
     const platformNeglect = new RegExp(`${platform}.{0,8}?(?:居然|竟然)?(?:不封号|不删|没封|没删)`).test(text);
     return accountDiscovery && hotspotContext && clipLure && (stillVisible || platformNeglect);
 }
+function isAdultPlatformClipFunnelCompact(compact) {
+    const text = String(compact || '').toLowerCase();
+    const platform = '(?:快手|抖音|小红书|视频号|微博|b站|bilibili)';
+    const accountDiscovery = new RegExp(`${platform}(?:号|账号|帐号|博主).{0,24}?(?:被扒|扒出来|被曝光|曝光了?|曝光出来|找到了?|搜到了?|搜出来)|(?:被扒|扒出来|被曝光|曝光了?|曝光出来|找到了?|搜到了?|搜出来).{0,24}?${platform}(?:号|账号|帐号|博主)|(?:评论区|有人说).{0,24}?${platform}博主|(?:男主|女主|主角|当事人)?.{0,8}?是${platform}博主|瓜视频.{0,12}?(?:可以看|看).{0,20}?${platform}博主|(?:跑去|好奇去|我去|去|特意去|专门上|摸去)?${platform}(?:翻|搜|搜索|看|查证|核对|查找|检索)|搜.{0,8}${platform}.{0,12}?(?:真是|本人|还真)`).test(text);
+    const adultContext = /小姐|操破|草破|顶裂|干穿|搞破|捅破|刺穿|捣碎|操烂|黄体|扣.{0,4}?(?:b|逼|比)|馒头比|馒头逼|溢出|液体|客人|没拿她当人|破处|喷出|汁|私密|黏液|淌出|热液|反绑/.test(text);
+    const clipLure = /(?:作品|作品里|作品里面|动态|动态里|主页|账号|那儿|挂着|摆着|存着|里面|视频|录像|片段|原片|片子|现场记录|记录|私密原视频).{0,28}?(?:视频|录像|片段|原片|片子|现场记录|记录|黄体|液体|汁|扣.{0,4}?(?:b|逼|比)|顶裂|干穿|捅破|刺穿|捣碎|操烂|操破|草破|反绑)|(?:视频|录像|片段|原片|片子|现场记录|私密原视频).{0,24}?(?:作品|动态|主页|账号|里面|还在|有|抖落)/.test(text);
+    const spreadHook = new RegExp(`(?:跑去|好奇去|我去|去|特意去|专门上|摸去|八卦去)${platform}?(?:翻|搜|搜索|看|查证|核对|查找|检索).{0,20}?(?:还真是|还真有|有|看过|真是|本人|一模一样|同一个人|确实是|发现|惊叹)|搜.{0,8}${platform}.{0,16}?(?:真是|本人|还真|有)|${platform}.{0,12}?(?:居然|竟然|这样|都|也|竟能)?(?:不封|没封|不管|不删|没删|不处理|没处理|不封禁|封禁|能容下|能忍)|这都不管`).test(text);
+    return accountDiscovery && adultContext && clipLure && spreadHook;
+}
+const PROFILE_BIO_SIGNAL_DEFS = [
+    { id: 'bio_adult_service', label: '成人服务简介', weight: 2, test: (compact, raw) => /(?:曰|日|约).{0,3}炮|同城.{0,8}(?:约|空降|上门)|附近.{0,8}(?:可加|加v|加微|加薇|约)|外围|楼凤|援交|约妹|约啪|约拍私房/i.test(compact) || /(?:曰|日|约)\s*炮|附近的?可加\s*v/i.test(raw) },
+    { id: 'bio_trust_pitch', label: '平台认证话术', weight: 1, test: (compact, raw) => /(?:已入驻|入驻).{0,10}平台|真人认证|隐私.{0,8}(?:保护|安全|保障)|平台.{0,10}(?:隐私|认证|保障|安全)/.test(compact) || /真人认证|隐私保护|隐私安全|上平台隐私安全有保障/.test(raw) },
+    { id: 'bio_contact_route', label: '简介联系方式', weight: 1, test: (compact, raw) => /https?:\/\/\s*[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)|[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)\b|加\s*[v微薇]|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)|@[a-z0-9_]{3,15}|电报|telegram|(?:^|[^a-z])tg(?:[^a-z]|$)/i.test(raw) || /加v|加微|加薇|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)/i.test(compact) }
+];
+function detectProfileBioSpam(text) {
+    const rawInput = String(text || '');
+    const raw = normalizeSpamText(rawInput);
+    const compact = compactSpamText(raw);
+    if (!raw || raw.length < 8) return { match: false, score: 0, signals: [], summary: '' };
+    const signals = [];
+    let score = 0;
+    for (const def of PROFILE_BIO_SIGNAL_DEFS) {
+        if (def.test(compact, raw, rawInput)) {
+            signals.push({ id: def.id, label: def.label, weight: def.weight });
+            score += def.weight;
+        }
+    }
+    const adultService = signals.some((s) => s.id === 'bio_adult_service');
+    const trustPitch = signals.some((s) => s.id === 'bio_trust_pitch');
+    const contactRoute = signals.some((s) => s.id === 'bio_contact_route');
+    const match = adultService && (trustPitch || contactRoute) && score >= 3;
+    const summary = signals.map((s) => s.label).join('、') || '';
+    return { match, score, signals, summary, compactPreview: compact.slice(0, 80) };
+}
 const SPAM_SIGNAL_DEFS = [
     { id: 'scroll_time', label: '刷帖/逛推时长', weight: 1, test: (compact) => /(?:刷|逛|翻|看|扫).{0,12}?(?:半天|一晚|一天|一晚上|好久|很久|许久|好一会|一会儿|一会|小时)/.test(compact) || /刚.{0,4}?(?:刷|逛|翻)完/.test(compact) },
     { id: 'platform_ref', label: '提及X/推特', weight: 1, test: (compact) => /(?:^|[^a-z0-9])x(?:[^a-z0-9]|$)/i.test(compact) || /推特|小蓝鸟|twitter/.test(compact) },
@@ -1415,6 +1504,7 @@ const SPAM_SIGNAL_DEFS = [
     { id: 'course_funnel', label: '课程/教程导流', weight: 3, test: (compact) => /英语|外语|日语|韩语|西班牙语|语言学习|任何语言|流利学会/.test(compact) && /公开课|这堂课|课程|教程|底层方法论|唯一正确|秘诀|快速学会|强烈建议刷|早知道.{0,12}?方法|别再.{0,12}?(?:不科学|浪费时间)|学会任何语言|流利学会任何语言/.test(compact) },
     { id: 'gray_money_funnel', label: '灰产/赚钱导流', weight: 3, test: (compact) => /交易所|okx|返佣|长期套利|收益空间|网赚|副业|偏门|跑分|灰产|日结|快钱|搞钱|洗钱|外汇/.test(compact) && /联系我|私聊|有兴趣了解|兴趣了解|可以联系|可以玩|稳定长期|每天都有收益|稳定执行|流程清晰|带你|稳赚/.test(compact) },
     { id: 'incident_clip_funnel', label: '事件视频导流', weight: 3, test: (compact) => isIncidentClipFunnelCompact(compact) },
+    { id: 'adult_platform_clip_funnel', label: '成人偷拍视频导流', weight: 3, test: (compact) => isAdultPlatformClipFunnelCompact(compact) },
     { id: 'emoji_only_bait', label: '纯 emoji 诱导', weight: 3, test: (compact, raw, source) => isEmojiOnlyBaitText(source) },
     { id: 'short_location_invite', label: '短句位置邀约', weight: 3, test: (compact) => isShortLocationInviteCompact(compact) },
     { id: 'pet_role_invite', label: '宠物角色邀约', weight: 3, test: (compact) => isPetRoleInviteCompact(compact) },
@@ -2295,6 +2385,15 @@ function ensureSpamBadge(article, detection, kind = 'text') {
             badge.title = `头像 OCR 命中: ${detection.summary}`;
             badge.textContent = `头像疑似引流 · ${detection.summary}`;
         }
+    } else if (kind === 'bio') {
+        const bioPart = `简介·${detection.summary}`;
+        if (badge.textContent && badge.textContent.includes('疑似引流')) {
+            badge.title = `${badge.title || ''}\n个人简介: ${detection.summary}`;
+            badge.textContent = `${badge.textContent}；${bioPart}`;
+        } else {
+            badge.title = `个人简介命中: ${detection.summary}`;
+            badge.textContent = `简介疑似引流 · ${detection.summary}`;
+        }
     } else {
         badge.title = `${detection.summary}\n得分: ${detection.score}`;
         badge.textContent = `疑似引流 · ${detection.score}分`;
@@ -2442,6 +2541,17 @@ async function executeManualNukeForDetectedTargets() {
         const queueById = new Map();
         const resolvedTargets = [];
         const onCollectProgress = status => showToast('nuke-manual-detected-toast', '建立九族列表', status, null);
+        let chainCollectionPaused = false;
+        let chainCollectionStopError = null;
+        let stoppedByApiFailure = false;
+        const onCollectFailure = (error) => {
+            if (!isApiRateLimitError(error) && !isApiTimeoutError(error)) return;
+            if (!chainCollectionPaused) {
+                chainCollectionPaused = true;
+                chainCollectionStopError = error;
+                showManualDetectedChainCollectPausedToast(error);
+            }
+        };
         for (const article of articles) {
             if (!isDetectedNukeTargetArticle(article)) continue;
             article.dataset.autoblockTriggered = 'true';
@@ -2450,12 +2560,24 @@ async function executeManualNukeForDetectedTargets() {
             try {
                 const resolvedTarget = await resolveNukeTarget(article, buildManualDetectedNukeTrigger(article));
                 resolvedTargets.push({ ...resolvedTarget, manualOrder: resolvedTargets.length });
-                await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress);
+                if (!chainCollectionPaused) {
+                    await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress, onCollectFailure);
+                }
             } catch (error) {
                 console.error('[CB] 手动九族建立列表失败:', error);
+                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
+                    showManualDetectedApiStopToast(error);
+                    stoppedByApiFailure = true;
+                    break;
+                }
             }
             updateManualDetectedNukeButton();
             await new Promise((resolve) => window.setTimeout(resolve, 250));
+        }
+        if (stoppedByApiFailure) {
+            await saveUserData(userData);
+            await updateStatusToast();
+            return;
         }
         const targetAuthorIds = mergeUserIdSets(resolvedTargets.map((target) => buildChainSkipUserIds(target)));
         const chainExemptHandles = [...new Set(resolvedTargets.flatMap((target) => getChainExemptHandlesForTarget(target.targetArticle)))];
@@ -2467,10 +2589,25 @@ async function executeManualNukeForDetectedTargets() {
         for (const resolvedTarget of directBlockTargets) {
             if (resolvedTarget.authorId && handledAuthorIds.has(resolvedTarget.authorId)) continue;
             if (resolvedTarget.authorId) handledAuthorIds.add(resolvedTarget.authorId);
-            if (await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) blockedAuthors += 1;
+            try {
+                if (await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) blockedAuthors += 1;
+            } catch (error) {
+                console.warn('[CB] 手动直接拉黑中断:', error);
+                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
+                    showManualDetectedApiStopToast(error);
+                    stoppedByApiFailure = true;
+                    break;
+                }
+                throw error;
+            }
             await saveUserData(userData);
             updateManualDetectedNukeButton();
             await new Promise((resolve) => window.setTimeout(resolve, 350));
+        }
+        if (stoppedByApiFailure) {
+            await saveUserData(userData);
+            await updateStatusToast();
+            return;
         }
         if (pendingChainQueueEntries.length > 0) {
             addNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, targetAuthorIds);
@@ -2489,10 +2626,49 @@ async function executeManualNukeForDetectedTargets() {
 }
 function finalizeSpamArticleScan(article) {
     if (!article) return;
+    delete article.dataset.profileBioPending;
+    delete article.dataset.profileBioQueued;
+    delete article.dataset.profileBioQueuedAt;
     delete article.dataset.avatarOcrPending;
     delete article.dataset.avatarOcrQueued;
     delete article.dataset.avatarOcrQueuedAt;
     article.dataset.spamScanned = 'complete';
+}
+function releaseProfileBioForRetry(article) {
+    if (!article) return;
+    removeProfileBioJobsForArticle(article);
+    delete article.dataset.profileBioPending;
+    delete article.dataset.profileBioQueued;
+    delete article.dataset.profileBioQueuedAt;
+    delete article.dataset.spamScanned;
+}
+function removeProfileBioJobsForArticle(article) {
+    if (!article) return;
+    for (let i = profileBioQueue.length - 1; i >= 0; i -= 1) {
+        if (profileBioQueue[i]?.article === article) profileBioQueue.splice(i, 1);
+    }
+}
+function isProfileBioJobActiveForArticle(article) {
+    return !!article && profileBioActiveArticle === article;
+}
+function enqueueProfileBioScan(article, screenName) {
+    if (!article || !screenName) return;
+    const visible = isArticleInViewport(article);
+    if ((article.dataset.profileBioPending === 'true' || article.dataset.profileBioQueued === 'true') && !visible) return;
+    if (isProfileBioJobActiveForArticle(article)) return;
+    removeProfileBioJobsForArticle(article);
+    article.dataset.profileBioQueued = 'true';
+    article.dataset.profileBioPending = 'true';
+    article.dataset.profileBioQueuedAt = String(Date.now());
+    const job = { article, screenName, priority: visible ? 1000 : 0 };
+    if (visible) profileBioQueue.unshift(job);
+    else profileBioQueue.push(job);
+    void pumpProfileBioQueue();
+}
+function hasStaleProfileBioPending(article) {
+    if (article?.dataset?.profileBioPending !== 'true') return false;
+    const queuedAt = parseInt(article.dataset.profileBioQueuedAt, 10) || 0;
+    return !queuedAt || Date.now() - queuedAt > PROFILE_BIO_STALE_PENDING_MS;
 }
 function releaseAvatarOcrForRetry(article) {
     if (!article) return;
@@ -2603,6 +2779,127 @@ function recoverStalledAvatarOcrPump() {
     updateAvatarOcrPumpProbe(hasVisibleJobWaiting ? 'preempt-visible' : 'recovered');
     void pumpAvatarOcrQueue();
 }
+function shouldCheckProfileBioForArticle(article, tweetText) {
+    if (!article || isStatusRootTweetArticle(article)) return false;
+    if (article.dataset.profileBioScannedBuild === SPAM_SCANNER_BUILD) return false;
+    if (article.dataset.profileBioPending === 'true' || article.dataset.profileBioQueued === 'true') return false;
+    if (!getArticleAuthorScreenName(article)) return false;
+    const raw = String(tweetText || '').trim();
+    if (!raw) return true;
+    const compact = compactSpamText(raw);
+    return compact.length <= 28 || isShortDatingInviteCompact(compact) || isEmojiOnlyBaitText(raw);
+}
+function continueSpamScanAfterProfileBio(article) {
+    if (!article?.isConnected) return;
+    delete article.dataset.profileBioPending;
+    delete article.dataset.profileBioQueued;
+    delete article.dataset.profileBioQueuedAt;
+    const avatarUrl = getAvatarImageUrlFromArticle(article);
+    if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
+        enqueueAvatarOcr(article, avatarUrl);
+        return;
+    }
+    finalizeSpamArticleScan(article);
+}
+async function getCachedProfileBioUserData(screenName) {
+    if (!screenName) return null;
+    const key = screenName.toLowerCase();
+    const cached = profileBioCache.get(key);
+    if (cached && Date.now() - cached.at < FOLLOWER_COUNT_CACHE_MS) return cached.userResult;
+    if (profileBioFetchPending.has(key)) return withProfileBioTimeout(profileBioFetchPending.get(key));
+    const pending = (async () => {
+        try {
+            const userResult = await getUserDataByScreenName(screenName);
+            profileBioCache.set(key, { userResult, at: Date.now() });
+            const count = getFollowersCountFromUserResult(userResult);
+            followerCountCache.set(key, { count, at: Date.now() });
+            return userResult;
+        } catch (error) {
+            console.warn(`[CB] 无法获取 @${screenName} 的个人简介`, error);
+            return null;
+        } finally {
+            profileBioFetchPending.delete(key);
+        }
+    })();
+    profileBioFetchPending.set(key, pending);
+    return withProfileBioTimeout(pending);
+}
+function withProfileBioTimeout(promise) {
+    return Promise.race([
+        promise,
+        new Promise((resolve) => window.setTimeout(() => resolve(null), PROFILE_BIO_SCAN_TIMEOUT_MS))
+    ]);
+}
+function getUserDescriptionFromUserResult(userResult) {
+    return String(userResult?.legacy?.description || userResult?.core?.description || userResult?.description || '').trim();
+}
+function shouldExemptProfileBioUserResult(userResult) {
+    return isFollowerCountExempt(getFollowersCountFromUserResult(userResult));
+}
+function takeNextProfileBioJob() {
+    let bestIndex = -1;
+    let bestScore = -Infinity;
+    for (let i = 0; i < profileBioQueue.length; i += 1) {
+        const job = profileBioQueue[i];
+        const score = (isArticleInViewport(job?.article) ? 1000 : 0) + (Number(job?.priority) || 0);
+        if (score > bestScore) {
+            bestScore = score;
+            bestIndex = i;
+        }
+    }
+    if (bestIndex > 0) return profileBioQueue.splice(bestIndex, 1)[0];
+    return profileBioQueue.shift();
+}
+async function pumpProfileBioQueue() {
+    if (profileBioPumpRunning) return;
+    profileBioPumpRunning = true;
+    try {
+        while (profileBioQueue.length) {
+            const job = takeNextProfileBioJob();
+            if (!job?.article?.isConnected) continue;
+            profileBioActiveArticle = job.article;
+            let matched = false;
+            try {
+                if (scriptConfig.spamIdentifyEnabled === false) {
+                    finalizeSpamArticleScan(job.article);
+                    continue;
+                }
+                const userResult = await getCachedProfileBioUserData(job.screenName);
+                job.article.dataset.profileBioScannedBuild = SPAM_SCANNER_BUILD;
+                const bio = getUserDescriptionFromUserResult(userResult);
+                const detection = detectProfileBioSpam(bio);
+                if (detection.match) {
+                    if (shouldExemptArticleByBlueVerified(job.article, 'profile_bio') || shouldExemptProfileBioUserResult(userResult)) {
+                        matched = true;
+                    } else {
+                        ensureSpamBadge(job.article, detection, 'bio');
+                        triggerAutoNukeForMarkedArticle(job.article, {
+                            triggerMode: 'auto',
+                            autoReason: 'profile_bio',
+                            profileBioSummary: detection.summary
+                        });
+                        matched = true;
+                    }
+                }
+            } catch (error) {
+                const failCount = (parseInt(job.article.dataset.profileBioFailCount, 10) || 0) + 1;
+                job.article.dataset.profileBioFailCount = String(failCount);
+                console.warn(`[CB] 个人简介识别失败 (${failCount})`, job.screenName, error);
+            } finally {
+                profileBioActiveArticle = null;
+            }
+            if (job.article?.isConnected) {
+                if (matched) finalizeSpamArticleScan(job.article);
+                else continueSpamScanAfterProfileBio(job.article);
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 120));
+        }
+    } finally {
+        profileBioPumpRunning = false;
+        profileBioActiveArticle = null;
+        if (profileBioQueue.length) void pumpProfileBioQueue();
+    }
+}
 async function pumpAvatarOcrQueue() {
     if (avatarOcrPumpRunning) return;
     avatarOcrPumpRunning = true;
@@ -2707,6 +3004,10 @@ async function processSpamArticle(article) {
             }
         }
     }
+    if (shouldCheckProfileBioForArticle(article, tweetText)) {
+        enqueueProfileBioScan(article, getArticleAuthorScreenName(article));
+        return;
+    }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
     if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
         enqueueAvatarOcr(article, avatarUrl);
@@ -2749,6 +3050,11 @@ function shouldSkipSpamArticleScan(article) {
         releaseAvatarOcrForRetry(article);
         return false;
     }
+    if (hasStaleProfileBioPending(article)) {
+        releaseProfileBioForRetry(article);
+        return false;
+    }
+    if (article.dataset.profileBioPending === 'true') return true;
     const hasPendingTextScan = !!getTweetTextFromArticle(article) && article.dataset.spamTextScannedBuild !== SPAM_SCANNER_BUILD && !article.querySelector('.nuke-spam-badge:not([data-avatar-ocr-badge])');
     if (article.dataset.avatarOcrPending === 'true') return !hasPendingTextScan;
     if (article.dataset.spamScanned !== 'complete') return false;
@@ -2789,6 +3095,7 @@ function scheduleSpamRescanDebounced() {
 }
 function scanSpamIdentifyContent() {
     if (!currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
+    if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
     recoverStalledAvatarOcrPump();
     resetSpamScanMarkersForBuildUpgrade();
     markStatusRootTweetArticles();
@@ -2809,6 +3116,8 @@ function scanSpamIdentifyContent() {
         document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
         document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
         document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
+        document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
+        document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
         ensureManualDetectedNukeButton();
     } catch {
         /* probe only */
@@ -3079,19 +3388,99 @@ const API_ENDPOINTS = {
     Favoriters: { hash: 'SoWvHOdzCsomAQdY-bFNDA', features: {"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":false,"rweb_tipjar_consumption_enabled":false,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":false,"responsive_web_jetfuel_frame":true,"responsive_web_grok_share_attachment_enabled":true,"responsive_web_grok_annotations_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"content_disclosure_indicator_enabled":true,"content_disclosure_ai_generated_indicator_enabled":true,"responsive_web_grok_show_grok_translated_post":false,"responsive_web_grok_analysis_button_from_backend":true,"post_ctas_fetch_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":false,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_enhance_cards_enabled":false} },
     TweetDetail: { hash: '-0WTL1e9Pij-JWAF5ztCCA', features: {"rweb_video_screen_enabled":false,"payments_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_jetfuel_frame":false,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"responsive_web_grok_show_grok_translated_post":false,"responsive_web_grok_analysis_button_from_backend":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_enhance_cards_enabled":false} }
 };
-function makeApiRequest(url, method = "GET", data = null) { return new Promise((resolve, reject) => GM_xmlhttpRequest({ method, url, data, headers: { Authorization: `Bearer ${getAuthToken()}`, "Content-Type": "application/x-www-form-urlencoded", "x-csrf-token": getCsrfToken() }, onload: r => r.status >= 200 && r.status < 300 ? resolve(r.responseText ? JSON.parse(r.responseText) : null) : reject({ message: `API请求失败: ${r.status}`, status: r.status }), onerror: e => reject({ message: "Network or script error", error: e }) })); }
+API_ENDPOINTS.TweetDetail = {
+    hash: 'DYCGBel_pHWgbQYKynAxnA',
+    features: {"rweb_video_screen_enabled":false,"rweb_cashtags_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":false,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":true,"rweb_cashtags_composer_attachment_enabled":false,"responsive_web_jetfuel_frame":false,"responsive_web_grok_share_attachment_enabled":true,"responsive_web_grok_annotations_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"rweb_conversational_replies_downvote_enabled":false,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"content_disclosure_indicator_enabled":true,"content_disclosure_ai_generated_indicator_enabled":true,"responsive_web_grok_show_grok_translated_post":false,"responsive_web_grok_analysis_button_from_backend":true,"post_ctas_fetch_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_grok_imagine_annotation_enabled":true,"responsive_web_grok_community_note_auto_translation_is_enabled":false,"responsive_web_enhance_cards_enabled":false},
+    fieldToggles: {"withPayments":false,"withAuxiliaryUserLabels":false,"withArticleRichContentState":true,"withArticlePlainText":false,"withArticleSummaryText":false,"withArticleVoiceOver":false,"withGrokAnalyze":false,"withDisallowedReplyControls":false}
+};
+function buildGraphqlUrl(endpoint, operationName, variables) {
+    const params = new URLSearchParams();
+    params.set('variables', JSON.stringify(variables));
+    params.set('features', JSON.stringify(endpoint.features || {}));
+    if (endpoint.fieldToggles) params.set('fieldToggles', JSON.stringify(endpoint.fieldToggles));
+    return `https://x.com/i/api/graphql/${endpoint.hash}/${operationName}?${params.toString()}`;
+}
+function makeApiRequest(url, method = "GET", data = null) { return new Promise((resolve, reject) => GM_xmlhttpRequest({ method, url, data, timeout: API_REQUEST_TIMEOUT_MS, headers: { Authorization: `Bearer ${getAuthToken()}`, "Content-Type": "application/x-www-form-urlencoded", "x-csrf-token": getCsrfToken() }, onload: r => r.status >= 200 && r.status < 300 ? resolve(r.responseText ? JSON.parse(r.responseText) : null) : reject({ message: `API请求失败: ${r.status}`, status: r.status }), onerror: e => reject({ message: "Network or script error", error: e }), ontimeout: () => reject({ message: "API请求超时", status: 0 }) })); }
+function isApiRateLimitError(error) {
+    return error?.status === 429;
+}
+function isApiTimeoutError(error) {
+    return error?.status === 0 || /超时|timeout/i.test(String(error?.message || ''));
+}
+function showApiLimitRetryToast() {
+    if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
+    if (apiLimitRetryTimeoutId) clearTimeout(apiLimitRetryTimeoutId);
+    showToast('nuke-api-limit-toast', 'API 已达上限', '正在计算时间...', null);
+    const retryTimestamp = Date.now() + API_RETRY_DELAY_MS;
+    apiLimitCountdownInterval = setInterval(() => {
+        const toastStatusEl = document.querySelector('#nuke-api-limit-toast .nuke-toast-status');
+        if (!toastStatusEl) {
+            clearInterval(apiLimitCountdownInterval);
+            apiLimitCountdownInterval = null;
+            return;
+        }
+        const secondsLeft = Math.round((retryTimestamp - Date.now()) / 1000);
+        if (secondsLeft <= 0) {
+            toastStatusEl.innerHTML = '正在重试...';
+            clearInterval(apiLimitCountdownInterval);
+            apiLimitCountdownInterval = null;
+            return;
+        }
+        toastStatusEl.innerHTML = `将在 <b>${String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:${String(secondsLeft % 60).padStart(2, '0')}</b> 后重试`;
+    }, 1000);
+    apiLimitRetryTimeoutId = setTimeout(() => {
+        apiLimitRetryTimeoutId = null;
+        initialize();
+    }, API_RETRY_DELAY_MS);
+}
+function showManualDetectedApiStopToast(error) {
+    if (isApiRateLimitError(error)) {
+        showApiLimitRetryToast();
+        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'X API 已达上限，已停止直接拉黑；稍后可重试', 5000);
+        return;
+    }
+    if (isApiTimeoutError(error)) {
+        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'API 请求超时，已停止直接拉黑；稍后可重试', 5000);
+        return;
+    }
+    showToast('nuke-manual-detected-toast', '手动执行失败', error?.message || String(error), 5000);
+}
+function showManualDetectedChainCollectPausedToast(error) {
+    if (isApiRateLimitError(error)) {
+        showApiLimitRetryToast();
+        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', 'X API 已达上限，停止继续收集关联列表；将继续尝试直接拉黑标记用户', 5000);
+        return;
+    }
+    if (isApiTimeoutError(error)) {
+        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '关联列表请求超时，停止继续收集；将继续尝试直接拉黑标记用户', 5000);
+        return;
+    }
+    showToast('nuke-manual-detected-toast', '九族列表收集失败', error?.message || String(error), 5000);
+}
+function skipFailedChainList(label, onCollectFailure) {
+    return (error) => {
+        console.warn(`[CB] 获取${label}失败，将跳过${label}关联用户`, error);
+        try {
+            onCollectFailure?.(error, label);
+        } catch {
+            /* ignore */
+        }
+        if (isApiRateLimitError(error)) showApiLimitRetryToast();
+        return [];
+    };
+}
 function getCsrfToken() { const e = document.cookie.split("; ").find(e => e.startsWith("ct0=")); return e ? e.split("=")[1] : null; }
 function getAuthToken() { return "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"; }
 async function getUserDataByScreenName(screenName) {
     const endpoint = API_ENDPOINTS.UserByScreenName;
-    const url = `https://x.com/i/api/graphql/${endpoint.hash}/UserByScreenName?variables=${encodeURIComponent(JSON.stringify({screen_name:screenName,withSafetyModeUserFields:true}))}&features=${encodeURIComponent(JSON.stringify(endpoint.features))}`;
+    const url = buildGraphqlUrl(endpoint, 'UserByScreenName', {screen_name:screenName,withSafetyModeUserFields:true});
     const data = await makeApiRequest(url);
     if (data?.data?.user?.result) return data.data.user.result;
     throw new Error(`无法找到用户 @${screenName} 的数据`);
 }
 async function getUserDataById(userId) {
     const endpoint = API_ENDPOINTS.UserByRestId;
-    const url = `https://x.com/i/api/graphql/${endpoint.hash}/UserByRestId?variables=${encodeURIComponent(JSON.stringify({userId,withSafetyModeUserFields:true}))}&features=${encodeURIComponent(JSON.stringify(endpoint.features))}`;
+    const url = buildGraphqlUrl(endpoint, 'UserByRestId', {userId,withSafetyModeUserFields:true});
     const data = await makeApiRequest(url);
     if (data?.data?.user?.result) return data.data.user.result;
     throw new Error(`无法找到用户 ID: ${userId} 的数据`);
@@ -3246,7 +3635,7 @@ async function getRetweetersData(tweetId, onProgress) {
     let users = new Map(), cursor = null, endpoint = API_ENDPOINTS.Retweeters;
     do {
         onProgress(`正在获取转推列表...(已找到: ${users.size})`);
-        const url = `https://x.com/i/api/graphql/${endpoint.hash}/Retweeters?variables=${encodeURIComponent(JSON.stringify({tweetId,count:100,cursor,includePromotedContent:true}))}&features=${encodeURIComponent(JSON.stringify(endpoint.features))}`;
+        const url = buildGraphqlUrl(endpoint, 'Retweeters', {tweetId,count:100,cursor,includePromotedContent:true});
         const data = await makeApiRequest(url);
         const entries = data?.data?.retweeters_timeline?.timeline?.instructions?.find(i=>i.type==='TimelineAddEntries')?.entries;
         if (!entries) break;
@@ -3265,7 +3654,7 @@ async function getFavoritersData(tweetId, onProgress) {
     let users = new Map(), cursor = null, endpoint = API_ENDPOINTS.Favoriters;
     do {
         onProgress(`正在获取点赞列表...(已找到: ${users.size})`);
-        const url = `https://x.com/i/api/graphql/${endpoint.hash}/Favoriters?variables=${encodeURIComponent(JSON.stringify({tweetId,count:100,cursor,includePromotedContent:true}))}&features=${encodeURIComponent(JSON.stringify(endpoint.features))}`;
+        const url = buildGraphqlUrl(endpoint, 'Favoriters', {tweetId,count:100,cursor,includePromotedContent:true});
         const data = await makeApiRequest(url);
         const entries = data?.data?.favoriters_timeline?.timeline?.instructions?.find(i=>i.type==='TimelineAddEntries')?.entries;
         if (!entries) break;
@@ -3286,7 +3675,7 @@ async function getRepliersData(tweetId, onProgress) {
     do {
         onProgress(`正在获取回复列表...(已找到: ${users.size})`);
         const variables = {...baseVariables, focalTweetId: tweetId, cursor, count: 40, rankingMode:"Relevance"};
-        const url = `https://x.com/i/api/graphql/${endpoint.hash}/TweetDetail?variables=${encodeURIComponent(JSON.stringify(variables))}&features=${encodeURIComponent(JSON.stringify(endpoint.features))}`;
+        const url = buildGraphqlUrl(endpoint, 'TweetDetail', variables);
         const data = await makeApiRequest(url);
         const instructions = data?.data?.threaded_conversation_with_injections_v2?.instructions || [];
         const entriesInstruction = instructions.find(i => i.type === 'TimelineAddEntries');
@@ -3571,13 +3960,25 @@ function getArticleAuthorHandle(article) {
     return normalizePromoHandle(getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/')?.pop()?.split('?')?.[0] || '');
 }
 function getStatusRootTweetArticle() {
-    if (window.location.pathname.split('/')[2] !== 'status') return null;
+    if (!getCurrentStatusPageInfo().tweetId) return null;
     markStatusRootTweetArticles();
     const articles = Array.from(document.querySelectorAll('[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]'));
-    return articles.find((article) => article.dataset.cbSpamRootTweet === 'true') || articles[0] || null;
+    return articles.find((article) => article.dataset.cbSpamRootTweet === 'true') || null;
 }
 function getRootTweetAuthorHandle() {
-    return getArticleAuthorHandle(getStatusRootTweetArticle());
+    const info = getCurrentStatusPageInfo();
+    if (!info.tweetId) return '';
+    const rootArticle = getStatusRootTweetArticle();
+    const articleHandle = getArticleAuthorHandle(rootArticle);
+    if (articleHandle) {
+        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: articleHandle };
+        return articleHandle;
+    }
+    if (info.authorHandle) {
+        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: info.authorHandle };
+        return info.authorHandle;
+    }
+    return statusRootTweetCache.tweetId === info.tweetId ? statusRootTweetCache.authorHandle : '';
 }
 function getChainExemptHandlesForTarget(targetArticle) {
     const rootAuthorHandle = getRootTweetAuthorHandle();
@@ -3637,6 +4038,7 @@ async function resolveNukeTarget(targetArticle, trigger) {
         if (!authorId) throw new Error(`无法获取 @${authorHandle} 的用户ID`);
     } catch (authorError) {
         console.error(`[CB] 获取作者 @${authorHandle} 失败:`, authorError);
+        if (isApiRateLimitError(authorError) || isApiTimeoutError(authorError)) throw authorError;
     }
     if (rootAuthorHandle && rootAuthorHandle === authorHandle) {
         rootAuthorId = authorId;
@@ -3646,6 +4048,7 @@ async function resolveNukeTarget(targetArticle, trigger) {
             rootAuthorId = rootAuthorData?.rest_id || null;
         } catch (rootAuthorError) {
             console.warn(`[CB] 获取主贴作者 @${rootAuthorHandle} 失败，将仅按 handle 豁免`, rootAuthorError);
+            if (isApiRateLimitError(rootAuthorError) || isApiTimeoutError(rootAuthorError)) throw rootAuthorError;
         }
     }
     tweetContext.rootAuthorHandle = rootAuthorHandle || '';
@@ -3673,19 +4076,15 @@ async function blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, e
     showToast('nuke-fetch-toast', '✅ 作者已拉黑并记录', `已立刻拉黑 @${authorHandle}`, 2000);
     return true;
 }
-async function collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress) {
+async function collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress, onCollectFailure) {
     const { authorId, tweetContext } = resolvedTarget;
     const tweetId = tweetContext.tweetId;
     if (!tweetId) return 0;
     const beforeSize = queueById.size;
-    const favoritersPromise = getFavoritersData(tweetId, onCollectProgress).catch(error => {
-        console.warn('[CB] 获取点赞列表失败，将跳过点赞关联用户', error);
-        return [];
-    });
     const [retweeters, repliers, favoriters] = await Promise.all([
-        getRetweetersData(tweetId, onCollectProgress),
-        getRepliersData(tweetId, onCollectProgress),
-        favoritersPromise
+        getRetweetersData(tweetId, onCollectProgress).catch(skipFailedChainList('转推列表', onCollectFailure)),
+        getRepliersData(tweetId, onCollectProgress).catch(skipFailedChainList('回复列表', onCollectFailure)),
+        getFavoritersData(tweetId, onCollectProgress).catch(skipFailedChainList('点赞列表', onCollectFailure))
     ]);
     addUsersToChainQueue(queueById, retweeters, 'retweet', tweetContext);
     addUsersToChainQueue(queueById, repliers, 'reply', tweetContext);
@@ -4007,6 +4406,9 @@ async function initialize() {
         const screenName = profileLink.href.split('/').pop();
         const user = await getUserDataByScreenName(screenName);
         if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
+        if (apiLimitRetryTimeoutId) clearTimeout(apiLimitRetryTimeoutId);
+        apiLimitCountdownInterval = null;
+        apiLimitRetryTimeoutId = null;
         document.getElementById('nuke-api-limit-toast')?.remove();
         currentUserId = user.rest_id;
         currentUserScreenName = user.legacy.screen_name;
@@ -4022,18 +4424,9 @@ async function initialize() {
             setTimeout(processQueue, 1000);
         }
     } catch (error) {
-        if (error?.status === 429) {
+        if (isApiRateLimitError(error)) {
             console.warn(`[CB] API rate limit hit. Retrying in ${API_RETRY_DELAY_MS / 60000} minutes.`);
-            showToast('nuke-api-limit-toast', 'API 已达上限', '正在计算时间...', null);
-            const retryTimestamp = Date.now() + API_RETRY_DELAY_MS;
-            apiLimitCountdownInterval = setInterval(() => {
-                const toastStatusEl = document.querySelector('#nuke-api-limit-toast .nuke-toast-status');
-                if (!toastStatusEl) { clearInterval(apiLimitCountdownInterval); return; }
-                const secondsLeft = Math.round((retryTimestamp - Date.now()) / 1000);
-                if (secondsLeft <= 0) { toastStatusEl.innerHTML = '正在重试...'; clearInterval(apiLimitCountdownInterval); return; }
-                toastStatusEl.innerHTML = `将在 <b>${String(Math.floor(secondsLeft/60)).padStart(2,'0')}:${String(secondsLeft%60).padStart(2,'0')}</b> 后重试`;
-            }, 1000);
-            setTimeout(initialize, API_RETRY_DELAY_MS);
+            showApiLimitRetryToast();
         } else { console.error("[CB] Initialization failed.", error); }
     }
 }
