@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.14
+// @version      2.15.16
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -64,7 +64,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.14';
+const SPAM_SCANNER_BUILD = '2.15.16';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1601,6 +1601,23 @@ async function processPromoMentionsFromArticle(targetArticle, tweetContext, user
 function normalizeOcrText(text) {
     return String(text || '').replace(/\s+/g, '').trim();
 }
+function isCommonAvatarPriorityTextChar(char) {
+    if (/[\p{Script=Han}\p{Script=Latin}\p{N}\s]/u.test(char)) return true;
+    return /[.,!?'"@#:/\\\-+，。！？、…·（）()【】[\]_]/u.test(char);
+}
+function isDecorativeUnicodeAvatarOcrPriorityText(text) {
+    const raw = String(text || '');
+    const compact = raw.replace(/\s+/g, '');
+    if (compact.length < 24 || compact.length > 180) return false;
+    const chars = Array.from(raw);
+    const latinCount = chars.filter((char) => /\p{Script=Latin}/u.test(char)).length;
+    if (latinCount < 18) return false;
+    const decorativeCount = chars.filter((char) => {
+        if (isCommonAvatarPriorityTextChar(char)) return false;
+        return (char.codePointAt(0) || 0) > 0x7f;
+    }).length;
+    return decorativeCount >= 8 && decorativeCount / Math.max(1, compact.length) >= 0.1;
+}
 function upgradeProfileImageUrl(url) {
     const src = String(url || '').trim();
     if (!src) return '';
@@ -2497,6 +2514,13 @@ function isAvatarOcrJobQueuedForArticle(article) {
 function isAvatarOcrJobActiveForArticle(article) {
     return !!article && avatarOcrActiveArticle === article;
 }
+function getAvatarOcrJobPriority(article) {
+    const tweetText = getTweetTextFromArticle(article);
+    let priority = 0;
+    if (isDecorativeUnicodeAvatarOcrPriorityText(tweetText)) priority += 8;
+    if (article?.querySelector('.nuke-spam-badge:not([data-avatar-ocr-badge])')) priority += 4;
+    return priority;
+}
 function enqueueAvatarOcr(article, imageUrl) {
     const visible = isArticleInViewport(article);
     if ((article.dataset.avatarOcrPending === 'true' || article.dataset.avatarOcrQueued === 'true') && !visible) return;
@@ -2505,7 +2529,7 @@ function enqueueAvatarOcr(article, imageUrl) {
     article.dataset.avatarOcrQueued = 'true';
     article.dataset.avatarOcrPending = 'true';
     article.dataset.avatarOcrQueuedAt = String(Date.now());
-    const job = { article, imageUrl };
+    const job = { article, imageUrl, priority: getAvatarOcrJobPriority(article) };
     if (visible) avatarOcrQueue.unshift(job);
     else avatarOcrQueue.push(job);
     void pumpAvatarOcrQueue();
@@ -2527,13 +2551,27 @@ function isArticleInViewport(article) {
     const rect = article.getBoundingClientRect();
     return rect.bottom > 0 && rect.top < window.innerHeight;
 }
+function avatarOcrJobScore(job) {
+    if (!job?.article?.isConnected) return -Infinity;
+    return (isArticleInViewport(job.article) ? 1000 : 0) + (Number(job.priority) || 0);
+}
 function takeNextAvatarOcrJob() {
-    const visibleIndex = avatarOcrQueue.findIndex((job) => isArticleInViewport(job?.article));
-    if (visibleIndex > 0) return avatarOcrQueue.splice(visibleIndex, 1)[0];
+    let bestIndex = -1;
+    let bestScore = -Infinity;
+    for (let i = 0; i < avatarOcrQueue.length; i += 1) {
+        const score = avatarOcrJobScore(avatarOcrQueue[i]);
+        if (score > bestScore) {
+            bestScore = score;
+            bestIndex = i;
+        }
+    }
+    if (bestIndex > 0) return avatarOcrQueue.splice(bestIndex, 1)[0];
     return avatarOcrQueue.shift();
 }
 function shouldDeferAvatarOcrJob(job) {
-    return !isArticleInViewport(job?.article) && shouldDeferBackgroundAvatarOcr();
+    return !isArticleInViewport(job?.article)
+        && !hasVisibleAvatarOcrJobWaiting()
+        && shouldDeferBackgroundAvatarOcr();
 }
 function hasVisibleAvatarOcrJobWaiting() {
     return avatarOcrQueue.some((job) => isArticleInViewport(job?.article));
@@ -2555,7 +2593,7 @@ function recoverStalledAvatarOcrPump() {
     }
     if (!avatarOcrActiveStartedAt) return;
     const activeAge = Date.now() - avatarOcrActiveStartedAt;
-    const hasVisibleJobWaiting = hasVisibleAvatarOcrJobWaiting() && !isArticleInViewport(avatarOcrActiveArticle);
+    const hasVisibleJobWaiting = hasVisibleAvatarOcrJobWaiting();
     const maxActiveAge = hasVisibleJobWaiting ? AVATAR_OCR_VISIBLE_REQUEUE_MS : AVATAR_OCR_JOB_TIMEOUT_MS + AVATAR_OCR_PUMP_STALL_GRACE_MS;
     if (activeAge <= maxActiveAge) return;
     avatarOcrPumpRunId += 1;
