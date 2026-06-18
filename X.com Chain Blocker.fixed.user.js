@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.25
+// @version      2.15.29
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -38,6 +38,7 @@ const MENU_ITEM_TEXT = "九族拉黑";
 const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4-6.8c0-4.1,3.4-7.5,7.5-7.5S19.5,7.9,19.5,12z M12,6c-2.2,0-4,1.8-4,4s1.8,4,4,4s4-1.8,4-4S14.2,6,12,6z M12,14c-1.1,0-2-0.9-2-2c0-0.4,0.1-0.7,0.3-1H10v-2h1.3c-0.2-0.3-0.3-0.6-0.3-1c0-1.1,0.9-2,2-2s2,0.9,2,2c0,0.4-0.1,0.7-0.3,1H14v2h-1.3c0.2,0.3,0.3,0.6,0.3,1C14,13.1,13.1,14,12,14z";
 const STORAGE_KEY = 'CHAIN_BLOCKER_DATA';
 const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
+const API_RATE_LIMIT_STATE_KEY = 'CHAIN_BLOCKER_API_RATE_LIMIT_STATE';
 const BLOCK_INTERVAL_MS = 10 * 1000;
 const API_REQUEST_TIMEOUT_MS = 12000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
@@ -72,7 +73,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.25';
+const SPAM_SCANNER_BUILD = '2.15.29';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -941,20 +942,25 @@ function markStatusRootTweetArticles() {
         delete article.dataset.cbSpamRootTweet;
     });
     if (!info.tweetId) {
-        statusRootTweetCache = { tweetId: '', authorHandle: '' };
+        statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
         return;
     }
-    let rootArticle = null;
-    articles.forEach((article) => {
-        if (getArticleOwnStatusId(article) === info.tweetId) rootArticle = article;
-    });
-    if (rootArticle) {
-        rootArticle.dataset.cbSpamRootTweet = 'true';
-        const authorHandle = getArticleAuthorHandle(rootArticle) || info.authorHandle;
-        if (authorHandle) statusRootTweetCache = { tweetId: info.tweetId, authorHandle };
-    } else if (info.authorHandle) {
-        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: info.authorHandle };
+    const entries = Array.from(articles).map((article) => ({ article, tweetId: getArticleOwnStatusId(article) }));
+    const currentIndex = entries.findIndex((entry) => entry.tweetId === info.tweetId);
+    const cachedRootTweetId = statusRootTweetCache.pageTweetId === info.tweetId ? statusRootTweetCache.rootTweetId : '';
+    let rootEntry = currentIndex > 0
+        ? entries.slice(0, currentIndex).find((entry) => entry.tweetId)
+        : entries[currentIndex];
+    if (!rootEntry && cachedRootTweetId) rootEntry = entries.find((entry) => entry.tweetId === cachedRootTweetId) || null;
+    if (!rootEntry) {
+        const cachedAuthorHandle = statusRootTweetCache.pageTweetId === info.tweetId ? statusRootTweetCache.authorHandle : '';
+        statusRootTweetCache = { pageTweetId: info.tweetId, rootTweetId: cachedRootTweetId, authorHandle: cachedAuthorHandle };
+        return;
     }
+    rootEntry.article.dataset.cbSpamRootTweet = 'true';
+    const previousAuthorHandle = statusRootTweetCache.pageTweetId === info.tweetId ? statusRootTweetCache.authorHandle : '';
+    const authorHandle = getArticleAuthorHandle(rootEntry.article) || (rootEntry.tweetId === info.tweetId ? info.authorHandle : '') || previousAuthorHandle;
+    statusRootTweetCache = { pageTweetId: info.tweetId, rootTweetId: rootEntry.tweetId || cachedRootTweetId, authorHandle };
 }
 function isStatusRootTweetArticle(article) {
     return article?.dataset?.cbSpamRootTweet === 'true';
@@ -978,10 +984,10 @@ const FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS = 4500;
 const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
-let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null;
+let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
 let manualDetectedNukeRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false;
-let statusRootTweetCache = { tweetId: '', authorHandle: '' };
+let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
 const aggregatedToastState = new Map();
 const followerCountCache = new Map();
 const followerFetchPending = new Map();
@@ -2815,6 +2821,7 @@ async function getCachedProfileBioUserData(screenName) {
             followerCountCache.set(key, { count, at: Date.now() });
             return userResult;
         } catch (error) {
+            if (isApiRateLimitError(error)) throw error;
             console.warn(`[CB] 无法获取 @${screenName} 的个人简介`, error);
             return null;
         } finally {
@@ -2852,6 +2859,7 @@ function takeNextProfileBioJob() {
 }
 async function pumpProfileBioQueue() {
     if (profileBioPumpRunning) return;
+    if (await getActiveApiRateLimitState()) return;
     profileBioPumpRunning = true;
     try {
         while (profileBioQueue.length) {
@@ -2859,6 +2867,7 @@ async function pumpProfileBioQueue() {
             if (!job?.article?.isConnected) continue;
             profileBioActiveArticle = job.article;
             let matched = false;
+            let deferredForApiLimit = false;
             try {
                 if (scriptConfig.spamIdentifyEnabled === false) {
                     finalizeSpamArticleScan(job.article);
@@ -2882,12 +2891,24 @@ async function pumpProfileBioQueue() {
                     }
                 }
             } catch (error) {
-                const failCount = (parseInt(job.article.dataset.profileBioFailCount, 10) || 0) + 1;
-                job.article.dataset.profileBioFailCount = String(failCount);
-                console.warn(`[CB] 个人简介识别失败 (${failCount})`, job.screenName, error);
+                if (isApiRateLimitError(error)) {
+                    showApiLimitRetryToast(error);
+                    deferredForApiLimit = true;
+                    if (job.article?.isConnected) {
+                        job.article.dataset.profileBioQueued = 'true';
+                        job.article.dataset.profileBioPending = 'true';
+                        job.article.dataset.profileBioQueuedAt = String(Date.now());
+                        profileBioQueue.unshift(job);
+                    }
+                } else {
+                    const failCount = (parseInt(job.article.dataset.profileBioFailCount, 10) || 0) + 1;
+                    job.article.dataset.profileBioFailCount = String(failCount);
+                    console.warn(`[CB] 个人简介识别失败 (${failCount})`, job.screenName, error);
+                }
             } finally {
                 profileBioActiveArticle = null;
             }
+            if (deferredForApiLimit) break;
             if (job.article?.isConnected) {
                 if (matched) finalizeSpamArticleScan(job.article);
                 else continueSpamScanAfterProfileBio(job.article);
@@ -2902,6 +2923,7 @@ async function pumpProfileBioQueue() {
 }
 async function pumpAvatarOcrQueue() {
     if (avatarOcrPumpRunning) return;
+    if (await getActiveApiRateLimitState()) return;
     avatarOcrPumpRunning = true;
     const pumpRunId = ++avatarOcrPumpRunId;
     updateAvatarOcrPumpProbe('running');
@@ -2917,6 +2939,7 @@ async function pumpAvatarOcrQueue() {
                 continue;
             }
             let matched = false;
+            let deferredForApiLimit = false;
             avatarOcrActiveStartedAt = Date.now();
             avatarOcrActiveArticle = job.article;
             updateAvatarOcrPumpProbe('active');
@@ -2945,13 +2968,25 @@ async function pumpAvatarOcrQueue() {
                 }
             } catch (error) {
                 if (pumpRunId !== avatarOcrPumpRunId) return;
-                noteAvatarOcrError(error);
-                const failCount = (parseInt(job.article.dataset.avatarOcrFailCount, 10) || 0) + 1;
-                job.article.dataset.avatarOcrFailCount = String(failCount);
-                console.warn(`[CB] 头像识别失败 (${failCount}/${AVATAR_OCR_MAX_FAILS})`, job.imageUrl, error);
-                if (!isAvatarOcrJobTimeout(error) && failCount < AVATAR_OCR_MAX_FAILS) {
-                    releaseAvatarOcrForRetry(job.article);
-                    continue;
+                if (isApiRateLimitError(error)) {
+                    showApiLimitRetryToast(error);
+                    deferredForApiLimit = true;
+                    if (job.article?.isConnected) {
+                        releaseAvatarOcrForRetry(job.article);
+                        job.article.dataset.avatarOcrQueued = 'true';
+                        job.article.dataset.avatarOcrPending = 'true';
+                        job.article.dataset.avatarOcrQueuedAt = String(Date.now());
+                        avatarOcrQueue.unshift(job);
+                    }
+                } else {
+                    noteAvatarOcrError(error);
+                    const failCount = (parseInt(job.article.dataset.avatarOcrFailCount, 10) || 0) + 1;
+                    job.article.dataset.avatarOcrFailCount = String(failCount);
+                    console.warn(`[CB] 头像识别失败 (${failCount}/${AVATAR_OCR_MAX_FAILS})`, job.imageUrl, error);
+                    if (!isAvatarOcrJobTimeout(error) && failCount < AVATAR_OCR_MAX_FAILS) {
+                        releaseAvatarOcrForRetry(job.article);
+                        continue;
+                    }
                 }
             } finally {
                 if (pumpRunId === avatarOcrPumpRunId) {
@@ -2960,6 +2995,7 @@ async function pumpAvatarOcrQueue() {
                     updateAvatarOcrPumpProbe('idle');
                 }
             }
+            if (deferredForApiLimit) break;
             if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
             await new Promise((resolve) => window.setTimeout(resolve, 100));
         }
@@ -2988,7 +3024,18 @@ async function processSpamArticle(article) {
         const detection = textDetection || detectSpamReply(tweetText);
         article.dataset.spamTextScannedBuild = SPAM_SCANNER_BUILD;
         if (detection.match) {
-            if (await shouldExemptArticleByTrustedAuthor(article, 'spam_identify')) {
+            let trustedExempt = false;
+            try {
+                trustedExempt = await shouldExemptArticleByTrustedAuthor(article, 'spam_identify');
+            } catch (error) {
+                if (isApiRateLimitError(error)) {
+                    showApiLimitRetryToast(error);
+                    delete article.dataset.spamTextScannedBuild;
+                    return;
+                }
+                throw error;
+            }
+            if (trustedExempt) {
                 finalizeSpamArticleScan(article);
                 return;
             }
@@ -3095,39 +3142,51 @@ function scheduleSpamRescanDebounced() {
 }
 function scanSpamIdentifyContent() {
     if (!currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
-    if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
-    recoverStalledAvatarOcrPump();
-    resetSpamScanMarkersForBuildUpgrade();
-    markStatusRootTweetArticles();
-    tryExpandHiddenSpamReplies();
-    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
-        void processSpamArticle(article);
-    });
-    recoverStalledAvatarOcrPump();
-    try {
-        const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
-        let avatarHits = 0;
-        avatarBadges.forEach((node) => {
-            if (/头像|全国安排/.test(node.textContent || '')) avatarHits += 1;
+    void (async () => {
+        if (await getActiveApiRateLimitState()) return;
+        if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
+        recoverStalledAvatarOcrPump();
+        resetSpamScanMarkersForBuildUpgrade();
+        markStatusRootTweetArticles();
+        tryExpandHiddenSpamReplies();
+        document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+            void processSpamArticle(article);
         });
-        document.documentElement.dataset.cbSpamScannerBuild = SPAM_SCANNER_BUILD;
-        document.documentElement.dataset.cbSpamAvatarBadgeCount = String(avatarHits);
-        document.documentElement.dataset.cbSpamOcrEngine = getAvatarOcrEngine();
-        document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
-        document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
-        document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
-        document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
-        document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
-        ensureManualDetectedNukeButton();
-    } catch {
-        /* probe only */
-    }
+        recoverStalledAvatarOcrPump();
+        try {
+            const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
+            let avatarHits = 0;
+            avatarBadges.forEach((node) => {
+                if (/头像|全国安排/.test(node.textContent || '')) avatarHits += 1;
+            });
+            document.documentElement.dataset.cbSpamScannerBuild = SPAM_SCANNER_BUILD;
+            document.documentElement.dataset.cbSpamAvatarBadgeCount = String(avatarHits);
+            document.documentElement.dataset.cbSpamOcrEngine = getAvatarOcrEngine();
+            document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
+            document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
+            document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
+            document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
+            document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
+            ensureManualDetectedNukeButton();
+        } catch {
+            /* probe only */
+        }
+    })();
 }
 async function inspectTweetArticleForSpam(article) {
     const userLink = article.querySelector('div[data-testid="User-Name"] a[role="link"]');
     const screenName = getScreenNameFromProfileHref(userLink?.href) || '未知';
     const tweetText = getTweetTextFromArticle(article);
-    const followerExempt = await shouldExemptArticleByTrustedAuthor(article, 'manual_spam_inspect');
+    let followerExempt = false;
+    try {
+        followerExempt = await shouldExemptArticleByTrustedAuthor(article, 'manual_spam_inspect');
+    } catch (error) {
+        if (isApiRateLimitError(error)) {
+            showApiLimitRetryToast(error);
+            return `@${screenName}: API 已达上限，等待恢复后再检测`;
+        }
+        throw error;
+    }
     let summary = '';
     if (!followerExempt && tweetText) {
         const detection = detectSpamReply(tweetText);
@@ -3400,42 +3459,163 @@ function buildGraphqlUrl(endpoint, operationName, variables) {
     if (endpoint.fieldToggles) params.set('fieldToggles', JSON.stringify(endpoint.fieldToggles));
     return `https://x.com/i/api/graphql/${endpoint.hash}/${operationName}?${params.toString()}`;
 }
-function makeApiRequest(url, method = "GET", data = null) { return new Promise((resolve, reject) => GM_xmlhttpRequest({ method, url, data, timeout: API_REQUEST_TIMEOUT_MS, headers: { Authorization: `Bearer ${getAuthToken()}`, "Content-Type": "application/x-www-form-urlencoded", "x-csrf-token": getCsrfToken() }, onload: r => r.status >= 200 && r.status < 300 ? resolve(r.responseText ? JSON.parse(r.responseText) : null) : reject({ message: `API请求失败: ${r.status}`, status: r.status }), onerror: e => reject({ message: "Network or script error", error: e }), ontimeout: () => reject({ message: "API请求超时", status: 0 }) })); }
+function getResponseHeaderValue(responseHeaders, name) {
+    const wanted = String(name || '').toLowerCase();
+    const line = String(responseHeaders || '').split(/\r?\n/).find((header) => header.toLowerCase().startsWith(`${wanted}:`));
+    return line ? line.slice(line.indexOf(':') + 1).trim() : '';
+}
+function getApiRateLimitRetryAtFromResponse(response) {
+    const now = Date.now();
+    const resetSeconds = parseInt(getResponseHeaderValue(response?.responseHeaders, 'x-rate-limit-reset'), 10);
+    if (Number.isFinite(resetSeconds) && resetSeconds * 1000 > now) return resetSeconds * 1000;
+    const retryAfterSeconds = parseInt(getResponseHeaderValue(response?.responseHeaders, 'retry-after'), 10);
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) return now + retryAfterSeconds * 1000;
+    return now + API_RETRY_DELAY_MS;
+}
+function normalizeApiRateLimitState(value, now = Date.now()) {
+    if (!value || typeof value !== 'object') return null;
+    const retryAt = Number(value.retryAt || 0);
+    if (!Number.isFinite(retryAt) || retryAt <= now) return null;
+    return {
+        retryAt,
+        updatedAt: Number(value.updatedAt || 0) || 0,
+        source: String(value.source || 'api')
+    };
+}
+async function getActiveApiRateLimitState(now = Date.now()) {
+    return normalizeApiRateLimitState(await GM_getValue(API_RATE_LIMIT_STATE_KEY, null), now);
+}
+async function clearExpiredApiRateLimitState(now = Date.now()) {
+    const raw = await GM_getValue(API_RATE_LIMIT_STATE_KEY, null);
+    const retryAt = Number(raw?.retryAt || 0);
+    if (retryAt && retryAt <= now) await GM_setValue(API_RATE_LIMIT_STATE_KEY, { retryAt: 0, updatedAt: now, source: 'expired' });
+}
+async function recordApiRateLimitUntil(retryAt, source = 'api') {
+    const now = Date.now();
+    const fallbackRetryAt = now + API_RETRY_DELAY_MS;
+    const parsedRetryAt = Number(retryAt);
+    const nextRetryAt = Number.isFinite(parsedRetryAt) && parsedRetryAt > now ? parsedRetryAt : fallbackRetryAt;
+    const current = await getActiveApiRateLimitState(now);
+    const state = {
+        retryAt: Math.max(current?.retryAt || 0, nextRetryAt),
+        updatedAt: now,
+        source
+    };
+    await GM_setValue(API_RATE_LIMIT_STATE_KEY, state);
+    return state;
+}
+async function recordApiRateLimitFromResponse(response) {
+    return recordApiRateLimitUntil(getApiRateLimitRetryAtFromResponse(response), 'api');
+}
+function buildApiRateLimitError(state) {
+    return { message: 'API 已达上限，等待共享恢复时间', status: 429, retryAt: state.retryAt, sharedRateLimit: true };
+}
+async function throwIfApiRateLimited() {
+    const state = await getActiveApiRateLimitState();
+    if (state) throw buildApiRateLimitError(state);
+}
+async function makeApiRequest(url, method = "GET", data = null) {
+    await throwIfApiRateLimited();
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+        method,
+        url,
+        data,
+        timeout: API_REQUEST_TIMEOUT_MS,
+        headers: { Authorization: `Bearer ${getAuthToken()}`, "Content-Type": "application/x-www-form-urlencoded", "x-csrf-token": getCsrfToken() },
+        onload: (r) => {
+            if (r.status >= 200 && r.status < 300) {
+                try {
+                    resolve(r.responseText ? JSON.parse(r.responseText) : null);
+                } catch (error) {
+                    reject({ message: 'API响应解析失败', status: r.status, error });
+                }
+                return;
+            }
+            if (r.status === 429) {
+                void (async () => {
+                    try {
+                        const state = await recordApiRateLimitFromResponse(r);
+                        reject({ message: `API请求失败: ${r.status}`, status: r.status, retryAt: state.retryAt, responseHeaders: r.responseHeaders || '' });
+                    } catch (error) {
+                        reject({ message: `API请求失败: ${r.status}`, status: r.status, error });
+                    }
+                })();
+                return;
+            }
+            reject({ message: `API请求失败: ${r.status}`, status: r.status });
+        },
+        onerror: e => reject({ message: "Network or script error", error: e }),
+        ontimeout: () => reject({ message: "API请求超时", status: 0 })
+    }));
+}
 function isApiRateLimitError(error) {
-    return error?.status === 429;
+    return error?.status === 429 || error?.sharedRateLimit === true;
 }
 function isApiTimeoutError(error) {
     return error?.status === 0 || /超时|timeout/i.test(String(error?.message || ''));
 }
-function showApiLimitRetryToast() {
+function clearApiLimitTimers() {
     if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
     if (apiLimitRetryTimeoutId) clearTimeout(apiLimitRetryTimeoutId);
-    showToast('nuke-api-limit-toast', 'API 已达上限', '正在计算时间...', null);
-    const retryTimestamp = Date.now() + API_RETRY_DELAY_MS;
-    apiLimitCountdownInterval = setInterval(() => {
-        const toastStatusEl = document.querySelector('#nuke-api-limit-toast .nuke-toast-status');
-        if (!toastStatusEl) {
-            clearInterval(apiLimitCountdownInterval);
-            apiLimitCountdownInterval = null;
-            return;
-        }
-        const secondsLeft = Math.round((retryTimestamp - Date.now()) / 1000);
-        if (secondsLeft <= 0) {
-            toastStatusEl.innerHTML = '正在重试...';
-            clearInterval(apiLimitCountdownInterval);
-            apiLimitCountdownInterval = null;
-            return;
-        }
-        toastStatusEl.innerHTML = `将在 <b>${String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:${String(secondsLeft % 60).padStart(2, '0')}</b> 后重试`;
-    }, 1000);
+    apiLimitCountdownInterval = null;
+    apiLimitRetryTimeoutId = null;
+    apiLimitRetryAt = 0;
+}
+function scheduleApiLimitRetry(retryAt) {
+    if (!retryAt || retryAt <= Date.now()) return;
+    if (apiLimitRetryAt === retryAt && apiLimitRetryTimeoutId) return;
+    if (apiLimitRetryTimeoutId) clearTimeout(apiLimitRetryTimeoutId);
+    apiLimitRetryAt = retryAt;
     apiLimitRetryTimeoutId = setTimeout(() => {
         apiLimitRetryTimeoutId = null;
+        apiLimitRetryAt = 0;
         initialize();
-    }, API_RETRY_DELAY_MS);
+    }, Math.max(0, retryAt - Date.now()));
+}
+function startApiLimitCountdown(retryAt) {
+    if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
+    const render = async () => {
+        const toastStatusEl = document.querySelector('#nuke-api-limit-toast .nuke-toast-status');
+        if (!toastStatusEl) {
+            if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
+            apiLimitCountdownInterval = null;
+            return;
+        }
+        const state = await getActiveApiRateLimitState();
+        const activeRetryAt = state?.retryAt || retryAt;
+        const secondsLeft = Math.ceil((activeRetryAt - Date.now()) / 1000);
+        if (secondsLeft <= 0) {
+            toastStatusEl.innerHTML = '正在重试...';
+            if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
+            apiLimitCountdownInterval = null;
+            if (!apiLimitRetryTimeoutId) {
+                apiLimitRetryTimeoutId = setTimeout(() => {
+                    apiLimitRetryTimeoutId = null;
+                    apiLimitRetryAt = 0;
+                    initialize();
+                }, 0);
+            }
+            return;
+        }
+        scheduleApiLimitRetry(activeRetryAt);
+        toastStatusEl.innerHTML = `将在 <b>${String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:${String(secondsLeft % 60).padStart(2, '0')}</b> 后重试`;
+    };
+    void render();
+    apiLimitCountdownInterval = setInterval(() => {
+        void render();
+    }, 1000);
+}
+function showApiLimitRetryToast(error = null) {
+    showToast('nuke-api-limit-toast', 'API 已达上限', '正在计算时间...', null);
+    void (async () => {
+        let state = error?.retryAt ? await recordApiRateLimitUntil(error.retryAt, error.sharedRateLimit ? 'shared' : 'api') : await getActiveApiRateLimitState();
+        if (!state) state = await recordApiRateLimitUntil(Date.now() + API_RETRY_DELAY_MS, 'local');
+        startApiLimitCountdown(state.retryAt);
+    })();
 }
 function showManualDetectedApiStopToast(error) {
     if (isApiRateLimitError(error)) {
-        showApiLimitRetryToast();
+        showApiLimitRetryToast(error);
         showToast('nuke-manual-detected-toast', '手动执行已暂停', 'X API 已达上限，已停止直接拉黑；稍后可重试', 5000);
         return;
     }
@@ -3447,7 +3627,7 @@ function showManualDetectedApiStopToast(error) {
 }
 function showManualDetectedChainCollectPausedToast(error) {
     if (isApiRateLimitError(error)) {
-        showApiLimitRetryToast();
+        showApiLimitRetryToast(error);
         showToast('nuke-manual-detected-toast', '九族列表收集已暂停', 'X API 已达上限，停止继续收集关联列表；将继续尝试直接拉黑标记用户', 5000);
         return;
     }
@@ -3465,7 +3645,7 @@ function skipFailedChainList(label, onCollectFailure) {
         } catch {
             /* ignore */
         }
-        if (isApiRateLimitError(error)) showApiLimitRetryToast();
+        if (isApiRateLimitError(error)) showApiLimitRetryToast(error);
         return [];
     };
 }
@@ -3581,6 +3761,7 @@ async function getCachedFollowerCount(screenName) {
             followerCountCache.set(key, { count, at: Date.now() });
             return count;
         } catch (error) {
+            if (isApiRateLimitError(error)) throw error;
             console.warn(`[CB] 无法获取 @${screenName} 的粉丝数`, error);
             return null;
         } finally {
@@ -3619,7 +3800,16 @@ async function maybeAutoBlockTarget(targetArticle, userNameText, screenName) {
     if (!userNameText) return;
     if (!isAutoNukeEnabled()) return;
     if (shouldExemptArticleByBlueVerified(targetArticle, 'auto_rule')) return;
-    const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
+    let decision = null;
+    try {
+        decision = await evaluateUsernameAutoBlock(userNameText, screenName);
+    } catch (error) {
+        if (isApiRateLimitError(error)) {
+            showApiLimitRetryToast(error);
+            return;
+        }
+        throw error;
+    }
     if (!decision.block) {
         if (decision.reason === 'follower_exempt') {
             console.log(`[CB] 跳过常规用户名规则自动拉黑 @${screenName || '未知'} (粉丝数高于阈值 ${getUsernameRuleFollowerExemptThreshold()})`);
@@ -3921,6 +4111,7 @@ function isQueueEntryProtectedRootAuthor(entry) {
 // --- CORE LOGIC ---
 async function processQueue() {
     if (isProcessingQueue || manualDetectedNukeRunning || !currentUserId) return;
+    if (await getActiveApiRateLimitState()) return;
     const userData = await loadUserData();
     if (!userData || userData.queue.length === 0 || (Date.now() - userData.lastBlockTimestamp < BLOCK_INTERVAL_MS)) return;
     isProcessingQueue = true;
@@ -3947,8 +4138,13 @@ async function processQueue() {
         if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
         userData.lastBlockTimestamp = Date.now();
     } catch (error) {
+        if (isApiRateLimitError(error)) {
+            console.warn(`[Chain Blocker] API 已达上限，暂停队列拉黑 @${userToBlock.screenName || userToBlock.userId}.`, error);
+            showApiLimitRetryToast(error);
+        } else {
         console.error(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 失败，移除.`, error);
         userData.queue.shift();
+        }
     } finally {
         await saveUserData(userData);
         await updateStatusToast();
@@ -3971,14 +4167,11 @@ function getRootTweetAuthorHandle() {
     const rootArticle = getStatusRootTweetArticle();
     const articleHandle = getArticleAuthorHandle(rootArticle);
     if (articleHandle) {
-        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: articleHandle };
+        const rootTweetId = getArticleOwnStatusId(rootArticle) || statusRootTweetCache.rootTweetId || '';
+        statusRootTweetCache = { pageTweetId: info.tweetId, rootTweetId, authorHandle: articleHandle };
         return articleHandle;
     }
-    if (info.authorHandle) {
-        statusRootTweetCache = { tweetId: info.tweetId, authorHandle: info.authorHandle };
-        return info.authorHandle;
-    }
-    return statusRootTweetCache.tweetId === info.tweetId ? statusRootTweetCache.authorHandle : '';
+    return statusRootTweetCache.pageTweetId === info.tweetId ? statusRootTweetCache.authorHandle : '';
 }
 function getChainExemptHandlesForTarget(targetArticle) {
     const rootAuthorHandle = getRootTweetAuthorHandle();
@@ -4128,7 +4321,15 @@ async function initiateNukeProcess(targetArticle, trigger = { triggerMode: 'manu
         }
         await updateStatusToast();
         setTimeout(processQueue, 1000);
-    } catch (error) { console.error("[CB] 收集过程中发生错误:", error); showToast(`nuke-fetch-toast`, '❌ 发生错误', error.message, 5000); }
+    } catch (error) {
+        console.error("[CB] 收集过程中发生错误:", error);
+        if (isApiRateLimitError(error)) {
+            showApiLimitRetryToast(error);
+            showToast(`nuke-fetch-toast`, 'API 已达上限', '已暂停本次九族拉黑，等待恢复后可重试', 5000);
+        } else {
+            showToast(`nuke-fetch-toast`, '❌ 发生错误', error.message, 5000);
+        }
+    }
 }
 
 // --- UI SCANNING & AUTOMATION ---
@@ -4176,20 +4377,29 @@ async function processAutoBlockArticle(article, userData) {
     const screenName = getScreenNameFromProfileHref(userLink?.href);
     const tweetText = getTweetTextFromArticle(article);
 
-    if (isStatusRootTweetArticle(article)) {
-        article.dataset.autoblockChecked = 'complete';
-        return;
-    }
-
     if (shouldExemptArticleByBlueVerified(article, 'auto_rule')) {
         article.dataset.autoblockChecked = 'complete';
         return;
     }
 
     if (userNameText) {
-        const decision = await evaluateUsernameAutoBlock(userNameText, screenName);
+        let decision = null;
+        try {
+            decision = await evaluateUsernameAutoBlock(userNameText, screenName);
+        } catch (error) {
+            if (isApiRateLimitError(error)) {
+                showApiLimitRetryToast(error);
+                return;
+            }
+            throw error;
+        }
         if (decision.block) {
             const label = getAutoBlockRuleLabel(decision.reason);
+            if (isStatusRootTweetArticle(article)) {
+                markArticleForAutoRule(article, label, `命中${label}: ${userNameText}`);
+                article.dataset.autoblockChecked = 'complete';
+                return;
+            }
             if (!isAutoNukeEnabled()) {
                 markArticleForAutoRule(article, label, `命中${label}: ${userNameText}`);
                 article.dataset.autoblockChecked = 'complete';
@@ -4204,6 +4414,11 @@ async function processAutoBlockArticle(article, userData) {
         if (decision.reason === 'follower_exempt') {
             console.log(`[CB] 跳过auto_rule @${screenName || '未知'} (粉丝数 ${decision.followerCount} 高于阈值 ${decision.exemptThreshold})`);
         }
+    }
+
+    if (isStatusRootTweetArticle(article)) {
+        article.dataset.autoblockChecked = 'complete';
+        return;
     }
 
     if (tweetText && userData?.promoTargets?.length) {
@@ -4232,22 +4447,27 @@ async function processAutoBlockArticle(article, userData) {
 function scanAndProcessContent() {
     document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
     if (!currentUserId) return;
-    markStatusRootTweetArticles();
-    void loadUserData().then((userData) => {
+    void (async () => {
+        if (await getActiveApiRateLimitState()) return;
+        markStatusRootTweetArticles();
+        const userData = await loadUserData();
         if (!userData) return;
         document.querySelectorAll('article[data-testid="tweet"]:not([data-autoblock-checked])').forEach((article) => {
             void processAutoBlockArticle(article, userData);
         });
-    });
-    if (!isAutoNukeEnabled()) return;
-    document.querySelectorAll('div[data-testid="UserCell"]:not([data-autoblock-checked])').forEach(cell => {
-        cell.dataset.autoblockChecked = 'true';
-        const userLink = cell.querySelector('a[role="link"]');
-        const userNameText = getDisplayNameFromUserLink(userLink);
-        const screenName = getScreenNameFromProfileHref(userLink?.href) || cell.querySelector('a[role="link"] span')?.textContent.trim() || '';
-        void maybeAutoBlockTarget(cell.closest('div[data-testid="cellInnerDiv"]'), userNameText, screenName);
-    });
-    ensureManualDetectedNukeButton();
+        if (!isAutoNukeEnabled()) {
+            ensureManualDetectedNukeButton();
+            return;
+        }
+        document.querySelectorAll('div[data-testid="UserCell"]:not([data-autoblock-checked])').forEach(cell => {
+            cell.dataset.autoblockChecked = 'true';
+            const userLink = cell.querySelector('a[role="link"]');
+            const userNameText = getDisplayNameFromUserLink(userLink);
+            const screenName = getScreenNameFromProfileHref(userLink?.href) || cell.querySelector('a[role="link"] span')?.textContent.trim() || '';
+            void maybeAutoBlockTarget(cell.closest('div[data-testid="cellInnerDiv"]'), userNameText, screenName);
+        });
+        ensureManualDetectedNukeButton();
+    })();
 }
 function addNukeButton(menuNode) {
     if (menuNode.querySelector('.nuke-button')) return;
@@ -4405,10 +4625,8 @@ async function initialize() {
     try {
         const screenName = profileLink.href.split('/').pop();
         const user = await getUserDataByScreenName(screenName);
-        if (apiLimitCountdownInterval) clearInterval(apiLimitCountdownInterval);
-        if (apiLimitRetryTimeoutId) clearTimeout(apiLimitRetryTimeoutId);
-        apiLimitCountdownInterval = null;
-        apiLimitRetryTimeoutId = null;
+        clearApiLimitTimers();
+        await clearExpiredApiRateLimitState();
         document.getElementById('nuke-api-limit-toast')?.remove();
         currentUserId = user.rest_id;
         currentUserScreenName = user.legacy.screen_name;
@@ -4426,7 +4644,7 @@ async function initialize() {
     } catch (error) {
         if (isApiRateLimitError(error)) {
             console.warn(`[CB] API rate limit hit. Retrying in ${API_RETRY_DELAY_MS / 60000} minutes.`);
-            showApiLimitRetryToast();
+            showApiLimitRetryToast(error);
         } else { console.error("[CB] Initialization failed.", error); }
     }
 }
