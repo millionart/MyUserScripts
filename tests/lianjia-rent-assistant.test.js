@@ -6,7 +6,10 @@ const path = require('node:path');
 const {
     CONTENT_FILTER_HOST_LABEL,
     DEFAULT_FILTER_STATE,
+    buildPageUrl,
     classifyListingContent,
+    filterNewListingKeys,
+    getListingKey,
     normalizeFilterState,
     serializeFilterState,
     shouldShowListing
@@ -35,6 +38,32 @@ test('filter state normalizes and serializes JSON-compatible values', () => {
     assert.deepEqual(state, { beikePreferred: false, apartment: true });
     assert.equal(serializeFilterState(state), '{"beikePreferred":false,"apartment":true}');
     assert.deepEqual(normalizeFilterState(JSON.parse(serializeFilterState(state))), state);
+});
+
+test('pagination URL templates resolve relative next-page URLs', () => {
+    assert.equal(
+        buildPageUrl(
+            '/ditiezufang/li99620692s99635743/pg{page}rco21/',
+            2,
+            'https://sh.lianjia.com/ditiezufang/li99620692s99635743/rco21/'
+        ),
+        'https://sh.lianjia.com/ditiezufang/li99620692s99635743/pg2rco21/'
+    );
+});
+
+test('listing keys prefer stable house codes and skip duplicates', () => {
+    assert.equal(getListingKey({ houseCode: 'SH123', hrefs: ['/zufang/SH123.html'] }), 'house:SH123');
+    assert.equal(getListingKey({ houseCode: '', hrefs: ['/zufang/SH456.html'] }), 'href:/zufang/SH456.html');
+
+    const seen = new Set(['house:SH123']);
+    assert.deepEqual(
+        filterNewListingKeys([
+            { houseCode: 'SH123', hrefs: ['/zufang/SH123.html'] },
+            { houseCode: 'SH456', hrefs: ['/zufang/SH456.html'] },
+            { houseCode: 'SH456', hrefs: ['/zufang/SH456-copy.html'] }
+        ], seen),
+        ['house:SH456']
+    );
 });
 
 test('listing classification catches Beike preferred and apartment markers', () => {

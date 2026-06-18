@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.1.3
+// @version      0.2.0
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -19,13 +19,25 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.1.3';
+const SCRIPT_VERSION = '0.2.0';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
 const CONTENT_FILTER_HOST_LABEL = '品牌';
+const STREAM_LOAD_THRESHOLD_PX = 900;
 const DEFAULT_FILTER_STATE = Object.freeze({
     beikePreferred: true,
     apartment: true
 });
+const streamState = {
+    initialized: false,
+    loading: false,
+    list: null,
+    pager: null,
+    status: null,
+    nextPage: 0,
+    totalPage: 0,
+    pageUrlTemplate: '',
+    seenKeys: new Set()
+};
 
 function normalizeFilterState(value) {
     const source = value && typeof value === 'object' ? value : {};
@@ -51,6 +63,32 @@ function classifyListingContent(listing) {
 function shouldShowListing(kinds, state) {
     const filters = normalizeFilterState(state);
     return (filters.beikePreferred || !kinds.beikePreferred) && (filters.apartment || !kinds.apartment);
+}
+
+function buildPageUrl(template, page, baseUrl) {
+    const pageNumber = Number(page);
+    if (!template || !Number.isFinite(pageNumber) || pageNumber < 1) return '';
+    return new URL(String(template).replace('{page}', String(pageNumber)).replace(/#.*$/, ''), baseUrl).href;
+}
+
+function getListingKey(listing) {
+    const houseCode = String(listing?.houseCode || '').trim();
+    if (houseCode) return `house:${houseCode}`;
+
+    const hrefs = Array.isArray(listing?.hrefs) ? listing.hrefs : [];
+    const href = hrefs.map((value) => String(value || '').trim()).find(Boolean);
+    return href ? `href:${href}` : '';
+}
+
+function filterNewListingKeys(listings, seenKeys) {
+    const result = [];
+    listings.forEach((listing) => {
+        const key = getListingKey(listing);
+        if (!key || seenKeys.has(key)) return;
+        seenKeys.add(key);
+        result.push(key);
+    });
+    return result;
 }
 
 function parseStoredFilterState(rawValue) {
@@ -128,6 +166,7 @@ function getCurrentFilterState(row) {
 function getListingData(card) {
     const hrefs = Array.from(card.querySelectorAll('a[href]')).map((link) => link.getAttribute('href') || '');
     return {
+        houseCode: card.getAttribute('data-house_code') || '',
         text: (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim(),
         hrefs
     };
@@ -154,7 +193,10 @@ function installStyles() {
         '.lj-content-filter__item{height:27px;line-height:27px;}',
         '.lj-content-filter__option{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:#394043;font-size:12px;}',
         '.lj-content-filter__option input{width:13px;height:13px;margin:0;accent-color:#00ae66;}',
-        '.lj-content-filter__option span{line-height:27px;}'
+        '.lj-content-filter__option span{line-height:27px;}',
+        '.lj-stream-hidden-pager{display:none!important;}',
+        '.lj-stream-status{margin:24px 0 8px;text-align:center;color:#888;font-size:13px;line-height:32px;}',
+        '.lj-stream-status[data-clickable="true"]{cursor:pointer;color:#00ae66;}'
     ].join('');
 
     if (typeof GM_addStyle === 'function') {
@@ -210,6 +252,155 @@ function scheduleApply() {
     }, 80);
 }
 
+function applyCurrentFilters() {
+    const hostRow = ensureFilterControls();
+    applyFilters(hostRow ? getCurrentFilterState(hostRow) : readStoredFilterState());
+}
+
+function findPagination() {
+    return document.querySelector('.content__pg[data-url][data-totalpage][data-curpage]');
+}
+
+function parsePositiveInteger(value) {
+    const number = Number.parseInt(value, 10);
+    return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function collectSeenListingKeys() {
+    streamState.seenKeys = new Set();
+    document.querySelectorAll('.content__list--item').forEach((card) => {
+        const key = getListingKey(getListingData(card));
+        if (key) streamState.seenKeys.add(key);
+    });
+}
+
+function ensureStreamStatus() {
+    if (streamState.status?.isConnected) return streamState.status;
+    const status = document.createElement('div');
+    status.className = 'lj-stream-status';
+    status.dataset.ljStreamStatus = 'true';
+    status.addEventListener('click', () => {
+        if (status.dataset.clickable === 'true') {
+            loadNextPage();
+        }
+    });
+    streamState.pager.after(status);
+    streamState.status = status;
+    return status;
+}
+
+function setStreamStatus(text, clickable = false) {
+    const status = ensureStreamStatus();
+    status.textContent = text;
+    status.dataset.clickable = clickable ? 'true' : 'false';
+}
+
+function updateStreamPager(pager, keepCurrentPager = true) {
+    if (keepCurrentPager) {
+        streamState.pager = pager;
+        pager.classList.add('lj-stream-hidden-pager');
+    }
+    streamState.pageUrlTemplate = pager.getAttribute('data-url') || streamState.pageUrlTemplate;
+    streamState.totalPage = parsePositiveInteger(pager.getAttribute('data-totalpage')) || streamState.totalPage;
+    const currentPage = parsePositiveInteger(pager.getAttribute('data-curpage'));
+    streamState.nextPage = currentPage && currentPage < streamState.totalPage ? currentPage + 1 : 0;
+}
+
+function updateStreamReadyStatus() {
+    if (streamState.nextPage) {
+        setStreamStatus('向下滚动加载更多房源');
+    } else {
+        setStreamStatus('已加载全部房源');
+    }
+}
+
+function getCardsFromDocument(doc) {
+    return Array.from(doc.querySelectorAll('.content__list--item'));
+}
+
+function appendNewCards(cards, page) {
+    let appended = 0;
+    cards.forEach((card) => {
+        const key = getListingKey(getListingData(card));
+        if (!key || streamState.seenKeys.has(key)) return;
+        streamState.seenKeys.add(key);
+        const imported = document.importNode(card, true);
+        imported.dataset.ljStreamPage = String(page);
+        streamState.list.append(imported);
+        appended += 1;
+    });
+    return appended;
+}
+
+async function loadNextPage() {
+    if (streamState.loading || !streamState.nextPage) return;
+
+    const page = streamState.nextPage;
+    const nextUrl = buildPageUrl(streamState.pageUrlTemplate, page, window.location.href);
+    if (!nextUrl) return;
+
+    streamState.loading = true;
+    setStreamStatus(`正在加载第 ${page} 页...`);
+
+    try {
+        const response = await fetch(nextUrl, { credentials: 'same-origin' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const cards = getCardsFromDocument(doc);
+        const appended = appendNewCards(cards, page);
+        const nextPager = doc.querySelector('.content__pg[data-url][data-totalpage][data-curpage]');
+        if (nextPager) {
+            updateStreamPager(nextPager, false);
+        } else {
+            streamState.nextPage = page < streamState.totalPage ? page + 1 : 0;
+        }
+        if (streamState.pager) {
+            streamState.pager.setAttribute('data-curpage', String(page));
+        }
+        applyCurrentFilters();
+        updateStreamReadyStatus();
+        if (!appended && streamState.nextPage) {
+            loadNextPage();
+        }
+    } catch {
+        setStreamStatus('加载失败，点击重试', true);
+    } finally {
+        streamState.loading = false;
+    }
+}
+
+function shouldLoadMore() {
+    if (!streamState.nextPage || streamState.loading) return false;
+    const distanceToBottom = document.documentElement.scrollHeight - window.innerHeight - window.pageYOffset;
+    return distanceToBottom <= STREAM_LOAD_THRESHOLD_PX;
+}
+
+function onStreamScroll() {
+    if (shouldLoadMore()) {
+        loadNextPage();
+    }
+}
+
+function initInfiniteScroll() {
+    if (streamState.initialized) return;
+
+    const list = document.querySelector('.content__list');
+    const pager = findPagination();
+    if (!list || !pager) return;
+
+    streamState.initialized = true;
+    streamState.list = list;
+    updateStreamPager(pager);
+    collectSeenListingKeys();
+    ensureStreamStatus();
+    updateStreamReadyStatus();
+
+    window.addEventListener('scroll', onStreamScroll, { passive: true });
+    window.addEventListener('resize', onStreamScroll, { passive: true });
+    window.setTimeout(onStreamScroll, 100);
+}
+
 function startContentObserver() {
     const observer = new MutationObserver((mutations) => {
         if (mutations.some((mutation) => mutation.addedNodes.length || mutation.removedNodes.length)) {
@@ -223,13 +414,17 @@ function init() {
     if (!/^https:\/\/[^/]+\.lianjia\.com\/(?:ditiezufang|zufang)\//.test(window.location.href)) return;
     installStyles();
     scheduleApply();
+    initInfiniteScroll();
     startContentObserver();
 }
 
 const api = {
+    buildPageUrl,
     CONTENT_FILTER_HOST_LABEL,
     DEFAULT_FILTER_STATE,
     classifyListingContent,
+    filterNewListingKeys,
+    getListingKey,
     normalizeFilterState,
     parseStoredFilterState,
     serializeFilterState,
