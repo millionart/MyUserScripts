@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.29
+// @version      2.15.31
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -11,6 +11,7 @@
 // @match        *://twitter.com/*
 // @exclude      *://x.com/settings*
 // @exclude      *://twitter.com/settings*
+// @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -33,6 +34,14 @@
 // ==/UserScript==
 (function () {
 'use strict';
+function isTopLevelWindow() {
+    try {
+        return window.self === window.top;
+    } catch {
+        return false;
+    }
+}
+if (!isTopLevelWindow()) return;
 // --- CONFIG & CONSTANTS ---
 const MENU_ITEM_TEXT = "九族拉黑";
 const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4-6.8c0-4.1,3.4-7.5,7.5-7.5S19.5,7.9,19.5,12z M12,6c-2.2,0-4,1.8-4,4s1.8,4,4,4s4-1.8,4-4S14.2,6,12,6z M12,14c-1.1,0-2-0.9-2-2c0-0.4,0.1-0.7,0.3-1H10v-2h1.3c-0.2-0.3-0.3-0.6-0.3-1c0-1.1,0.9-2,2-2s2,0.9,2,2c0,0.4-0.1,0.7-0.3,1H14v2h-1.3c0.2,0.3,0.3,0.6,0.3,1C14,13.1,13.1,14,12,14z";
@@ -73,7 +82,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.29';
+const SPAM_SCANNER_BUILD = '2.15.31';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -916,6 +925,12 @@ function getStatusTweetIdFromHref(href) {
     } catch {
         return source.match(/\/status\/(\d+)/i)?.[1] || '';
     }
+}
+function isStatusTweetPage() {
+    return /\/status\/\d+/i.test(window.location.pathname);
+}
+function shouldRunArticleDetectionScans() {
+    return isStatusTweetPage();
 }
 function getCurrentStatusPageInfo() {
     const parts = window.location.pathname.split('/').filter(Boolean);
@@ -2508,7 +2523,7 @@ function updateManualDetectedNukeButton() {
 }
 function ensureManualDetectedNukeButton() {
     const existing = document.getElementById('nuke-manual-detected-nuke-button');
-    if (isAutoNukeEnabled()) {
+    if (isAutoNukeEnabled() || !shouldRunArticleDetectionScans()) {
         existing?.remove();
         return;
     }
@@ -3066,7 +3081,7 @@ const SPAM_EXPAND_LABEL_RE = /垃圾|spam|冒犯|offensive|可疑|probable|隐�
 const HIDDEN_SPAM_EXPAND_RE = /显示可能的垃圾|Show probable spam|probable spam|可能含有垃圾|冒犯性回复|Offensive replies/i;
 function tryExpandHiddenSpamReplies() {
     if (scriptConfig.spamAutoExpandHidden === false || scriptConfig.spamIdentifyEnabled === false) return;
-    if (!/\/status\/\d+/i.test(window.location.pathname)) return;
+    if (!isStatusTweetPage()) return;
     if (window.__cbHiddenSpamExpandPath === window.location.pathname) return;
     const expandButton = [...document.querySelectorAll('[role="button"], button, a, div[tabindex="0"]')].find((element) => {
         const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
@@ -3141,7 +3156,7 @@ function scheduleSpamRescanDebounced() {
     }, 120);
 }
 function scanSpamIdentifyContent() {
-    if (!currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
+    if (!shouldRunArticleDetectionScans() || !currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
     void (async () => {
         if (await getActiveApiRateLimitState()) return;
         if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
@@ -4445,6 +4460,10 @@ async function processAutoBlockArticle(article, userData) {
     }
 }
 function scanAndProcessContent() {
+    if (!shouldRunArticleDetectionScans()) {
+        ensureManualDetectedNukeButton();
+        return;
+    }
     document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
     if (!currentUserId) return;
     void (async () => {
@@ -4649,6 +4668,7 @@ async function initialize() {
     }
 }
 const observer = new MutationObserver(mutations => {
+    const canRunArticleScans = shouldRunArticleDetectionScans();
     let shouldScanSpam = false;
     for (const mutation of mutations) {
         if (mutation.addedNodes.length) {
@@ -4660,7 +4680,7 @@ const observer = new MutationObserver(mutations => {
                         addVerificationButton(menu);
                         addSpamInspectButton(menu);
                     }
-                    if (node.matches?.('article[data-testid="tweet"]') || node.querySelector?.('article[data-testid="tweet"]')) {
+                    if (canRunArticleScans && (node.matches?.('article[data-testid="tweet"]') || node.querySelector?.('article[data-testid="tweet"]'))) {
                         shouldScanSpam = true;
                     }
                 }
@@ -4688,6 +4708,10 @@ document.addEventListener('click', e => {
 }, true);
 observer.observe(document.body, { childList: true, subtree: true });
 setInterval(() => {
+    if (!shouldRunArticleDetectionScans()) {
+        ensureManualDetectedNukeButton();
+        return;
+    }
     scanAndProcessContent();
     scanSpamIdentifyContent();
 }, AUTO_SCAN_INTERVAL_MS);
