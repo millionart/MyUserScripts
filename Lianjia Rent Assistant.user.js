@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.3.3
+// @version      0.5.7
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -20,13 +20,19 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.3.3';
+const SCRIPT_VERSION = '0.5.7';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
+const MAP_CACHE_STORAGE_KEY = 'LIANJIA_RENT_MAP_LISTING_CACHE';
+const AUTO_FETCH_STORAGE_KEY = 'LIANJIA_RENT_MAP_AUTO_FETCH_STATE';
+const MAP_CACHE_VERSION = 1;
 const CONTENT_FILTER_HOST_LABEL = '品牌';
 const STREAM_LOAD_THRESHOLD_PX = 900;
 const BAIDU_MAP_AK = 'djAasQ167kYWRGbjL2az8aGmHBUmXp4V';
 const MAP_DETAIL_FETCH_LIMIT = 1;
 const MAP_DETAIL_FETCH_DELAY_MS = 900;
+const MAP_DETAIL_FETCH_TIMEOUT_MS = 10000;
+const AUTO_FETCH_PAGE_DELAY_MS = 2500;
+const AUTO_FETCH_RETRY_DELAYS_MS = [20000, 20000, 20000];
 const DEFAULT_FILTER_STATE = Object.freeze({
     beikePreferred: true,
     apartment: true
@@ -51,12 +57,18 @@ const mapState = {
     map: null,
     mapScriptPromise: null,
     mapReadyPromise: null,
+    autoFetchControl: null,
+    autoFetchStatus: null,
+    autoFetchState: null,
+    autoFetchLoading: false,
+    autoFetchTimer: 0,
     queuedKeys: new Set(),
     fetchedListings: new Map(),
     failedKeys: new Set(),
     activeFetches: 0,
     pendingRecords: [],
-    blocked: false
+    blocked: false,
+    cache: null
 };
 
 function normalizeFilterState(value) {
@@ -83,6 +95,78 @@ function classifyListingContent(listing) {
 function shouldShowListing(kinds, state) {
     const filters = normalizeFilterState(state);
     return (filters.beikePreferred || !kinds.beikePreferred) && (filters.apartment || !kinds.apartment);
+}
+
+function normalizeListingKinds(value) {
+    if (!value || typeof value !== 'object') return null;
+    return {
+        beikePreferred: value.beikePreferred === true,
+        apartment: value.apartment === true
+    };
+}
+
+function normalizeAutoFetchState(value) {
+    let source = value;
+    if (typeof source === 'string') {
+        try {
+            source = JSON.parse(source);
+        } catch {
+            source = {};
+        }
+    }
+
+    const progress = {};
+    const rawProgress = source?.progress && typeof source.progress === 'object' ? source.progress : {};
+    Object.entries(rawProgress).forEach(([key, page]) => {
+        const pageNumber = Number.parseInt(page, 10);
+        if (key && Number.isFinite(pageNumber) && pageNumber > 0) {
+            progress[key] = pageNumber;
+        }
+    });
+    const retryCount = Number.parseInt(source?.retryCount, 10);
+    const state = {
+        enabled: source?.enabled === true,
+        progress
+    };
+    if (Number.isFinite(retryCount) && retryCount > 0) {
+        state.retryCount = retryCount;
+    }
+    return state;
+}
+
+function getAutoFetchNextPage(state, searchKey, currentPage, totalPage) {
+    const normalized = normalizeAutoFetchState(state);
+    const current = parsePositiveInteger(currentPage);
+    const total = parsePositiveInteger(totalPage);
+    const fetched = parsePositiveInteger(normalized.progress[searchKey]);
+    const baseline = Math.max(current, fetched);
+    return total && baseline < total ? baseline + 1 : 0;
+}
+
+function markAutoFetchPageFetched(state, searchKey, page) {
+    const normalized = normalizeAutoFetchState(state);
+    const pageNumber = parsePositiveInteger(page);
+    if (!searchKey || !pageNumber) return normalized;
+    normalized.progress[searchKey] = Math.max(parsePositiveInteger(normalized.progress[searchKey]), pageNumber);
+    return normalized;
+}
+
+function getAutoFetchRetryDelay(state) {
+    const retryCount = Math.max(0, Number.parseInt(state?.retryCount, 10) || 0);
+    const index = Math.min(retryCount, AUTO_FETCH_RETRY_DELAYS_MS.length - 1);
+    return AUTO_FETCH_RETRY_DELAYS_MS[index];
+}
+
+function markAutoFetchCaptchaRetry(state) {
+    const normalized = normalizeAutoFetchState(state);
+    normalized.retryCount = Math.min((normalized.retryCount || 0) + 1, AUTO_FETCH_RETRY_DELAYS_MS.length);
+    return normalized;
+}
+
+function resetAutoFetchRetry(state) {
+    const normalized = normalizeAutoFetchState(state);
+    delete normalized.retryCount;
+    return normalized;
 }
 
 function buildPageUrl(template, page, baseUrl) {
@@ -153,6 +237,104 @@ function extractMapPointFromDetailHtml(html) {
     return lonFirst ? normalizeMapPoint({ longitude: lonFirst[1], latitude: lonFirst[2] }) : null;
 }
 
+function normalizeCachedMapRecord(record, fallbackUpdatedAt) {
+    const key = String(record?.key || '').trim();
+    const detailUrl = String(record?.detailUrl || '').trim();
+    if (!key || !detailUrl) return null;
+
+    const updatedAt = Number(record?.updatedAt);
+    const normalized = {
+        key,
+        detailUrl,
+        title: String(record?.title || ''),
+        price: String(record?.price || ''),
+        updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : fallbackUpdatedAt
+    };
+    const point = normalizeMapPoint(record?.point);
+    if (point) normalized.point = point;
+    const kinds = normalizeListingKinds(record?.kinds);
+    if (kinds) normalized.kinds = kinds;
+    const searchKeys = Array.isArray(record?.searchKeys)
+        ? record.searchKeys.map((value) => String(value || '').trim()).filter(Boolean)
+        : [];
+    if (searchKeys.length) normalized.searchKeys = Array.from(new Set(searchKeys));
+    return normalized;
+}
+
+function parseStoredMapCache(rawValue) {
+    let source = rawValue;
+    if (typeof source === 'string') {
+        try {
+            source = JSON.parse(source);
+        } catch {
+            source = {};
+        }
+    }
+
+    const result = { version: MAP_CACHE_VERSION, listings: {} };
+    const listings = source?.listings && typeof source.listings === 'object' ? source.listings : {};
+    Object.values(listings).forEach((record) => {
+        const normalized = normalizeCachedMapRecord(record, Number(record?.updatedAt) || Date.now());
+        if (normalized) result.listings[normalized.key] = normalized;
+    });
+    return result;
+}
+
+function mergeMapCacheRecords(cache, records, updatedAt = Date.now(), sourceKey = '') {
+    const next = parseStoredMapCache(cache);
+    records.forEach((record) => {
+        const key = String(record?.key || '').trim();
+        const existing = next.listings[key];
+        const existingPoint = normalizeMapPoint(existing?.point);
+        const incomingPoint = normalizeMapPoint(record?.point);
+        const searchKeys = [
+            ...(Array.isArray(existing?.searchKeys) ? existing.searchKeys : []),
+            ...(Array.isArray(record?.searchKeys) ? record.searchKeys : []),
+            sourceKey
+        ].map((value) => String(value || '').trim()).filter(Boolean);
+        const normalized = normalizeCachedMapRecord({
+            ...existing,
+            ...record,
+            point: incomingPoint || existingPoint,
+            searchKeys,
+            updatedAt
+        }, updatedAt);
+        if (normalized) next.listings[normalized.key] = normalized;
+    });
+    return next;
+}
+
+function getSearchCacheRecords(cache, searchKey, filterState) {
+    const filters = normalizeFilterState(filterState);
+    return Object.values(parseStoredMapCache(cache).listings).filter((record) => {
+        if (!Array.isArray(record.searchKeys) || !record.searchKeys.includes(searchKey)) return false;
+        const kinds = normalizeListingKinds(record.kinds);
+        return !kinds || shouldShowListing(kinds, filters);
+    });
+}
+
+function filterMapRecordsByState(records, filterState) {
+    const filters = normalizeFilterState(filterState);
+    return records.filter((record) => {
+        const kinds = normalizeListingKinds(record?.kinds);
+        return !kinds || shouldShowListing(kinds, filters);
+    });
+}
+
+function hydrateMapRecordsFromCache(records, cache) {
+    const parsed = parseStoredMapCache(cache);
+    return records.map((record) => {
+        const cached = parsed.listings[String(record?.key || '').trim()];
+        const point = normalizeMapPoint(cached?.point);
+        if (!point) return record;
+        return {
+            ...record,
+            point,
+            updatedAt: cached.updatedAt
+        };
+    });
+}
+
 function parseStoredFilterState(rawValue) {
     if (!rawValue) return DEFAULT_FILTER_STATE;
     if (typeof rawValue === 'string') {
@@ -186,6 +368,54 @@ function writeStoredFilterState(state) {
         window.localStorage?.setItem(STORAGE_KEY, serialized);
     } catch {
         // Degraded environments can still filter for the current page session.
+    }
+}
+
+function readStoredMapCache() {
+    if (typeof GM_getValue === 'function') {
+        return parseStoredMapCache(GM_getValue(MAP_CACHE_STORAGE_KEY, null));
+    }
+    try {
+        return parseStoredMapCache(window.localStorage?.getItem(MAP_CACHE_STORAGE_KEY));
+    } catch {
+        return parseStoredMapCache(null);
+    }
+}
+
+function writeStoredMapCache(cache) {
+    const serialized = JSON.stringify(parseStoredMapCache(cache));
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(MAP_CACHE_STORAGE_KEY, serialized);
+        return;
+    }
+    try {
+        window.localStorage?.setItem(MAP_CACHE_STORAGE_KEY, serialized);
+    } catch {
+        // Map points still work for the current page session when storage is unavailable.
+    }
+}
+
+function readStoredAutoFetchState() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeAutoFetchState(GM_getValue(AUTO_FETCH_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeAutoFetchState(window.localStorage?.getItem(AUTO_FETCH_STORAGE_KEY));
+    } catch {
+        return normalizeAutoFetchState(null);
+    }
+}
+
+function writeStoredAutoFetchState(state) {
+    const serialized = JSON.stringify(normalizeAutoFetchState(state));
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(AUTO_FETCH_STORAGE_KEY, serialized);
+        return;
+    }
+    try {
+        window.localStorage?.setItem(AUTO_FETCH_STORAGE_KEY, serialized);
+    } catch {
+        // The toggle still works for the current page session when storage is unavailable.
     }
 }
 
@@ -262,6 +492,9 @@ function installStyles() {
         '.lj-rent-map-panel{margin:10px 0 18px;border:1px solid #e5e5e5;background:#fff;}',
         '.lj-rent-map-panel__header{display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 14px;border-bottom:1px solid #f0f0f0;color:#394043;font-size:14px;}',
         '.lj-rent-map-panel__header strong{font-weight:600;}',
+        '.lj-rent-map-panel__actions{display:flex;align-items:center;gap:12px;}',
+        '.lj-rent-map-auto{display:inline-flex;align-items:center;gap:5px;color:#666;font-size:12px;cursor:pointer;white-space:nowrap;}',
+        '.lj-rent-map-auto input{width:13px;height:13px;margin:0;accent-color:#00ae66;}',
         '.lj-rent-map-panel__status{color:#888;font-size:12px;}',
         '.lj-rent-map-panel__canvas{height:360px;background:#f7f7f7;}',
         '.lj-rent-map-info{min-width:180px;max-width:260px;color:#394043;line-height:1.5;}',
@@ -367,7 +600,8 @@ function getMapRecordFromCard(card) {
         key,
         detailUrl,
         title: getListingTitle(card),
-        price: getListingPrice(card)
+        price: getListingPrice(card),
+        kinds: classifyListingContent(listing)
     };
 }
 
@@ -375,11 +609,64 @@ function isVisibleMapCard(card) {
     return card.dataset.ljContentFilterHidden !== 'true' && card.style.display !== 'none';
 }
 
+function getLoadedMapRecords() {
+    return Array.from(document.querySelectorAll('.content__list--item'))
+        .map(getMapRecordFromCard)
+        .filter(Boolean);
+}
+
 function getVisibleMapRecords() {
     return Array.from(document.querySelectorAll('.content__list--item'))
         .filter(isVisibleMapCard)
         .map(getMapRecordFromCard)
         .filter(Boolean);
+}
+
+function ensureMapCache() {
+    if (!mapState.cache) {
+        mapState.cache = readStoredMapCache();
+    }
+    return mapState.cache;
+}
+
+function rememberMapRecords(records, searchKey = '') {
+    if (!records.length) return;
+    mapState.cache = mergeMapCacheRecords(ensureMapCache(), records, Date.now(), searchKey);
+    writeStoredMapCache(mapState.cache);
+}
+
+function getCurrentMapFilterState() {
+    const hostRow = findFilterHostRow();
+    return hostRow ? getCurrentFilterState(hostRow) : readStoredFilterState();
+}
+
+function getCurrentSearchKey() {
+    const pageKey = streamState.pageUrlTemplate || findPagination()?.getAttribute('data-url') || window.location.pathname;
+    return `${pageKey}#filters=${serializeFilterState(getCurrentMapFilterState())}`;
+}
+
+function mergeMapRecordsByKey(records) {
+    const merged = new Map();
+    records.forEach((record) => {
+        if (!record?.key) return;
+        merged.set(record.key, { ...merged.get(record.key), ...record });
+    });
+    return Array.from(merged.values());
+}
+
+function getCurrentMapRecords() {
+    const cache = ensureMapCache();
+    const searchKey = getCurrentSearchKey();
+    const records = hydrateMapRecordsFromCache(mergeMapRecordsByKey([
+        ...getSearchCacheRecords(cache, searchKey, getCurrentMapFilterState()),
+        ...getVisibleMapRecords()
+    ]), cache);
+    records.forEach((record) => {
+        if (record.point) {
+            mapState.fetchedListings.set(record.key, record);
+        }
+    });
+    return records;
 }
 
 function findResultTitle() {
@@ -410,11 +697,15 @@ function ensureMapPanel() {
     status.dataset.ljRentMapStatus = 'true';
     status.textContent = '正在读取坐标...';
 
+    const actions = document.createElement('div');
+    actions.className = 'lj-rent-map-panel__actions';
+    actions.append(buildAutoFetchControl(), status);
+
     const canvas = document.createElement('div');
     canvas.className = 'lj-rent-map-panel__canvas';
     canvas.id = 'lj-rent-map-canvas';
 
-    header.append(heading, status);
+    header.append(heading, actions);
     panel.append(header, canvas);
     title.after(panel);
 
@@ -429,9 +720,60 @@ function setMapStatus(text) {
     if (mapState.status) mapState.status.textContent = text;
 }
 
+function getAutoFetchState() {
+    if (!mapState.autoFetchState) {
+        mapState.autoFetchState = readStoredAutoFetchState();
+    }
+    return mapState.autoFetchState;
+}
+
+function saveAutoFetchState(state) {
+    mapState.autoFetchState = normalizeAutoFetchState(state);
+    writeStoredAutoFetchState(mapState.autoFetchState);
+}
+
+function setAutoFetchStatus(text) {
+    if (mapState.autoFetchStatus) {
+        mapState.autoFetchStatus.textContent = text;
+    }
+}
+
+function buildAutoFetchControl() {
+    const state = getAutoFetchState();
+    const label = document.createElement('label');
+    label.className = 'lj-rent-map-auto';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = state.enabled;
+    input.dataset.ljRentMapAutoFetch = 'true';
+
+    const text = document.createElement('span');
+    text.textContent = '自动抓取';
+
+    const status = document.createElement('span');
+    status.className = 'lj-rent-map-auto__status';
+    status.dataset.ljRentMapAutoFetchStatus = 'true';
+    status.textContent = state.enabled ? '等待中' : '';
+
+    input.addEventListener('change', () => {
+        saveAutoFetchState({ ...getAutoFetchState(), enabled: input.checked });
+        if (input.checked) {
+            startAutoFetch();
+        } else {
+            stopAutoFetch();
+        }
+    });
+
+    label.append(input, text, status);
+    mapState.autoFetchControl = input;
+    mapState.autoFetchStatus = status;
+    return label;
+}
+
 function updateMapStatus(records) {
     if (mapState.blocked) {
-        setMapStatus('遇到验证，暂停读取坐标');
+        setMapStatus('遇到验证，稍后重试');
         return;
     }
 
@@ -518,7 +860,7 @@ function buildInfoWindowHtml(record) {
 }
 
 function renderListingMap() {
-    const records = getVisibleMapRecords();
+    const records = getCurrentMapRecords();
     updateMapStatus(records);
 
     const mappedRecords = records
@@ -554,15 +896,41 @@ function renderListingMap() {
 }
 
 async function fetchMapRecord(record) {
-    const response = await fetch(record.detailUrl, { credentials: 'same-origin' });
+    const response = await fetchWithTimeout(record.detailUrl, { credentials: 'same-origin' }, MAP_DETAIL_FETCH_TIMEOUT_MS);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
-    if (/\/captcha(?:\?|$)/.test(response.url) || /hip\.lianjia\.com\/captcha|人机验证/.test(html)) {
+    if (isCaptchaResponse(response, html)) {
         throw new Error('captcha');
     }
     const point = extractMapPointFromDetailHtml(html);
     if (!point) throw new Error('coordinate missing');
-    mapState.fetchedListings.set(record.key, { ...record, point });
+    const cachedRecord = { ...record, point };
+    mapState.fetchedListings.set(record.key, cachedRecord);
+    rememberMapRecords([cachedRecord]);
+}
+
+function fetchWithTimeout(url, options = {}, timeoutMs = MAP_DETAIL_FETCH_TIMEOUT_MS, fetchImpl = fetch) {
+    if (typeof AbortController !== 'function' || !timeoutMs) {
+        return fetchImpl(url, options);
+    }
+
+    const controller = new AbortController();
+    const timerApi = typeof window === 'object' ? window : globalThis;
+    const timeoutId = timerApi.setTimeout(() => controller.abort(), timeoutMs);
+    return fetchImpl(url, { ...options, signal: controller.signal }).finally(() => {
+        timerApi.clearTimeout(timeoutId);
+    });
+}
+
+function isCaptchaResponse(response, html) {
+    return /\/captcha(?:\?|$)/.test(response?.url || '') || /hip\.lianjia\.com\/captcha|人机验证|CAPTCHA/.test(String(html || ''));
+}
+
+function releaseQueuedMapRecordKeys(queuedKeys, records) {
+    records.forEach((record) => {
+        if (record?.key) queuedKeys.delete(record.key);
+    });
+    return queuedKeys;
 }
 
 function processMapQueue() {
@@ -574,9 +942,9 @@ function processMapQueue() {
         fetchMapRecord(record)
             .catch((error) => {
                 if (error?.message === 'captcha') {
-                    mapState.blocked = true;
+                    pauseForCaptchaRetry();
+                    releaseQueuedMapRecordKeys(mapState.queuedKeys, mapState.pendingRecords);
                     mapState.pendingRecords = [];
-                    setMapStatus('遇到验证，暂停读取坐标');
                     return;
                 }
                 mapState.failedKeys.add(record.key);
@@ -602,10 +970,121 @@ function enqueueMapRecords(records) {
     });
 }
 
+function getCurrentPageNumber() {
+    return parsePositiveInteger(streamState.pager?.getAttribute('data-curpage'))
+        || parsePositiveInteger(findPagination()?.getAttribute('data-curpage'))
+        || 1;
+}
+
+function getCurrentTotalPage() {
+    return streamState.totalPage || parsePositiveInteger(findPagination()?.getAttribute('data-totalpage'));
+}
+
+function getAutoFetchPageUrl(page) {
+    const template = streamState.pageUrlTemplate || findPagination()?.getAttribute('data-url') || '';
+    return buildPageUrl(template, page, window.location.href);
+}
+
+function stopAutoFetch() {
+    window.clearTimeout(mapState.autoFetchTimer);
+    mapState.autoFetchTimer = 0;
+    mapState.autoFetchLoading = false;
+    setAutoFetchStatus('');
+}
+
+function scheduleAutoFetch(delay = AUTO_FETCH_PAGE_DELAY_MS) {
+    window.clearTimeout(mapState.autoFetchTimer);
+    if (!getAutoFetchState().enabled) return;
+    mapState.autoFetchTimer = window.setTimeout(runAutoFetchStep, delay);
+}
+
+function startAutoFetch() {
+    if (mapState.blocked) {
+        setAutoFetchStatus('等待重试');
+        scheduleAutoFetch(getAutoFetchRetryDelay(getAutoFetchState()));
+        return;
+    }
+    setAutoFetchStatus('等待中');
+    scheduleAutoFetch(0);
+}
+
+function refreshMapAfterAutoFetchStep() {
+    const currentRecords = getCurrentMapRecords();
+    enqueueMapRecords(currentRecords);
+    updateMapStatus(currentRecords);
+    processMapQueue();
+    renderListingMap();
+}
+
+function pauseForCaptchaRetry() {
+    mapState.blocked = true;
+    const currentState = getAutoFetchState();
+    const delay = getAutoFetchRetryDelay(currentState);
+    const state = markAutoFetchCaptchaRetry(currentState);
+    saveAutoFetchState(state);
+    setAutoFetchStatus(`遇到验证，${Math.round(delay / 1000)} 秒后重试`);
+    setMapStatus('遇到验证，稍后重试');
+    scheduleAutoFetch(delay);
+}
+
+async function runAutoFetchStep() {
+    if (!getAutoFetchState().enabled || mapState.autoFetchLoading) return;
+    if (mapState.blocked) {
+        mapState.blocked = false;
+    }
+
+    const searchKey = getCurrentSearchKey();
+    const page = getAutoFetchNextPage(getAutoFetchState(), searchKey, getCurrentPageNumber(), getCurrentTotalPage());
+    if (!page) {
+        setAutoFetchStatus('已全部抓取');
+        refreshMapAfterAutoFetchStep();
+        return;
+    }
+
+    const pageUrl = getAutoFetchPageUrl(page);
+    if (!pageUrl) {
+        setAutoFetchStatus('无分页');
+        return;
+    }
+
+    mapState.autoFetchLoading = true;
+    setAutoFetchStatus(`第 ${page} 页`);
+
+    try {
+        const response = await fetch(pageUrl, { credentials: 'same-origin' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        if (isCaptchaResponse(response, html)) throw new Error('captcha');
+
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const records = filterMapRecordsByState(
+            getCardsFromDocument(doc).map(getMapRecordFromCard).filter(Boolean),
+            getCurrentMapFilterState()
+        );
+        rememberMapRecords(records, searchKey);
+        saveAutoFetchState(resetAutoFetchRetry(markAutoFetchPageFetched(getAutoFetchState(), searchKey, page)));
+
+        refreshMapAfterAutoFetchStep();
+        setAutoFetchStatus(`已到 ${page} 页`);
+        scheduleAutoFetch();
+    } catch (error) {
+        if (error?.message === 'captcha') {
+            pauseForCaptchaRetry();
+            return;
+        }
+        setAutoFetchStatus('抓取失败');
+        scheduleAutoFetch(AUTO_FETCH_PAGE_DELAY_MS * 2);
+    } finally {
+        mapState.autoFetchLoading = false;
+    }
+}
+
 function refreshListingMap() {
     if (!ensureMapPanel()) return;
 
-    const records = getVisibleMapRecords();
+    const searchKey = getCurrentSearchKey();
+    rememberMapRecords(filterMapRecordsByState(getLoadedMapRecords(), getCurrentMapFilterState()), searchKey);
+    const records = getCurrentMapRecords();
     enqueueMapRecords(records);
     updateMapStatus(records);
     processMapQueue();
@@ -616,7 +1095,11 @@ function initListingMap() {
     if (mapState.initialized) return;
     if (!ensureMapPanel()) return;
     mapState.initialized = true;
+    ensureMapCache();
     refreshListingMap();
+    if (getAutoFetchState().enabled) {
+        startAutoFetch();
+    }
 }
 
 function findPagination() {
@@ -808,12 +1291,25 @@ const api = {
     DEFAULT_FILTER_STATE,
     classifyListingContent,
     extractMapPointFromDetailHtml,
+    fetchWithTimeout,
+    filterMapRecordsByState,
     filterNewListingKeys,
+    getAutoFetchNextPage,
+    getAutoFetchRetryDelay,
     getListingDetailUrl,
     getListingKey,
+    getSearchCacheRecords,
+    hydrateMapRecordsFromCache,
+    markAutoFetchCaptchaRetry,
+    markAutoFetchPageFetched,
+    mergeMapCacheRecords,
+    normalizeAutoFetchState,
     normalizeMapPoint,
     normalizeFilterState,
+    parseStoredMapCache,
     parseStoredFilterState,
+    releaseQueuedMapRecordKeys,
+    resetAutoFetchRetry,
     serializeFilterState,
     shouldShowListing
 };
