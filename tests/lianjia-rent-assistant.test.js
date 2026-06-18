@@ -8,9 +8,12 @@ const {
     DEFAULT_FILTER_STATE,
     buildPageUrl,
     classifyListingContent,
+    extractMapPointFromDetailHtml,
     filterNewListingKeys,
+    getListingDetailUrl,
     getListingKey,
     normalizeFilterState,
+    normalizeMapPoint,
     serializeFilterState,
     shouldShowListing
 } = require('../Lianjia Rent Assistant.user.js');
@@ -63,6 +66,36 @@ test('listing keys prefer stable house codes and skip duplicates', () => {
             { houseCode: 'SH456', hrefs: ['/zufang/SH456-copy.html'] }
         ], seen),
         ['house:SH456']
+    );
+});
+
+test('listing detail URLs are normalized for rent detail pages', () => {
+    assert.equal(
+        getListingDetailUrl({ hrefs: ['/zufang/SH2176197223874822144.html', '/zufang/'] }, 'https://sh.lianjia.com/zufang/'),
+        'https://sh.lianjia.com/zufang/SH2176197223874822144.html'
+    );
+    assert.equal(
+        getListingDetailUrl({ hrefs: ['https://sh.lianjia.com/apartment/109456.html'] }, 'https://sh.lianjia.com/ditiezufang/'),
+        'https://sh.lianjia.com/apartment/109456.html'
+    );
+});
+
+test('map points are normalized and bounded to China coordinates', () => {
+    assert.deepEqual(
+        normalizeMapPoint({ longitude: '121.905235', latitude: '30.905494' }),
+        { longitude: 121.905235, latitude: 30.905494 }
+    );
+    assert.equal(normalizeMapPoint({ longitude: '0', latitude: '0' }), null);
+});
+
+test('detail HTML map points are extracted from standard and apartment templates', () => {
+    assert.deepEqual(
+        extractMapPointFromDetailHtml("g_conf.coord = { longitude: '121.905235', latitude: '30.905494' };"),
+        { longitude: 121.905235, latitude: 30.905494 }
+    );
+    assert.deepEqual(
+        extractMapPointFromDetailHtml('{"latitude":"31.24969822332007","longitude":"121.28041761711265","apartment_name":"纪王大街店"}'),
+        { longitude: 121.28041761711265, latitude: 31.24969822332007 }
     );
 });
 
