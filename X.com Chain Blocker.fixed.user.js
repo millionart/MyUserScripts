@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.31
+// @version      2.15.35
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -48,7 +48,8 @@ const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4
 const STORAGE_KEY = 'CHAIN_BLOCKER_DATA';
 const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const API_RATE_LIMIT_STATE_KEY = 'CHAIN_BLOCKER_API_RATE_LIMIT_STATE';
-const BLOCK_INTERVAL_MS = 10 * 1000;
+const BLOCK_INTERVAL_MS = 60 * 1000;
+const API_OPERATION_INTERVAL_MS = 5 * 1000;
 const API_REQUEST_TIMEOUT_MS = 12000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
 const USERNAME_LENGTH_THRESHOLD = 25;
@@ -65,6 +66,9 @@ const AVATAR_OCR_PUMP_STALL_GRACE_MS = 10000;
 const AVATAR_OCR_VISIBLE_REQUEUE_MS = 8000;
 const PROFILE_BIO_SCAN_TIMEOUT_MS = 6500;
 const PROFILE_BIO_STALE_PENDING_MS = 30000;
+const PENDING_HIDDEN_USERS_LIMIT = 2000;
+const HIDDEN_RELEASE_QUEUE_LIMIT = 2000;
+const NUKE_CAPTURE_LOG_LIMIT = 300;
 const avatarOcrCache = new Map();
 const avatarOcrQueue = [];
 const profileBioCache = new Map();
@@ -82,7 +86,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.31';
+const SPAM_SCANNER_BUILD = '2.15.35';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -995,17 +999,16 @@ function extractTwitterProfileImageId(url) {
     return match ? match[1] : '';
 }
 const FOLLOWER_COUNT_CACHE_MS = 10 * 60 * 1000;
-const FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS = 4500;
 const AUTO_SCAN_INTERVAL_MS = 2000;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
+let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false;
 let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
 const aggregatedToastState = new Map();
 const followerCountCache = new Map();
-const followerFetchPending = new Map();
 
 // --- STYLES ---
 GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;background-color:#15202b;color:white;padding:10px 15px;border-radius:12px;border:1px solid #38444d;box-shadow:0 4px 12px rgba(0,0,0,0.4);width:auto;max-width:350px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;transition:all .5s ease-out;opacity:1;transform:translateX(0)}.nuke-toast.fading-out{opacity:0;transform:translateX(20px)}.nuke-toast-title{font-weight:bold;margin-bottom:8px;font-size:16px}.nuke-toast-status{font-size:14px;margin-bottom:0;line-height:1.5}#nuke-status-toast{background-color:#253341}#nuke-api-limit-toast{background-color:#d9a100;color:#15202b;border-color:#ffc107}.nuke-config-panel,.nuke-verify-modal{position:fixed;z-index:100001;background-color:#15202b;color:white;border-radius:16px;border:1px solid #38444d;box-shadow:0 8px 24px rgba(0,0,0,0.5);width:550px;max-width:90vw;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:0;margin:0}.nuke-verify-modal{top:50%;left:50%;transform:translate(-50%,-50%)}.nuke-config-panel{max-height:calc(100vh - 16px);overflow-y:auto;transform:none;top:0;left:0}.nuke-config-panel.nuke-dialog-dragging{user-select:none;will-change:left,top}.nuke-panel-header.nuke-dialog-drag-handle{cursor:grab;touch-action:none}.nuke-panel-header.nuke-dialog-drag-handle:active{cursor:grabbing}.nuke-config-panel::backdrop,.nuke-verify-modal::backdrop{background:rgba(91,112,131,0.45)}.nuke-panel-header{display:flex;align-items:center;justify-content:space-between;height:53px;padding:0 16px;border-bottom:1px solid #38444d}.nuke-header-item{flex-basis:56px;display:flex;align-items:center}.nuke-header-item.left{justify-content:flex-start}.nuke-header-item.right{justify-content:flex-end}.nuke-config-title{font-weight:bold;font-size:20px;flex-grow:1;text-align:center}.nuke-close-button{background:0 0;border:0;padding:0;cursor:pointer;width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9999px;transition:background-color .2s ease-in-out}.nuke-close-button:hover{background-color:rgba(239,243,244,0.1)}.nuke-close-button svg{fill:white;width:20px;height:20px}.nuke-panel-content{padding:16px}.nuke-config-textarea,.nuke-verify-textarea,.nuke-list-search,.nuke-setting-item input[type=number]{user-select:text;-webkit-user-select:text;pointer-events:auto}.nuke-config-textarea,.nuke-verify-textarea{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:10px;font-size:14px;resize:vertical;box-sizing:border-box;margin-bottom:15px}.nuke-url-textarea{height:80px}.nuke-keywords-textarea{height:60px}.nuke-verify-textarea{height:110px;line-height:1.5}.nuke-config-button-container{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}.nuke-config-button.save,.nuke-config-button.copy{background-color:#eff3f4;color:#0f1419;padding:8px 16px;border-radius:20px;border:none;font-weight:bold;cursor:pointer;transition:background-color .2s}.nuke-config-button.save:hover,.nuke-config-button.copy:hover{background-color:#d7dbdc}.nuke-config-tabs{display:flex;border-bottom:1px solid #38444d;margin-bottom:15px}.nuke-config-tab{background:0 0;border:none;color:#8899a6;padding:10px 15px;cursor:pointer;font-size:15px;font-weight:700;flex-grow:1;transition:background-color .2s}.nuke-config-tab:hover{background-color:rgba(239,243,244,0.1)}.nuke-config-tab.active{color:#1d9bf0;border-bottom:2px solid #1d9bf0;margin-bottom:-1px}.nuke-config-tab-content{animation:fadeIn .3s ease-in-out;padding-top:10px}.nuke-config-tab-content.hidden{display:none}@keyframes fadeIn{from{opacity:0}to{opacity:1}}.nuke-list{max-height:280px;overflow-y:auto;padding-right:10px}.nuke-list-search{width:100%;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:8px 12px;font-size:14px;box-sizing:border-box;margin-bottom:10px}.nuke-list-entry{display:flex;justify-content:space-between;align-items:center;padding:8px 5px;border-bottom:1px solid #253341}.nuke-list-user-info{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:10px}.nuke-list-user-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nuke-list-user-handle{color:#8899a6;font-size:14px;cursor:pointer}.nuke-list-user-handle:hover{text-decoration:underline}.nuke-list-block-reason{display:block;font-size:12px;color:#8899a6;margin-top:4px;line-height:1.4;word-break:break-word;white-space:normal}.nuke-list-actions{font-size:12px;color:#8899a6;white-space:nowrap;cursor:pointer;flex-shrink:0;margin-left:8px}.nuke-list-actions:hover{color:#1d9bf0}.nuke-list-user-info a{color:inherit;text-decoration:none}.nuke-list-user-info a:hover .nuke-list-user-name{text-decoration:underline}.nuke-setting-item{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.nuke-setting-item label{font-size:14px;margin-right:10px}.nuke-setting-item input[type=number]{width:80px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-setting-item select{max-width:240px;background-color:#253341;border:1px solid #38444d;border-radius:8px;color:white;padding:5px 8px;font-size:14px}.nuke-ocr-engine-item{align-items:center}.nuke-ocr-engine-controls{display:flex;align-items:center;gap:8px;flex-shrink:0}.nuke-ocr-engine-status{width:20px;height:20px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}.nuke-ocr-engine-status--idle{visibility:hidden;pointer-events:none}.nuke-ocr-engine-status svg{width:20px;height:20px;display:block}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-track{stroke:#38444d}.nuke-ocr-engine-status--loading .nuke-ocr-engine-ring-progress{stroke:#1d9bf0;transition:stroke-dashoffset .25s ease}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--done .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-fill{fill:#f4212e}.nuke-ocr-engine-status--error .nuke-ocr-engine-error-mark{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round}.nuke-ocr-engine-status--error{cursor:help}.nuke-setting-item input[type=checkbox]{height:20px;width:20px;accent-color:#1d9bf0}.nuke-settings-label{display:block;font-size:14px;color:#8899a6;margin-top:10px;margin-bottom:10px}.nuke-verify-note{font-size:14px;color:#8899a6;line-height:1.5;margin-bottom:10px}article[data-testid="tweet"].nuke-spam-identified{box-shadow:inset 0 0 0 1px rgba(255,173,31,.55);border-radius:12px}.nuke-spam-badge{display:inline-flex;align-items:center;margin:4px 12px 0;padding:2px 8px;font-size:12px;font-weight:700;color:#ffad1f;background:rgba(255,173,31,.12);border:1px solid rgba(255,173,31,.35);border-radius:9999px;cursor:help}`);
@@ -1621,6 +1624,69 @@ function textContentWithImageAlt(root) {
 function normalizePromoHandle(handle) {
     return String(handle || '').trim().replace(/^@+/, '').toLowerCase();
 }
+function getHiddenUserStorageKey(entry) {
+    const userId = entry?.userId ? String(entry.userId) : '';
+    if (userId) return `id:${userId}`;
+    const screenName = normalizePromoHandle(entry?.screenName);
+    return screenName ? `handle:${screenName}` : '';
+}
+function getHiddenUserStorageKeys(entry) {
+    const keys = [];
+    const userId = entry?.userId ? String(entry.userId) : '';
+    const screenName = normalizePromoHandle(entry?.screenName);
+    if (userId) keys.push(`id:${userId}`);
+    if (screenName) keys.push(`handle:${screenName}`);
+    return keys;
+}
+function mergePendingHiddenUserEntries(existing = [], incoming = [], now = Date.now()) {
+    const byKey = new Map();
+    (existing || []).forEach((entry) => {
+        const key = getHiddenUserStorageKey(entry);
+        if (!key) return;
+        byKey.set(key, {
+            ...entry,
+            screenName: normalizePromoHandle(entry.screenName),
+            addedAt: entry.addedAt || now,
+            lastSeenAt: entry.lastSeenAt || entry.addedAt || now
+        });
+    });
+    (incoming || []).forEach((entry) => {
+        const key = getHiddenUserStorageKey(entry);
+        if (!key) return;
+        const prev = byKey.get(key);
+        byKey.set(key, {
+            ...prev,
+            ...entry,
+            userId: entry.userId || prev?.userId || null,
+            screenName: normalizePromoHandle(entry.screenName || prev?.screenName),
+            userNameText: entry.userNameText || prev?.userNameText || normalizePromoHandle(entry.screenName || prev?.screenName),
+            addedAt: prev?.addedAt || entry.addedAt || now,
+            lastSeenAt: now
+        });
+    });
+    const limit = typeof PENDING_HIDDEN_USERS_LIMIT === 'number' ? PENDING_HIDDEN_USERS_LIMIT : 2000;
+    return Array.from(byKey.values())
+        .sort((a, b) => (b.lastSeenAt || b.addedAt || 0) - (a.lastSeenAt || a.addedAt || 0))
+        .slice(0, limit);
+}
+function queueHiddenUserRelease(userData, entry, now = Date.now()) {
+    if (!userData) return false;
+    const key = getHiddenUserStorageKey(entry);
+    if (!key) return false;
+    const releases = Array.isArray(userData.hiddenReleaseQueue) ? userData.hiddenReleaseQueue : [];
+    const next = { userId: entry.userId || null, screenName: normalizePromoHandle(entry.screenName), releasedAt: now };
+    const limit = typeof HIDDEN_RELEASE_QUEUE_LIMIT === 'number' ? HIDDEN_RELEASE_QUEUE_LIMIT : 2000;
+    userData.hiddenReleaseQueue = mergePendingHiddenUserEntries(releases, [next], now).slice(0, limit);
+    return true;
+}
+function applyHiddenUserReleaseQueue(userData) {
+    if (!userData || !Array.isArray(userData.hiddenReleaseQueue) || userData.hiddenReleaseQueue.length === 0) return 0;
+    const releaseKeys = new Set(userData.hiddenReleaseQueue.flatMap(getHiddenUserStorageKeys).filter(Boolean));
+    const before = userData.pendingHiddenUsers?.length || 0;
+    userData.pendingHiddenUsers = (userData.pendingHiddenUsers || []).filter((entry) => !getHiddenUserStorageKeys(entry).some((key) => releaseKeys.has(key)));
+    userData.hiddenReleaseQueue = [];
+    return before - userData.pendingHiddenUsers.length;
+}
 function extractMentionHandlesFromText(text, excludeHandles = []) {
     const exclude = new Set((excludeHandles || []).map(normalizePromoHandle).filter(Boolean));
     const handles = new Set();
@@ -1664,7 +1730,7 @@ function mergePromoTargetEntries(existing = [], handles = [], meta = {}) {
     });
     return [...byHandle.values()].sort((a, b) => (b.lastSeenAt || b.addedAt || 0) - (a.lastSeenAt || a.addedAt || 0));
 }
-async function blockPromoTargetHandle(handle, userData, tweetContext, whitelistIds, exemptHandles) {
+async function queuePromoTargetHandle(handle, userData, tweetContext, whitelistIds, exemptHandles) {
     const normalized = normalizePromoHandle(handle);
     if (!normalized || exemptHandles.includes(normalized) || normalized === normalizePromoHandle(currentUserScreenName)) return false;
     const existingIds = new Set([...userData.queue.map((u) => u.userId), ...userData.blockedLog.map((u) => u.userId)]);
@@ -1677,20 +1743,19 @@ async function blockPromoTargetHandle(handle, userData, tweetContext, whitelistI
     }
     const userId = userResult?.rest_id;
     if (!userId || whitelistIds.has(userId) || existingIds.has(userId)) return false;
-    await blockUserById(userId);
-    userData.blockedLog.push({
+    const entry = {
         userId,
         screenName: normalized,
         userNameText: userResult.core?.name || userResult.legacy?.name || normalized,
-        blockTimestamp: Date.now(),
         blockReason: 'promo_target',
         blockNote: `引流目标·@${normalized}${formatTweetContextSuffix(tweetContext)}`.trim(),
         sourceTweetId: tweetContext.tweetId || null,
         sourceTweetUrl: tweetContext.tweetUrl || '',
         sourceTweetText: tweetContext.tweetText || ''
-    });
-    const limit = scriptConfig.blockLogLimit || 500;
-    if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
+    };
+    userData.queue.push(entry);
+    addPendingHiddenUsers(userData, [createPendingHiddenUserEntry(entry, tweetContext)]);
+    applyPendingHiddenUsersToPage(userData);
     return true;
 }
 async function processPromoMentionsFromArticle(targetArticle, tweetContext, userData, authorHandle, whitelistIds, exemptHandles) {
@@ -1699,15 +1764,15 @@ async function processPromoMentionsFromArticle(targetArticle, tweetContext, user
     userData.promoTargets = mergePromoTargetEntries(userData.promoTargets, mentions, {
         sourceNote: `九族收录·@${authorHandle || '未知'}`
     });
-    let blocked = 0;
+    let queued = 0;
     for (const handle of mentions) {
-        if (await blockPromoTargetHandle(handle, userData, tweetContext, whitelistIds, exemptHandles)) blocked += 1;
+        if (await queuePromoTargetHandle(handle, userData, tweetContext, whitelistIds, exemptHandles)) queued += 1;
     }
     await saveUserData(userData);
-    if (blocked > 0) {
-        showToast('nuke-promo-target-toast', '引流目标已拉黑', `已拉黑 ${blocked} 个推文 @ 用户并加入列表`, 3500);
+    if (queued > 0) {
+        showToast('nuke-promo-target-toast', '引流目标已入队', `已隐藏并加入 ${queued} 个推文 @ 用户`, 3500);
     }
-    return { added: mentions, blocked };
+    return { added: mentions, queued };
 }
 function normalizeOcrText(text) {
     return String(text || '').replace(/\s+/g, '').trim();
@@ -2481,11 +2546,17 @@ function getArticleEngagementCounts(article) {
         likes: getEngagementCountFromAction(article, ['like', 'unlike'])
     };
 }
+function shouldCollectChainSourceFromCounts(counts, chainSource) {
+    const keyBySource = { reply: 'replies', retweet: 'retweets', like: 'likes' };
+    const key = keyBySource[chainSource];
+    if (!key) return true;
+    return counts?.[key] !== 0;
+}
 function isZeroEngagementNukeTarget(resolvedTarget) {
     const counts = resolvedTarget?.engagementCounts;
     return !!counts && counts.replies === 0 && counts.retweets === 0 && counts.likes === 0;
 }
-function sortResolvedNukeTargetsForDirectBlock(resolvedTargets) {
+function sortResolvedNukeTargetsForAuthorQueue(resolvedTargets) {
     return resolvedTargets.slice().sort((left, right) => {
         const zeroPriority = Number(isZeroEngagementNukeTarget(right)) - Number(isZeroEngagementNukeTarget(left));
         if (zeroPriority) return zeroPriority;
@@ -2513,7 +2584,7 @@ function updateManualDetectedNukeButton() {
     if (!button) return;
     const count = getDetectedNukeTargetArticles().length;
     const countEl = button.querySelector('.nuke-manual-detected-count');
-    button.disabled = manualDetectedNukeRunning || count === 0;
+    button.disabled = shouldDisableManualDetectedNukeButton(manualDetectedNukeRunning, count);
     button.title = count ? `九族拉黑 ${count} 个已检测目标` : '暂无已检测目标';
     button.setAttribute('aria-label', button.title);
     if (countEl) {
@@ -2541,6 +2612,81 @@ function ensureManualDetectedNukeButton() {
     document.body.appendChild(button);
     updateManualDetectedNukeButton();
 }
+function captureManualDetectedNukeTargets(articles, userData) {
+    const capturedTargets = [];
+    for (const article of articles) {
+        if (!isDetectedNukeTargetArticle(article)) continue;
+        article.dataset.autoblockTriggered = 'true';
+        article.dataset.autoblockChecked = 'complete';
+        const trigger = buildManualDetectedNukeTrigger(article);
+        captureNukeTargetForImmediateHide(article, trigger, userData);
+        capturedTargets.push({ article, trigger });
+    }
+    return capturedTargets;
+}
+function shouldDisableManualDetectedNukeButton(isCaptureRunning, count) {
+    return !!isCaptureRunning || count === 0;
+}
+async function processManualDetectedNukeBackground(capturedTargets) {
+    try {
+        const userData = await loadUserData();
+        if (!userData) throw new Error("无法加载用户数据");
+        const whitelistIds = new Set(userData.whitelist.map(u => u.userId));
+        const resolvedTargets = [];
+        let stoppedByApiFailure = false;
+        for (const job of capturedTargets) {
+            try {
+                const resolvedTarget = await resolveNukeTarget(job.article, job.trigger);
+                resolvedTargets.push({ ...resolvedTarget, manualOrder: resolvedTargets.length });
+            } catch (error) {
+                console.error('[CB] 手动九族建立列表失败:', error);
+                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
+                    showManualDetectedApiStopToast(error);
+                    stoppedByApiFailure = true;
+                    break;
+                }
+            }
+            updateManualDetectedNukeButton();
+            await waitForMs(250);
+        }
+        const chainExemptHandles = [...new Set(resolvedTargets.flatMap((target) => getChainExemptHandlesForTarget(target.targetArticle)))];
+        const queuedAuthorTargets = sortResolvedNukeTargetsForAuthorQueue(resolvedTargets);
+        showToast('nuke-manual-detected-toast', '标记用户已隐藏', `正在将 ${queuedAuthorTargets.length} 个标记用户加入后台队列（0互动优先）`, null);
+        let queuedAuthors = 0;
+        const handledAuthorIds = new Set();
+        for (const resolvedTarget of queuedAuthorTargets) {
+            if (resolvedTarget.authorId && handledAuthorIds.has(resolvedTarget.authorId)) continue;
+            if (resolvedTarget.authorId) handledAuthorIds.add(resolvedTarget.authorId);
+            if (queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) queuedAuthors += 1;
+            updateManualDetectedNukeButton();
+        }
+        await saveUserData(userData);
+        await updateStatusToast();
+        const onCollectProgress = status => showToast('nuke-manual-detected-toast', '建立九族列表', status, null);
+        let queuedChainUsers = 0;
+        if (!stoppedByApiFailure) {
+            for (const resolvedTarget of resolvedTargets) {
+                try {
+                    queuedChainUsers += await collectChainUsersForResolvedTarget(resolvedTarget, userData, whitelistIds, chainExemptHandles, onCollectProgress, showManualDetectedChainCollectPausedToast);
+                } catch (error) {
+                    if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
+                        stoppedByApiFailure = true;
+                        break;
+                    }
+                    throw error;
+                }
+            }
+        }
+        await updateStatusToast();
+        showToast('nuke-manual-detected-toast', stoppedByApiFailure ? '手动执行已暂停' : '手动执行已入队', `已隐藏并入队 ${queuedAuthors} 个标记用户，后台九族新增 ${queuedChainUsers} 个用户`, 4500);
+        setTimeout(processQueue, 1000);
+    } catch (error) {
+        console.error('[CB] 手动执行九族拉黑失败:', error);
+        showToast('nuke-manual-detected-toast', '手动执行失败', error.message, 5000);
+    } finally {
+        updateManualDetectedNukeButton();
+    }
+}
 async function executeManualNukeForDetectedTargets() {
     if (manualDetectedNukeRunning || isAutoNukeEnabled()) return;
     scanSpamIdentifyContent();
@@ -2554,89 +2700,20 @@ async function executeManualNukeForDetectedTargets() {
     }
     manualDetectedNukeRunning = true;
     updateManualDetectedNukeButton();
-    showToast('nuke-manual-detected-toast', '建立九族列表', `正在收集 ${articles.length} 个已检测目标的关联用户`, null);
+    showToast('nuke-manual-detected-toast', '建立九族列表', `正在记录并隐藏 ${articles.length} 个已检测目标`, null);
     try {
         const userData = await loadUserData();
         if (!userData) throw new Error("无法加载用户数据");
-        const whitelistIds = new Set(userData.whitelist.map(u => u.userId));
-        const queueById = new Map();
-        const resolvedTargets = [];
-        const onCollectProgress = status => showToast('nuke-manual-detected-toast', '建立九族列表', status, null);
-        let chainCollectionPaused = false;
-        let chainCollectionStopError = null;
-        let stoppedByApiFailure = false;
-        const onCollectFailure = (error) => {
-            if (!isApiRateLimitError(error) && !isApiTimeoutError(error)) return;
-            if (!chainCollectionPaused) {
-                chainCollectionPaused = true;
-                chainCollectionStopError = error;
-                showManualDetectedChainCollectPausedToast(error);
-            }
-        };
-        for (const article of articles) {
-            if (!isDetectedNukeTargetArticle(article)) continue;
-            article.dataset.autoblockTriggered = 'true';
-            article.dataset.autoblockChecked = 'complete';
-            hideElement(article);
-            try {
-                const resolvedTarget = await resolveNukeTarget(article, buildManualDetectedNukeTrigger(article));
-                resolvedTargets.push({ ...resolvedTarget, manualOrder: resolvedTargets.length });
-                if (!chainCollectionPaused) {
-                    await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress, onCollectFailure);
-                }
-            } catch (error) {
-                console.error('[CB] 手动九族建立列表失败:', error);
-                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
-                    showManualDetectedApiStopToast(error);
-                    stoppedByApiFailure = true;
-                    break;
-                }
-            }
-            updateManualDetectedNukeButton();
-            await new Promise((resolve) => window.setTimeout(resolve, 250));
-        }
-        if (stoppedByApiFailure) {
-            await saveUserData(userData);
-            await updateStatusToast();
-            return;
-        }
-        const targetAuthorIds = mergeUserIdSets(resolvedTargets.map((target) => buildChainSkipUserIds(target)));
-        const chainExemptHandles = [...new Set(resolvedTargets.flatMap((target) => getChainExemptHandlesForTarget(target.targetArticle)))];
-        const pendingChainQueueEntries = selectNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, targetAuthorIds);
-        const directBlockTargets = sortResolvedNukeTargetsForDirectBlock(resolvedTargets);
-        showToast('nuke-manual-detected-toast', '直接拉黑标记用户', `已建立 ${pendingChainQueueEntries.length} 个后台九族目标，正在直接拉黑 ${directBlockTargets.length} 个标记用户（0互动优先）`, null);
-        let blockedAuthors = 0;
-        const handledAuthorIds = new Set();
-        for (const resolvedTarget of directBlockTargets) {
-            if (resolvedTarget.authorId && handledAuthorIds.has(resolvedTarget.authorId)) continue;
-            if (resolvedTarget.authorId) handledAuthorIds.add(resolvedTarget.authorId);
-            try {
-                if (await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) blockedAuthors += 1;
-            } catch (error) {
-                console.warn('[CB] 手动直接拉黑中断:', error);
-                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
-                    showManualDetectedApiStopToast(error);
-                    stoppedByApiFailure = true;
-                    break;
-                }
-                throw error;
-            }
-            await saveUserData(userData);
-            updateManualDetectedNukeButton();
-            await new Promise((resolve) => window.setTimeout(resolve, 350));
-        }
-        if (stoppedByApiFailure) {
-            await saveUserData(userData);
-            await updateStatusToast();
-            return;
-        }
-        if (pendingChainQueueEntries.length > 0) {
-            addNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, targetAuthorIds);
-            await saveUserData(userData);
-        }
+        const capturedTargets = captureManualDetectedNukeTargets(articles, userData);
+        await saveUserData(userData);
         await updateStatusToast();
-        showToast('nuke-manual-detected-toast', '手动执行完成', `已直接拉黑 ${blockedAuthors} 个标记用户，后台九族队列新增 ${pendingChainQueueEntries.length} 个用户`, 4500);
-        setTimeout(processQueue, 1000);
+        updateManualDetectedNukeButton();
+        if (!capturedTargets.length) {
+            showToast('nuke-manual-detected-toast', '暂无已检测目标', '没有可执行九族拉黑的标记推文', 3000);
+            return;
+        }
+        showToast('nuke-manual-detected-toast', '标记用户已隐藏', `已隐藏 ${capturedTargets.length} 个目标，正在后台建立九族列表`, null);
+        void processManualDetectedNukeBackground(capturedTargets);
     } catch (error) {
         console.error('[CB] 手动执行九族拉黑失败:', error);
         showToast('nuke-manual-detected-toast', '手动执行失败', error.message, 5000);
@@ -3329,17 +3406,32 @@ function mergeQueueEntries(existingEntry, incomingEntry, context) {
     const meta = buildChainBlockNote(chainSources, context);
     return { ...existingEntry, ...incomingEntry, chainSources, blockReason: meta.blockReason, blockNote: meta.blockNote };
 }
-function createAuthorLogEntry(authorId, authorHandle, authorUserNameText, trigger, context) {
-    const meta = buildAuthorBlockNote(trigger, context);
+function createPendingHiddenUserEntry(entry, context = {}) {
+    return {
+        userId: entry.userId || null,
+        screenName: normalizePromoHandle(entry.screenName),
+        userNameText: entry.userNameText || entry.screenName || '',
+        sourceTweetId: entry.sourceTweetId || context.tweetId || null,
+        sourceTweetUrl: entry.sourceTweetUrl || context.tweetUrl || '',
+        sourceTweetText: entry.sourceTweetText || context.tweetText || '',
+        sourceAuthorHandle: entry.sourceAuthorHandle || context.authorHandle || '',
+        blockReason: entry.blockReason || '',
+        blockNote: entry.blockNote || ''
+    };
+}
+function createAuthorQueueEntry(resolvedTarget) {
+    const { authorId, authorHandle, authorUserNameText, trigger, tweetContext } = resolvedTarget;
+    const meta = buildAuthorBlockNote(trigger, tweetContext);
     return {
         userId: authorId,
         screenName: authorHandle,
         userNameText: authorUserNameText,
-        blockTimestamp: Date.now(),
-        sourceTweetId: context.tweetId || null,
-        sourceTweetUrl: context.tweetUrl || '',
-        sourceTweetText: truncateBlockContextText(context.tweetText),
-        sourceAuthorHandle: context.authorHandle || authorHandle,
+        sourceTweetId: tweetContext.tweetId || null,
+        sourceTweetUrl: tweetContext.tweetUrl || '',
+        sourceTweetText: truncateBlockContextText(tweetContext.tweetText),
+        sourceAuthorHandle: tweetContext.authorHandle || authorHandle,
+        sourceRootAuthorHandle: tweetContext.rootAuthorHandle || '',
+        sourceRootAuthorId: tweetContext.rootAuthorId || null,
         ...meta
     };
 }
@@ -3529,9 +3621,24 @@ async function throwIfApiRateLimited() {
     const state = await getActiveApiRateLimitState();
     if (state) throw buildApiRateLimitError(state);
 }
+function waitForMs(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+function enqueueApiOperation(operation) {
+    const run = async () => {
+        await throwIfApiRateLimited();
+        const waitMs = Math.max(0, apiLastOperationStartedAt + API_OPERATION_INTERVAL_MS - Date.now());
+        if (waitMs > 0) await waitForMs(waitMs);
+        await throwIfApiRateLimited();
+        apiLastOperationStartedAt = Date.now();
+        return operation();
+    };
+    const scheduled = apiOperationTail.then(run, run);
+    apiOperationTail = scheduled.catch(() => {});
+    return scheduled;
+}
 async function makeApiRequest(url, method = "GET", data = null) {
-    await throwIfApiRateLimited();
-    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+    return enqueueApiOperation(() => new Promise((resolve, reject) => GM_xmlhttpRequest({
         method,
         url,
         data,
@@ -3561,7 +3668,7 @@ async function makeApiRequest(url, method = "GET", data = null) {
         },
         onerror: e => reject({ message: "Network or script error", error: e }),
         ontimeout: () => reject({ message: "API请求超时", status: 0 })
-    }));
+    })));
 }
 function isApiRateLimitError(error) {
     return error?.status === 429 || error?.sharedRateLimit === true;
@@ -3631,11 +3738,11 @@ function showApiLimitRetryToast(error = null) {
 function showManualDetectedApiStopToast(error) {
     if (isApiRateLimitError(error)) {
         showApiLimitRetryToast(error);
-        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'X API 已达上限，已停止直接拉黑；稍后可重试', 5000);
+        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'X API 已达上限，已保留本地隐藏和队列；稍后可重试', 5000);
         return;
     }
     if (isApiTimeoutError(error)) {
-        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'API 请求超时，已停止直接拉黑；稍后可重试', 5000);
+        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'API 请求超时，已保留本地隐藏和队列；稍后可重试', 5000);
         return;
     }
     showToast('nuke-manual-detected-toast', '手动执行失败', error?.message || String(error), 5000);
@@ -3643,11 +3750,11 @@ function showManualDetectedApiStopToast(error) {
 function showManualDetectedChainCollectPausedToast(error) {
     if (isApiRateLimitError(error)) {
         showApiLimitRetryToast(error);
-        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', 'X API 已达上限，停止继续收集关联列表；将继续尝试直接拉黑标记用户', 5000);
+        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', 'X API 已达上限，停止继续收集关联列表；已入队用户会后台处理', 5000);
         return;
     }
     if (isApiTimeoutError(error)) {
-        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '关联列表请求超时，停止继续收集；将继续尝试直接拉黑标记用户', 5000);
+        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '关联列表请求超时，停止继续收集；已入队用户会后台处理', 5000);
         return;
     }
     showToast('nuke-manual-detected-toast', '九族列表收集失败', error?.message || String(error), 5000);
@@ -3719,8 +3826,7 @@ function getAutoBlockDecision(userNameText, followerCount) {
     const builtInDisplayNameMatch = matchesBuiltInDisplayNameSpam(userNameText);
     if (!keywordMatch && !builtInDisplayNameMatch) return { block: false, reason: 'no_match' };
     if (followerCount == null || Number.isNaN(followerCount)) {
-        if (builtInDisplayNameMatch) return { block: true, reason: 'display_name_spam' };
-        return { block: false, reason: 'follower_unknown' };
+        return { block: true, reason: builtInDisplayNameMatch ? 'display_name_spam' : 'standard_keywords', followerCount: null, exemptThreshold };
     }
     if (followerCount <= exemptThreshold) return { block: true, reason: builtInDisplayNameMatch ? 'display_name_spam' : 'standard_keywords', followerCount, exemptThreshold };
     return { block: false, reason: 'follower_exempt', followerCount, exemptThreshold };
@@ -3737,6 +3843,43 @@ function getScreenNameFromProfileHref(href) {
 function getArticleAuthorScreenName(article) {
     const userLink = article?.querySelector('div[data-testid="User-Name"] a[role="link"]');
     return getScreenNameFromProfileHref(userLink?.href);
+}
+function getVisibleFollowerCountFromText(text) {
+    const source = String(text || '').replace(/,/g, '');
+    const patterns = [
+        /(\d+(?:\.\d+)?)\s*([万千kKmM]?)\s*(?:粉丝|关注者|followers?)/i,
+        /(?:粉丝|关注者|followers?)\s*(\d+(?:\.\d+)?)\s*([万千kKmM]?)/i
+    ];
+    for (const pattern of patterns) {
+        const match = source.match(pattern);
+        if (match) return parseCompactEngagementCount(`${match[1]}${match[2] || ''}`);
+    }
+    return null;
+}
+function getVisibleFollowerCountFromArticle(article) {
+    if (!article) return null;
+    const candidates = [
+        article.textContent || '',
+        ...Array.from(article.querySelectorAll('[aria-label], [title]')).flatMap((node) => [
+            node.getAttribute('aria-label') || '',
+            node.getAttribute('title') || ''
+        ])
+    ];
+    for (const text of candidates) {
+        const count = getVisibleFollowerCountFromText(text);
+        if (count != null) return count;
+    }
+    return null;
+}
+function getCachedFollowerCount(screenName) {
+    if (!screenName) return null;
+    const cached = followerCountCache.get(screenName.toLowerCase());
+    return cached && Date.now() - cached.at < FOLLOWER_COUNT_CACHE_MS ? cached.count : null;
+}
+function getVisibleOrCachedFollowerCount(article, screenName) {
+    const visibleCount = getVisibleFollowerCountFromArticle(article);
+    if (visibleCount != null) return visibleCount;
+    return getCachedFollowerCount(screenName);
 }
 function isTwitterBlueColor(value) {
     const text = String(value || '').trim().toLowerCase();
@@ -3763,39 +3906,10 @@ function isBlueVerifiedUserElement(userElement) {
 function isArticleBlueVerified(article) {
     return isBlueVerifiedUserElement(article?.querySelector('div[data-testid="User-Name"]'));
 }
-async function getCachedFollowerCount(screenName) {
-    if (!screenName) return null;
-    const key = screenName.toLowerCase();
-    const cached = followerCountCache.get(key);
-    if (cached && Date.now() - cached.at < FOLLOWER_COUNT_CACHE_MS) return cached.count;
-    if (followerFetchPending.has(key)) return withFollowerCountTimeout(followerFetchPending.get(key));
-    const pending = (async () => {
-        try {
-            const userResult = await getUserDataByScreenName(screenName);
-            const count = getFollowersCountFromUserResult(userResult);
-            followerCountCache.set(key, { count, at: Date.now() });
-            return count;
-        } catch (error) {
-            if (isApiRateLimitError(error)) throw error;
-            console.warn(`[CB] 无法获取 @${screenName} 的粉丝数`, error);
-            return null;
-        } finally {
-            followerFetchPending.delete(key);
-        }
-    })();
-    followerFetchPending.set(key, pending);
-    return withFollowerCountTimeout(pending);
-}
-function withFollowerCountTimeout(promise) {
-    return Promise.race([
-        promise,
-        new Promise((resolve) => window.setTimeout(() => resolve(null), FOLLOWER_COUNT_LOOKUP_TIMEOUT_MS))
-    ]);
-}
 async function shouldExemptArticleByFollowerCount(article, reason) {
     const screenName = getArticleAuthorScreenName(article);
     if (!screenName) return false;
-    const followerCount = await getCachedFollowerCount(screenName);
+    const followerCount = getVisibleOrCachedFollowerCount(article, screenName);
     if (!isFollowerCountExempt(followerCount)) return false;
     console.log(`[CB] 跳过${reason || '自动标记'} @${screenName} (粉丝数 ${followerCount} 高于阈值 ${getUsernameRuleFollowerExemptThreshold()})`);
     return true;
@@ -3836,7 +3950,7 @@ async function maybeAutoBlockTarget(targetArticle, userNameText, screenName) {
     }
     void initiateNukeProcess(targetArticle, { triggerMode: 'auto', autoReason: decision.reason, suspiciousDisplayName: userNameText });
 }
-async function getRetweetersData(tweetId, onProgress) {
+async function getRetweetersData(tweetId, onProgress, onUsersPage) {
     let users = new Map(), cursor = null, endpoint = API_ENDPOINTS.Retweeters;
     do {
         onProgress(`正在获取转推列表...(已找到: ${users.size})`);
@@ -3845,17 +3959,19 @@ async function getRetweetersData(tweetId, onProgress) {
         const entries = data?.data?.retweeters_timeline?.timeline?.instructions?.find(i=>i.type==='TimelineAddEntries')?.entries;
         if (!entries) break;
         let foundNewUsers = false;
+        const pageUsers = [];
         for (const entry of entries) {
             if (entry.entryId.startsWith('user-')) {
                 const userResult = entry.content?.itemContent?.user_results?.result;
-                if (userResult?.rest_id && !users.has(userResult.rest_id)) { users.set(userResult.rest_id, userResult); foundNewUsers = true; }
+                if (userResult?.rest_id && !users.has(userResult.rest_id)) { users.set(userResult.rest_id, userResult); pageUsers.push(userResult); foundNewUsers = true; }
             } else if (entry.entryId.startsWith('cursor-bottom-')) { cursor = entry.content.value; }
         }
+        if (pageUsers.length) await onUsersPage?.(pageUsers);
         if (!foundNewUsers || !cursor) break;
     } while (cursor);
     return Array.from(users.values());
 }
-async function getFavoritersData(tweetId, onProgress) {
+async function getFavoritersData(tweetId, onProgress, onUsersPage) {
     let users = new Map(), cursor = null, endpoint = API_ENDPOINTS.Favoriters;
     do {
         onProgress(`正在获取点赞列表...(已找到: ${users.size})`);
@@ -3864,17 +3980,19 @@ async function getFavoritersData(tweetId, onProgress) {
         const entries = data?.data?.favoriters_timeline?.timeline?.instructions?.find(i=>i.type==='TimelineAddEntries')?.entries;
         if (!entries) break;
         let foundNewUsers = false;
+        const pageUsers = [];
         for (const entry of entries) {
             if (entry.entryId.startsWith('user-')) {
                 const userResult = entry.content?.itemContent?.user_results?.result;
-                if (userResult?.rest_id && !users.has(userResult.rest_id)) { users.set(userResult.rest_id, userResult); foundNewUsers = true; }
+                if (userResult?.rest_id && !users.has(userResult.rest_id)) { users.set(userResult.rest_id, userResult); pageUsers.push(userResult); foundNewUsers = true; }
             } else if (entry.entryId.startsWith('cursor-bottom-')) { cursor = entry.content.value; }
         }
+        if (pageUsers.length) await onUsersPage?.(pageUsers);
         if (!foundNewUsers || !cursor) break;
     } while (cursor);
     return Array.from(users.values());
 }
-async function getRepliersData(tweetId, onProgress) {
+async function getRepliersData(tweetId, onProgress, onUsersPage) {
     let users = new Map(), cursor = null, endpoint = API_ENDPOINTS.TweetDetail;
     const baseVariables = {"with_rux_injections":false,"includePromotedContent":true,"withCommunity":true,"withQuickPromoteEligibilityTweetFields":true,"withBirdwatchNotes":true,"withVoice":true,"withV2Timeline":true};
     do {
@@ -3888,6 +4006,7 @@ async function getRepliersData(tweetId, onProgress) {
         if (!entries) break;
         let nextCursor = null;
         let foundNewUsersInPage = false;
+        const pageUsers = [];
         for (const entry of entries) {
             if (entry.entryId.startsWith('conversationthread-')) {
                 const threadItems = entry.content?.items;
@@ -3895,8 +4014,9 @@ async function getRepliersData(tweetId, onProgress) {
                     for(const item of threadItems){
                         const userResult = item.item?.itemContent?.tweet_results?.result?.core?.user_results?.result;
                         if (userResult?.rest_id && !users.has(userResult.rest_id)) {
-                            users.set(userResult.rest_id, userResult);
-                            foundNewUsersInPage = true;
+                           users.set(userResult.rest_id, userResult);
+                           pageUsers.push(userResult);
+                           foundNewUsersInPage = true;
                         }
                     }
                 }
@@ -3904,12 +4024,14 @@ async function getRepliersData(tweetId, onProgress) {
                 const userResult = entry.content?.itemContent?.tweet_results?.result?.core?.user_results?.result;
                 if (userResult?.rest_id && !users.has(userResult.rest_id)) {
                    users.set(userResult.rest_id, userResult);
+                   pageUsers.push(userResult);
                    foundNewUsersInPage = true;
                 }
             } else if (entry.entryId.startsWith('cursor-bottom-')) {
                 nextCursor = entry.content.value;
             }
         }
+        if (pageUsers.length) await onUsersPage?.(pageUsers);
         if (cursor === nextCursor || !foundNewUsersInPage) break;
         cursor = nextCursor;
     } while (cursor);
@@ -3928,12 +4050,20 @@ async function loadUserData() {
     if (!Array.isArray(userData.blockedLog)) userData.blockedLog = [];
     if (!Array.isArray(userData.whitelist)) userData.whitelist = [];
     if (!Array.isArray(userData.promoTargets)) userData.promoTargets = [];
+    if (!Array.isArray(userData.pendingHiddenUsers)) userData.pendingHiddenUsers = [];
+    if (!Array.isArray(userData.hiddenReleaseQueue)) userData.hiddenReleaseQueue = [];
+    if (!Array.isArray(userData.nukeCaptures)) userData.nukeCaptures = [];
+    if (!Number.isFinite(Number(userData.lastBlockTimestamp))) userData.lastBlockTimestamp = 0;
+    const releasedHiddenUsers = applyHiddenUserReleaseQueue(userData);
     if (userData.spamIdentifyLog) {
         delete userData.spamIdentifyLog;
         allData[currentUserId] = userData;
         await GM_setValue(STORAGE_KEY, allData);
+    } else if (releasedHiddenUsers > 0) {
+        allData[currentUserId] = userData;
+        await GM_setValue(STORAGE_KEY, allData);
     }
-    return { ...userData, lastBlockTimestamp: 0 };
+    return userData;
 }
 async function saveUserData(data) {
     if (!currentUserId) return;
@@ -4143,12 +4273,16 @@ async function processQueue() {
         }
         if (isQueueEntryProtectedRootAuthor(userToBlock)) {
             console.warn(`[CB] 跳过队列中的主贴作者 @${userToBlock.screenName || userToBlock.userId}`);
+            queueHiddenUserRelease(userData, userToBlock);
+            applyHiddenUserReleaseQueue(userData);
             userData.queue.shift();
             return;
         }
         await blockUserById(userToBlock.userId);
         userData.queue.shift();
         userData.blockedLog.push({ ...userToBlock, blockTimestamp: Date.now(), blockNote: userToBlock.blockNote || '', blockReason: userToBlock.blockReason || '' });
+        queueHiddenUserRelease(userData, userToBlock);
+        applyHiddenUserReleaseQueue(userData);
         const limit = scriptConfig.blockLogLimit || 500;
         if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
         userData.lastBlockTimestamp = Date.now();
@@ -4169,6 +4303,50 @@ async function processQueue() {
 function getArticleAuthorHandle(article) {
     const userLink = article?.querySelector?.('div[data-testid="User-Name"] a[role="link"]');
     return normalizePromoHandle(getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/')?.pop()?.split('?')?.[0] || '');
+}
+function getPendingHiddenHandleSet(userData) {
+    return new Set((userData?.pendingHiddenUsers || []).map((entry) => normalizePromoHandle(entry.screenName)).filter(Boolean));
+}
+function hideArticlesByHandles(handles) {
+    if (!handles?.size) return 0;
+    let hiddenCount = 0;
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+        const handle = getArticleAuthorHandle(article);
+        if (!handle || !handles.has(handle)) return;
+        article.dataset.cbPendingHiddenUser = handle;
+        article.style.setProperty('display', 'none', 'important');
+        hiddenCount += 1;
+    });
+    return hiddenCount;
+}
+function applyPendingHiddenUsersToPage(userData) {
+    return hideArticlesByHandles(getPendingHiddenHandleSet(userData));
+}
+async function refreshPendingHiddenUsersOnPage() {
+    const userData = await loadUserData();
+    if (!userData) return 0;
+    return applyPendingHiddenUsersToPage(userData);
+}
+function addPendingHiddenUsers(userData, entries) {
+    if (!userData || !entries?.length) return [];
+    const before = new Set((userData.pendingHiddenUsers || []).map(getHiddenUserStorageKey).filter(Boolean));
+    userData.pendingHiddenUsers = mergePendingHiddenUserEntries(userData.pendingHiddenUsers, entries);
+    return userData.pendingHiddenUsers.filter((entry) => !before.has(getHiddenUserStorageKey(entry)));
+}
+function recordNukeCapture(userData, capture) {
+    if (!userData) return null;
+    const now = Date.now();
+    const entry = {
+        captureId: capture.captureId || `${capture.tweetContext?.tweetId || capture.authorHandle || 'tweet'}:${now}`,
+        authorHandle: normalizePromoHandle(capture.authorHandle),
+        authorUserNameText: capture.authorUserNameText || capture.authorHandle || '',
+        trigger: capture.trigger || {},
+        tweetContext: capture.tweetContext || {},
+        pageUrl: location.href,
+        capturedAt: now
+    };
+    userData.nukeCaptures = [entry, ...(userData.nukeCaptures || []).filter((item) => item.captureId !== entry.captureId)].slice(0, NUKE_CAPTURE_LOG_LIMIT);
+    return entry;
 }
 function getStatusRootTweetArticle() {
     if (!getCurrentStatusPageInfo().tweetId) return null;
@@ -4227,9 +4405,30 @@ function mergeUserIdSets(sets = []) {
     });
     return merged;
 }
-function trimBlockedLogToLimit(userData) {
-    const limit = scriptConfig.blockLogLimit || 500;
-    if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
+function captureNukeTargetForImmediateHide(targetArticle, trigger, userData) {
+    const userLink = targetArticle?.querySelector?.('div[data-testid="User-Name"] a[role="link"]');
+    const authorHandle = getArticleAuthorHandle(targetArticle) || getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/').pop()?.split('?')[0];
+    const authorUserNameText = targetArticle?.querySelector?.('div[data-testid="User-Name"] a[role="link"] span')?.textContent?.trim() || authorHandle;
+    if (!authorHandle) throw new Error("无法确定作者 handle");
+    const tweetContext = getTweetContextFromTarget(targetArticle, authorHandle);
+    const rootAuthorHandle = getRootTweetAuthorHandle();
+    tweetContext.rootAuthorHandle = rootAuthorHandle || '';
+    const capture = recordNukeCapture(userData, { authorHandle, authorUserNameText, trigger, tweetContext });
+    const isProtectedRoot = rootAuthorHandle && normalizePromoHandle(rootAuthorHandle) === normalizePromoHandle(authorHandle) && trigger?.triggerMode !== 'manual';
+    if (!isProtectedRoot) {
+        addPendingHiddenUsers(userData, [createPendingHiddenUserEntry({
+            screenName: authorHandle,
+            userNameText: authorUserNameText,
+            sourceTweetId: tweetContext.tweetId,
+            sourceTweetUrl: tweetContext.tweetUrl,
+            sourceTweetText: tweetContext.tweetText,
+            sourceAuthorHandle: tweetContext.authorHandle,
+            blockReason: trigger?.autoReason || trigger?.triggerMode || 'nuke_capture',
+            blockNote: `待拉黑·@${authorHandle}${formatTweetContextSuffix(tweetContext)}`
+        }, tweetContext)]);
+        hideArticlesByHandles(new Set([normalizePromoHandle(authorHandle)]));
+    }
+    return { capture, authorHandle, authorUserNameText, tweetContext, isProtectedRoot };
 }
 async function resolveNukeTarget(targetArticle, trigger) {
     const userLink = targetArticle.querySelector('div[data-testid="User-Name"] a[role="link"]');
@@ -4263,42 +4462,66 @@ async function resolveNukeTarget(targetArticle, trigger) {
     tweetContext.rootAuthorId = rootAuthorId || null;
     return { targetArticle, trigger, authorHandle, authorUserNameText, tweetContext, authorId, rootAuthorHandle, rootAuthorId, engagementCounts: getArticleEngagementCounts(targetArticle) };
 }
-async function blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptHandles) {
-    const { authorId, authorHandle, authorUserNameText, trigger, tweetContext } = resolvedTarget;
+function queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptHandles) {
+    const { authorId, authorHandle } = resolvedTarget;
     if (!authorId) {
-        console.error(`[CB] 拉黑作者 @${authorHandle} 失败:`, new Error("无法获取作者用户ID"));
+        console.error(`[CB] 作者 @${authorHandle} 入队失败:`, new Error("无法获取作者用户ID"));
         return false;
     }
     if (isResolvedTargetRootAuthor(resolvedTarget) && !isDirectManualRootAuthorBlock(resolvedTarget)) {
-        console.warn(`[CB] 跳过拉黑主贴作者 @${authorHandle}：非直接手动主贴操作`);
+        console.warn(`[CB] 跳过主贴作者 @${authorHandle}：非直接手动主贴操作`);
+        queueHiddenUserRelease(userData, { userId: authorId, screenName: authorHandle });
+        applyHiddenUserReleaseQueue(userData);
         showToast('nuke-fetch-toast', '🛡️ 已跳过主贴作者', `非直接手动操作，不拉黑 @${authorHandle}`, 4000);
         return false;
     }
-    if (whitelistIds.has(authorId) || exemptHandles.includes(authorHandle)) {
-        showToast('nuke-fetch-toast', '🛡️ 用户在白名单或豁免列表', `已跳过拉黑 @${authorHandle}`, 4000);
+    const normalizedHandle = normalizePromoHandle(authorHandle);
+    if (whitelistIds.has(authorId) || (exemptHandles || []).map(normalizePromoHandle).includes(normalizedHandle)) {
+        queueHiddenUserRelease(userData, { userId: authorId, screenName: authorHandle });
+        applyHiddenUserReleaseQueue(userData);
+        showToast('nuke-fetch-toast', '🛡️ 用户在白名单或豁免列表', `已跳过 @${authorHandle}`, 4000);
         return false;
     }
-    await blockUserById(authorId);
-    userData.blockedLog.push(createAuthorLogEntry(authorId, authorHandle, authorUserNameText, trigger, tweetContext));
-    trimBlockedLogToLimit(userData);
-    showToast('nuke-fetch-toast', '✅ 作者已拉黑并记录', `已立刻拉黑 @${authorHandle}`, 2000);
+    const existingIds = new Set([...userData.queue.map((u) => u.userId), ...userData.blockedLog.map((u) => u.userId)]);
+    if (existingIds.has(authorId) || authorId === currentUserId) return false;
+    const entry = createAuthorQueueEntry(resolvedTarget);
+    userData.queue.push(entry);
+    addPendingHiddenUsers(userData, [createPendingHiddenUserEntry(entry, resolvedTarget.tweetContext)]);
+    applyPendingHiddenUsersToPage(userData);
     return true;
 }
-async function collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress, onCollectFailure) {
-    const { authorId, tweetContext } = resolvedTarget;
+async function collectChainUsersForResolvedTarget(resolvedTarget, userData, whitelistIds, exemptHandles, onCollectProgress, onCollectFailure) {
+    const { tweetContext } = resolvedTarget;
     const tweetId = tweetContext.tweetId;
     if (!tweetId) return 0;
-    const beforeSize = queueById.size;
-    const [retweeters, repliers, favoriters] = await Promise.all([
-        getRetweetersData(tweetId, onCollectProgress).catch(skipFailedChainList('转推列表', onCollectFailure)),
-        getRepliersData(tweetId, onCollectProgress).catch(skipFailedChainList('回复列表', onCollectFailure)),
-        getFavoritersData(tweetId, onCollectProgress).catch(skipFailedChainList('点赞列表', onCollectFailure))
-    ]);
-    addUsersToChainQueue(queueById, retweeters, 'retweet', tweetContext);
-    addUsersToChainQueue(queueById, repliers, 'reply', tweetContext);
-    addUsersToChainQueue(queueById, favoriters, 'like', tweetContext);
-    removeProtectedAuthorsFromChainQueue(queueById, resolvedTarget);
-    return Math.max(0, queueById.size - beforeSize);
+    let totalQueued = 0;
+    const skipUserIds = buildChainSkipUserIds(resolvedTarget);
+    const persistUsersPage = async (users, chainSource) => {
+        const queueById = new Map();
+        addUsersToChainQueue(queueById, users, chainSource, tweetContext);
+        removeProtectedAuthorsFromChainQueue(queueById, resolvedTarget);
+        const newUsers = addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds);
+        if (!newUsers.length) return;
+        totalQueued += newUsers.length;
+        await saveUserData(userData);
+        await updateStatusToast();
+    };
+    const collect = async (label, chainSource, getter) => {
+        if (!shouldCollectChainSourceFromCounts(resolvedTarget.engagementCounts, chainSource)) {
+            onCollectProgress?.(`${label}为 0，跳过 API 请求`);
+            return;
+        }
+        try {
+            await getter(tweetId, onCollectProgress, (users) => persistUsersPage(users, chainSource));
+        } catch (error) {
+            skipFailedChainList(label, onCollectFailure)(error);
+            if (isApiRateLimitError(error) || isApiTimeoutError(error)) throw error;
+        }
+    };
+    await collect('转推列表', 'retweet', getRetweetersData);
+    await collect('回复列表', 'reply', getRepliersData);
+    await collect('点赞列表', 'like', getFavoritersData);
+    return totalQueued;
 }
 function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
     const existingUserIds = new Set([...userData.queue.map(u => u.userId), ...userData.blockedLog.map(u => u.userId), ...whitelistIds, ...skipUserIds]);
@@ -4307,30 +4530,32 @@ function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHan
 }
 function addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
     const newUsersToQueue = selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds);
-    if (newUsersToQueue.length > 0) userData.queue.push(...newUsersToQueue);
+    if (newUsersToQueue.length > 0) {
+        userData.queue.push(...newUsersToQueue);
+        addPendingHiddenUsers(userData, newUsersToQueue.map((entry) => createPendingHiddenUserEntry(entry)));
+        applyPendingHiddenUsersToPage(userData);
+    }
     return newUsersToQueue;
 }
 async function initiateNukeProcess(targetArticle, trigger = { triggerMode: 'manual' }) {
-    showToast('nuke-fetch-toast', '🚀 九族拉黑已启动', '正在处理...', null);
-    hideElement(targetArticle);
+    showToast('nuke-fetch-toast', '🚀 九族拉黑已启动', '已记录目标并本地隐藏，后台慢慢处理...', null);
     try {
         const userData = await loadUserData();
         if (!userData) throw new Error("无法加载用户数据");
+        captureNukeTargetForImmediateHide(targetArticle, trigger, userData);
+        await saveUserData(userData);
         const whitelistIds = new Set(userData.whitelist.map(u => u.userId));
         const resolvedTarget = await resolveNukeTarget(targetArticle, trigger);
-        await blockResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, []);
+        const authorQueued = queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, []);
         await saveUserData(userData);
         const chainExemptHandles = getChainExemptHandlesForTarget(resolvedTarget.targetArticle);
         await processPromoMentionsFromArticle(targetArticle, resolvedTarget.tweetContext, userData, resolvedTarget.authorHandle, whitelistIds, chainExemptHandles);
         if (!resolvedTarget.tweetContext.tweetId) return;
         const onCollectProgress = status => showToast('nuke-fetch-toast', '收集中...', status, null);
-        const queueById = new Map();
-        await collectChainUsersForResolvedTarget(resolvedTarget, queueById, onCollectProgress);
-        const skipUserIds = buildChainSkipUserIds(resolvedTarget);
-        const newUsersToQueue = addNewChainQueueEntries(userData, queueById, whitelistIds, chainExemptHandles, skipUserIds);
-        if (newUsersToQueue.length > 0) {
+        const queuedChainUsers = await collectChainUsersForResolvedTarget(resolvedTarget, userData, whitelistIds, chainExemptHandles, onCollectProgress);
+        if (authorQueued || queuedChainUsers > 0) {
             await saveUserData(userData);
-            showToast('nuke-fetch-toast', '✅ 操作成功', `已将 ${newUsersToQueue.length} 个相关用户加入拉黑队列。`, 4000);
+            showToast('nuke-fetch-toast', '✅ 已加入后台队列', `作者${authorQueued ? '已' : '未'}入队，关联用户新增 ${queuedChainUsers} 个。`, 4000);
         } else {
             showToast('nuke-fetch-toast', 'ℹ️ 操作完成', `没有找到新的可拉黑用户。`, 4000);
         }
@@ -4373,11 +4598,10 @@ function getDisplayNameFromUserLink(userLink) {
     if (!handle) return raw;
     return raw.replace(new RegExp(`@?${handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'), '').trim() || raw;
 }
-async function evaluateUsernameAutoBlock(userNameText, screenName) {
+async function evaluateUsernameAutoBlock(userNameText, screenName, followerCount = null) {
     const needsFollowerCheck = matchesStandardKeywords(userNameText, scriptConfig.blockKeywordsStandard || []) || matchesBuiltInDisplayNameSpam(userNameText);
-    let followerCount = null;
-    if (needsFollowerCheck && screenName) followerCount = await getCachedFollowerCount(screenName);
-    return getAutoBlockDecision(userNameText, followerCount);
+    const countForDecision = needsFollowerCheck && followerCount == null && screenName ? getCachedFollowerCount(screenName) : followerCount;
+    return getAutoBlockDecision(userNameText, countForDecision);
 }
 function getAutoBlockRuleLabel(reason) {
     if (reason === 'standard_keywords') return '用户名关键词';
@@ -4400,7 +4624,7 @@ async function processAutoBlockArticle(article, userData) {
     if (userNameText) {
         let decision = null;
         try {
-            decision = await evaluateUsernameAutoBlock(userNameText, screenName);
+            decision = await evaluateUsernameAutoBlock(userNameText, screenName, getVisibleOrCachedFollowerCount(article, screenName));
         } catch (error) {
             if (isApiRateLimitError(error)) {
                 showApiLimitRetryToast(error);
@@ -4471,6 +4695,7 @@ function scanAndProcessContent() {
         markStatusRootTweetArticles();
         const userData = await loadUserData();
         if (!userData) return;
+        applyPendingHiddenUsersToPage(userData);
         document.querySelectorAll('article[data-testid="tweet"]:not([data-autoblock-checked])').forEach((article) => {
             void processAutoBlockArticle(article, userData);
         });
