@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.5.7
+// @version      0.5.14
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -11,31 +11,60 @@
 // @match        https://*.lianjia.com/ditiezufang/*
 // @match        https://*.lianjia.com/zufang/
 // @match        https://*.lianjia.com/zufang/*
+// @match        https://*.lianjia.com/apartment/*
 // @noframes
 // @grant        GM_addStyle
 // @grant        GM_getValue
+// @grant        GM_openInTab
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // ==/UserScript==
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.5.7';
+const SCRIPT_VERSION = '0.5.14';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
 const MAP_CACHE_STORAGE_KEY = 'LIANJIA_RENT_MAP_LISTING_CACHE';
 const AUTO_FETCH_STORAGE_KEY = 'LIANJIA_RENT_MAP_AUTO_FETCH_STATE';
+const TIMING_SETTINGS_STORAGE_KEY = 'LIANJIA_RENT_TIMING_SETTINGS';
+const COORDINATE_SOURCE_STORAGE_KEY = 'LIANJIA_RENT_COORDINATE_SOURCE';
 const MAP_CACHE_VERSION = 1;
 const CONTENT_FILTER_HOST_LABEL = '品牌';
 const STREAM_LOAD_THRESHOLD_PX = 900;
 const BAIDU_MAP_AK = 'djAasQ167kYWRGbjL2az8aGmHBUmXp4V';
 const MAP_DETAIL_FETCH_LIMIT = 1;
-const MAP_DETAIL_FETCH_DELAY_MS = 900;
+const MAP_DETAIL_FETCH_DELAY_MS = 4000;
 const MAP_DETAIL_FETCH_TIMEOUT_MS = 10000;
-const AUTO_FETCH_PAGE_DELAY_MS = 2500;
-const AUTO_FETCH_RETRY_DELAYS_MS = [20000, 20000, 20000];
+const AUTO_FETCH_PAGE_DELAY_MS = 4000;
+const CAPTCHA_RETRY_DELAY_MS = 20000;
+const MAX_AUTO_FETCH_RETRY_COUNT = 99;
+const COORDINATE_SOURCE_GEOCODE = 'geocode';
+const COORDINATE_SOURCE_FETCH = 'fetch';
+const COORDINATE_SOURCE_TAB = 'tab';
+const COORDINATE_SOURCE_IFRAME = 'iframe';
+const COORDINATE_SOURCE_CASCADE = 'cascade';
+const DEFAULT_COORDINATE_SOURCE = COORDINATE_SOURCE_GEOCODE;
+const COORDINATE_SOURCE_OPTIONS = Object.freeze([
+    { value: COORDINATE_SOURCE_GEOCODE, label: '地理编码' },
+    { value: COORDINATE_SOURCE_FETCH, label: 'fetch' },
+    { value: COORDINATE_SOURCE_TAB, label: '后台标签' },
+    { value: COORDINATE_SOURCE_IFRAME, label: 'iframe' },
+    { value: COORDINATE_SOURCE_CASCADE, label: '级联模式' }
+]);
+const CASCADE_COORDINATE_SOURCES = Object.freeze([
+    COORDINATE_SOURCE_GEOCODE,
+    COORDINATE_SOURCE_IFRAME,
+    COORDINATE_SOURCE_TAB,
+    COORDINATE_SOURCE_FETCH
+]);
 const DEFAULT_FILTER_STATE = Object.freeze({
     beikePreferred: true,
     apartment: true
+});
+const DEFAULT_TIMING_SETTINGS = Object.freeze({
+    autoFetchPageDelayMs: AUTO_FETCH_PAGE_DELAY_MS,
+    mapDetailFetchDelayMs: MAP_DETAIL_FETCH_DELAY_MS,
+    captchaRetryDelayMs: CAPTCHA_RETRY_DELAY_MS
 });
 const streamState = {
     initialized: false,
@@ -62,10 +91,18 @@ const mapState = {
     autoFetchState: null,
     autoFetchLoading: false,
     autoFetchTimer: 0,
+    autoFetchCountdownTimer: 0,
+    timingSettings: null,
+    timingSettingsPanel: null,
+    coordinateSource: null,
     queuedKeys: new Set(),
     fetchedListings: new Map(),
     failedKeys: new Set(),
+    previewImageLoadingKeys: new Set(),
+    previewImageFailedKeys: new Set(),
     activeFetches: 0,
+    mapQueueTimer: 0,
+    lastMapFetchFinishedAt: 0,
     pendingRecords: [],
     blocked: false,
     cache: null
@@ -134,6 +171,55 @@ function normalizeAutoFetchState(value) {
     return state;
 }
 
+function normalizeDelayMs(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? Math.round(number) : fallback;
+}
+
+function normalizeTimingSettings(value) {
+    let source = value;
+    if (typeof source === 'string') {
+        try {
+            source = JSON.parse(source);
+        } catch {
+            source = {};
+        }
+    }
+
+    return {
+        autoFetchPageDelayMs: normalizeDelayMs(source?.autoFetchPageDelayMs, DEFAULT_TIMING_SETTINGS.autoFetchPageDelayMs),
+        mapDetailFetchDelayMs: normalizeDelayMs(source?.mapDetailFetchDelayMs, DEFAULT_TIMING_SETTINGS.mapDetailFetchDelayMs),
+        captchaRetryDelayMs: normalizeDelayMs(source?.captchaRetryDelayMs, DEFAULT_TIMING_SETTINGS.captchaRetryDelayMs)
+    };
+}
+
+function serializeTimingSettings(settings) {
+    return JSON.stringify(normalizeTimingSettings(settings));
+}
+
+function getAutoFetchPageDelay(settings = DEFAULT_TIMING_SETTINGS, multiplier = 1) {
+    const factor = normalizeDelayMs(multiplier, 1);
+    return normalizeTimingSettings(settings).autoFetchPageDelayMs * factor;
+}
+
+function getMapDetailFetchDelay(settings = DEFAULT_TIMING_SETTINGS) {
+    return normalizeTimingSettings(settings).mapDetailFetchDelayMs;
+}
+
+function getCaptchaRetryDelay(settings = DEFAULT_TIMING_SETTINGS) {
+    return normalizeTimingSettings(settings).captchaRetryDelayMs;
+}
+
+function normalizeCoordinateSource(value) {
+    const source = String(value || '').trim();
+    return COORDINATE_SOURCE_OPTIONS.some((option) => option.value === source) ? source : DEFAULT_COORDINATE_SOURCE;
+}
+
+function getCoordinateSourceSequence(source) {
+    const normalized = normalizeCoordinateSource(source);
+    return normalized === COORDINATE_SOURCE_CASCADE ? Array.from(CASCADE_COORDINATE_SOURCES) : [normalized];
+}
+
 function getAutoFetchNextPage(state, searchKey, currentPage, totalPage) {
     const normalized = normalizeAutoFetchState(state);
     const current = parsePositiveInteger(currentPage);
@@ -151,15 +237,18 @@ function markAutoFetchPageFetched(state, searchKey, page) {
     return normalized;
 }
 
-function getAutoFetchRetryDelay(state) {
-    const retryCount = Math.max(0, Number.parseInt(state?.retryCount, 10) || 0);
-    const index = Math.min(retryCount, AUTO_FETCH_RETRY_DELAYS_MS.length - 1);
-    return AUTO_FETCH_RETRY_DELAYS_MS[index];
+function getAutoFetchRetryDelay(state, settings = DEFAULT_TIMING_SETTINGS) {
+    return getCaptchaRetryDelay(settings);
+}
+
+function getAutoFetchRetryStatusText(remainingMs) {
+    const seconds = Math.ceil(Math.max(0, Number(remainingMs) || 0) / 1000);
+    return seconds > 0 ? `遇到验证，${seconds} 秒后重试` : '正在重试';
 }
 
 function markAutoFetchCaptchaRetry(state) {
     const normalized = normalizeAutoFetchState(state);
-    normalized.retryCount = Math.min((normalized.retryCount || 0) + 1, AUTO_FETCH_RETRY_DELAYS_MS.length);
+    normalized.retryCount = Math.min((normalized.retryCount || 0) + 1, MAX_AUTO_FETCH_RETRY_COUNT);
     return normalized;
 }
 
@@ -182,6 +271,11 @@ function getListingKey(listing) {
     const hrefs = Array.isArray(listing?.hrefs) ? listing.hrefs : [];
     const href = hrefs.map((value) => String(value || '').trim()).find(Boolean);
     return href ? `href:${href}` : '';
+}
+
+function getListingKeyFromDetailUrl(url) {
+    const match = /\/(?:zufang|apartment)\/([^/?#]+)\.html(?:[?#].*)?$/.exec(String(url || ''));
+    return match ? `house:${match[1]}` : '';
 }
 
 function filterNewListingKeys(listings, seenKeys) {
@@ -237,6 +331,39 @@ function extractMapPointFromDetailHtml(html) {
     return lonFirst ? normalizeMapPoint({ longitude: lonFirst[1], latitude: lonFirst[2] }) : null;
 }
 
+function normalizePreviewImageUrl(value, baseUrl = typeof window === 'object' ? window.location.href : 'https://lianjia.com/') {
+    const source = String(value || '').trim();
+    if (!source || /^data:|^javascript:/i.test(source)) return '';
+    try {
+        const url = new URL(source.replace(/^\/\//, 'https://'), baseUrl);
+        return /^https?:$/.test(url.protocol) ? url.href : '';
+    } catch {
+        return '';
+    }
+}
+
+function readHtmlAttribute(text, name) {
+    const match = new RegExp(`${name}\\s*=\\s*["']([^"']+)["']`, 'i').exec(String(text || ''));
+    return match ? match[1] : '';
+}
+
+function extractPreviewImageFromDetailHtml(html, baseUrl) {
+    const source = String(html || '');
+    const metaMatch = /<meta\b[^>]*(?:property|name)\s*=\s*["'](?:og:image|twitter:image|image)["'][^>]*>/i.exec(source);
+    const metaUrl = normalizePreviewImageUrl(readHtmlAttribute(metaMatch?.[0], 'content'), baseUrl);
+    if (metaUrl) return metaUrl;
+
+    const imgMatches = source.match(/<img\b[^>]*>/gi) || [];
+    for (const img of imgMatches) {
+        const imageUrl = normalizePreviewImageUrl(
+            readHtmlAttribute(img, 'data-src') || readHtmlAttribute(img, 'data-original') || readHtmlAttribute(img, 'src'),
+            baseUrl
+        );
+        if (imageUrl) return imageUrl;
+    }
+    return '';
+}
+
 function normalizeCachedMapRecord(record, fallbackUpdatedAt) {
     const key = String(record?.key || '').trim();
     const detailUrl = String(record?.detailUrl || '').trim();
@@ -250,8 +377,13 @@ function normalizeCachedMapRecord(record, fallbackUpdatedAt) {
         price: String(record?.price || ''),
         updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : fallbackUpdatedAt
     };
+    if (record?.address) normalized.address = String(record.address);
+    if (record?.city) normalized.city = String(record.city);
     const point = normalizeMapPoint(record?.point);
     if (point) normalized.point = point;
+    const previewImageUrl = normalizePreviewImageUrl(record?.previewImageUrl, detailUrl);
+    if (previewImageUrl) normalized.previewImageUrl = previewImageUrl;
+    if (record?.coordinateSource) normalized.coordinateSource = normalizeCoordinateSource(record.coordinateSource);
     const kinds = normalizeListingKinds(record?.kinds);
     if (kinds) normalized.kinds = kinds;
     const searchKeys = Array.isArray(record?.searchKeys)
@@ -287,6 +419,7 @@ function mergeMapCacheRecords(cache, records, updatedAt = Date.now(), sourceKey 
         const existing = next.listings[key];
         const existingPoint = normalizeMapPoint(existing?.point);
         const incomingPoint = normalizeMapPoint(record?.point);
+        const previewImageUrl = normalizePreviewImageUrl(record?.previewImageUrl || existing?.previewImageUrl, record?.detailUrl || existing?.detailUrl);
         const searchKeys = [
             ...(Array.isArray(existing?.searchKeys) ? existing.searchKeys : []),
             ...(Array.isArray(record?.searchKeys) ? record.searchKeys : []),
@@ -296,6 +429,7 @@ function mergeMapCacheRecords(cache, records, updatedAt = Date.now(), sourceKey 
             ...existing,
             ...record,
             point: incomingPoint || existingPoint,
+            previewImageUrl,
             searchKeys,
             updatedAt
         }, updatedAt);
@@ -327,9 +461,11 @@ function hydrateMapRecordsFromCache(records, cache) {
         const cached = parsed.listings[String(record?.key || '').trim()];
         const point = normalizeMapPoint(cached?.point);
         if (!point) return record;
+        const previewImageUrl = normalizePreviewImageUrl(record.previewImageUrl || cached.previewImageUrl, record.detailUrl || cached.detailUrl);
         return {
             ...record,
             point,
+            ...(previewImageUrl ? { previewImageUrl } : {}),
             updatedAt: cached.updatedAt
         };
     });
@@ -419,6 +555,54 @@ function writeStoredAutoFetchState(state) {
     }
 }
 
+function readStoredTimingSettings() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeTimingSettings(GM_getValue(TIMING_SETTINGS_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeTimingSettings(window.localStorage?.getItem(TIMING_SETTINGS_STORAGE_KEY));
+    } catch {
+        return DEFAULT_TIMING_SETTINGS;
+    }
+}
+
+function writeStoredTimingSettings(settings) {
+    const serialized = serializeTimingSettings(settings);
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(TIMING_SETTINGS_STORAGE_KEY, serialized);
+        return;
+    }
+    try {
+        window.localStorage?.setItem(TIMING_SETTINGS_STORAGE_KEY, serialized);
+    } catch {
+        // Timing changes still apply for the current page session when storage is unavailable.
+    }
+}
+
+function readStoredCoordinateSource() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeCoordinateSource(GM_getValue(COORDINATE_SOURCE_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeCoordinateSource(window.localStorage?.getItem(COORDINATE_SOURCE_STORAGE_KEY));
+    } catch {
+        return DEFAULT_COORDINATE_SOURCE;
+    }
+}
+
+function writeStoredCoordinateSource(source) {
+    const normalized = normalizeCoordinateSource(source);
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(COORDINATE_SOURCE_STORAGE_KEY, normalized);
+        return;
+    }
+    try {
+        window.localStorage?.setItem(COORDINATE_SOURCE_STORAGE_KEY, normalized);
+    } catch {
+        // Coordinate source changes still apply for the current page session when storage is unavailable.
+    }
+}
+
 function getAsideText(row) {
     const aside = row?.querySelector?.('.filter__item--aside');
     return (aside?.textContent || '').replace(/\s+/g, '');
@@ -495,10 +679,23 @@ function installStyles() {
         '.lj-rent-map-panel__actions{display:flex;align-items:center;gap:12px;}',
         '.lj-rent-map-auto{display:inline-flex;align-items:center;gap:5px;color:#666;font-size:12px;cursor:pointer;white-space:nowrap;}',
         '.lj-rent-map-auto input{width:13px;height:13px;margin:0;accent-color:#00ae66;}',
+        '.lj-rent-map-settings{position:relative;display:inline-flex;align-items:center;}',
+        '.lj-rent-map-settings__button{height:22px;padding:0 8px;border:1px solid #ddd;background:#fff;color:#666;font-size:12px;line-height:20px;cursor:pointer;}',
+        '.lj-rent-map-settings__panel{position:absolute;top:28px;right:0;z-index:10;width:210px;padding:10px;border:1px solid #ddd;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.12);color:#394043;font-size:12px;}',
+        '.lj-rent-map-settings__row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;}',
+        '.lj-rent-map-settings__row input{width:64px;height:24px;padding:0 5px;border:1px solid #ddd;color:#394043;font-size:12px;}',
+        '.lj-rent-map-settings__row select{width:94px;height:24px;border:1px solid #ddd;background:#fff;color:#394043;font-size:12px;}',
+        '.lj-rent-map-settings__field{display:inline-flex;align-items:center;gap:4px;}',
+        '.lj-rent-map-settings__actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:2px;}',
+        '.lj-rent-map-settings__actions button{height:24px;padding:0 9px;border:1px solid #ddd;background:#fff;color:#394043;font-size:12px;cursor:pointer;}',
+        '.lj-rent-map-settings__actions button[data-primary="true"]{border-color:#00ae66;background:#00ae66;color:#fff;}',
+        '.lj-rent-map-settings__error{min-height:16px;color:#fa5741;font-size:12px;line-height:16px;}',
         '.lj-rent-map-panel__status{color:#888;font-size:12px;}',
         '.lj-rent-map-panel__canvas{height:360px;background:#f7f7f7;}',
         '.lj-rent-map-info{min-width:180px;max-width:260px;color:#394043;line-height:1.5;}',
         '.lj-rent-map-info__title{font-weight:600;margin-bottom:4px;}',
+        '.lj-rent-map-info__preview{width:220px;max-width:100%;height:128px;margin:4px 0 6px;border-radius:2px;background:#f5f5f5;object-fit:cover;display:block;}',
+        '.lj-rent-map-info__preview-state{width:220px;max-width:100%;height:34px;margin:4px 0 6px;color:#999;font-size:12px;line-height:34px;text-align:center;background:#f7f7f7;}',
         '.lj-rent-map-info__price{color:#fa5741;margin-bottom:4px;}',
         '.lj-rent-map-info__link{color:#00ae66;text-decoration:none;}'
     ].join('');
@@ -591,6 +788,47 @@ function getListingPrice(card) {
     return (card.querySelector('.content__list--item-price')?.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
+function getListingAddress(card) {
+    return (card.querySelector('.content__list--item--des')?.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+function getListingPreviewImage(card) {
+    const image = Array.from(card.querySelectorAll('img')).find((node) => {
+        return normalizePreviewImageUrl(node.getAttribute('data-src') || node.getAttribute('data-original') || node.getAttribute('src'));
+    });
+    return image ? normalizePreviewImageUrl(image.getAttribute('data-src') || image.getAttribute('data-original') || image.getAttribute('src')) : '';
+}
+
+function getCurrentCityName(hostname = window.location.hostname) {
+    const cityCode = String(hostname || '').split('.')[0];
+    const cityNames = {
+        bj: '北京',
+        cd: '成都',
+        cq: '重庆',
+        cs: '长沙',
+        dg: '东莞',
+        fs: '佛山',
+        gz: '广州',
+        hz: '杭州',
+        nj: '南京',
+        sh: '上海',
+        sz: '深圳',
+        tj: '天津',
+        wh: '武汉',
+        xa: '西安'
+    };
+    return cityNames[cityCode] || '';
+}
+
+function buildGeocodeQuery(record) {
+    const city = String(record?.city || getCurrentCityName()).trim();
+    const candidate = [record?.community, record?.title, record?.address]
+        .map((value) => String(value || '').replace(/\s+/g, ' ').trim())
+        .find(Boolean);
+    if (!candidate) return city;
+    return city && !candidate.includes(city) ? `${city}${candidate}` : candidate;
+}
+
 function getMapRecordFromCard(card) {
     const listing = getListingData(card);
     const key = getListingKey(listing);
@@ -599,8 +837,11 @@ function getMapRecordFromCard(card) {
     return {
         key,
         detailUrl,
+        address: getListingAddress(card),
+        city: getCurrentCityName(),
         title: getListingTitle(card),
         price: getListingPrice(card),
+        previewImageUrl: getListingPreviewImage(card),
         kinds: classifyListingContent(listing)
     };
 }
@@ -699,7 +940,7 @@ function ensureMapPanel() {
 
     const actions = document.createElement('div');
     actions.className = 'lj-rent-map-panel__actions';
-    actions.append(buildAutoFetchControl(), status);
+    actions.append(buildAutoFetchControl(), buildTimingSettingsControl(), status);
 
     const canvas = document.createElement('div');
     canvas.className = 'lj-rent-map-panel__canvas';
@@ -727,15 +968,72 @@ function getAutoFetchState() {
     return mapState.autoFetchState;
 }
 
+function isAutoFetchEnabled() {
+    return getAutoFetchState().enabled === true;
+}
+
+function getTimingSettings() {
+    if (!mapState.timingSettings) {
+        mapState.timingSettings = readStoredTimingSettings();
+    }
+    return mapState.timingSettings;
+}
+
+function getCoordinateSource() {
+    if (!mapState.coordinateSource) {
+        mapState.coordinateSource = readStoredCoordinateSource();
+    }
+    return mapState.coordinateSource;
+}
+
 function saveAutoFetchState(state) {
     mapState.autoFetchState = normalizeAutoFetchState(state);
     writeStoredAutoFetchState(mapState.autoFetchState);
+}
+
+function saveTimingSettings(settings) {
+    mapState.timingSettings = normalizeTimingSettings(settings);
+    writeStoredTimingSettings(mapState.timingSettings);
+    return mapState.timingSettings;
+}
+
+function saveCoordinateSource(source) {
+    mapState.coordinateSource = normalizeCoordinateSource(source);
+    writeStoredCoordinateSource(mapState.coordinateSource);
+    return mapState.coordinateSource;
 }
 
 function setAutoFetchStatus(text) {
     if (mapState.autoFetchStatus) {
         mapState.autoFetchStatus.textContent = text;
     }
+}
+
+function clearMapQueue() {
+    window.clearTimeout(mapState.mapQueueTimer);
+    mapState.mapQueueTimer = 0;
+    mapState.pendingRecords = [];
+    mapState.queuedKeys.clear();
+}
+
+function applyTimingSettingsNow() {
+    window.clearTimeout(mapState.mapQueueTimer);
+    mapState.mapQueueTimer = 0;
+    processMapQueue();
+
+    window.clearTimeout(mapState.autoFetchTimer);
+    mapState.autoFetchTimer = 0;
+    if (!isAutoFetchEnabled() || mapState.autoFetchLoading) return;
+
+    if (mapState.blocked) {
+        const delay = getAutoFetchRetryDelay(getAutoFetchState(), getTimingSettings());
+        startAutoFetchRetryCountdown(delay);
+        scheduleAutoFetch(delay);
+        return;
+    }
+
+    stopAutoFetchRetryCountdown();
+    scheduleAutoFetch(getAutoFetchPageDelay(getTimingSettings()));
 }
 
 function buildAutoFetchControl() {
@@ -771,15 +1069,169 @@ function buildAutoFetchControl() {
     return label;
 }
 
+function getTimingSettingSeconds(settings, key) {
+    return Math.max(1, Math.round(normalizeTimingSettings(settings)[key] / 1000));
+}
+
+function fillTimingSettingsPanel(panel, settings) {
+    panel.querySelectorAll('[data-lj-rent-timing-key]').forEach((input) => {
+        input.value = String(getTimingSettingSeconds(settings, input.dataset.ljRentTimingKey));
+    });
+    const sourceSelect = panel.querySelector('[data-lj-rent-coordinate-source]');
+    if (sourceSelect) sourceSelect.value = DEFAULT_COORDINATE_SOURCE;
+}
+
+function readTimingSettingsPanel(panel) {
+    const values = {};
+    let valid = true;
+    panel.querySelectorAll('[data-lj-rent-timing-key]').forEach((input) => {
+        const seconds = Number(input.value);
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+            valid = false;
+            return;
+        }
+        values[input.dataset.ljRentTimingKey] = Math.round(seconds * 1000);
+    });
+    return valid ? normalizeTimingSettings(values) : null;
+}
+
+function buildTimingSettingsRow(key, labelText, settings) {
+    const row = document.createElement('label');
+    row.className = 'lj-rent-map-settings__row';
+
+    const label = document.createElement('span');
+    label.textContent = labelText;
+
+    const field = document.createElement('span');
+    field.className = 'lj-rent-map-settings__field';
+
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.step = '1';
+    input.value = String(getTimingSettingSeconds(settings, key));
+    input.dataset.ljRentTimingKey = key;
+
+    const unit = document.createElement('span');
+    unit.textContent = '秒';
+
+    field.append(input, unit);
+    row.append(label, field);
+    return row;
+}
+
+function buildCoordinateSourceRow(source) {
+    const row = document.createElement('label');
+    row.className = 'lj-rent-map-settings__row';
+
+    const label = document.createElement('span');
+    label.textContent = '坐标来源';
+
+    const select = document.createElement('select');
+    select.dataset.ljRentCoordinateSource = 'true';
+    COORDINATE_SOURCE_OPTIONS.forEach((option) => {
+        const item = document.createElement('option');
+        item.value = option.value;
+        item.textContent = option.label;
+        select.append(item);
+    });
+    select.value = normalizeCoordinateSource(source);
+
+    row.append(label, select);
+    return row;
+}
+
+function buildTimingSettingsPanel() {
+    const settings = getTimingSettings();
+    const coordinateSource = getCoordinateSource();
+    const panel = document.createElement('div');
+    panel.className = 'lj-rent-map-settings__panel';
+    panel.dataset.ljRentTimingSettingsPanel = 'true';
+
+    const error = document.createElement('div');
+    error.className = 'lj-rent-map-settings__error';
+
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.textContent = '重置';
+
+    const confirm = document.createElement('button');
+    confirm.type = 'button';
+    confirm.textContent = '确定';
+    confirm.dataset.primary = 'true';
+
+    const actions = document.createElement('div');
+    actions.className = 'lj-rent-map-settings__actions';
+    actions.append(reset, confirm);
+
+    panel.append(
+        buildCoordinateSourceRow(coordinateSource),
+        buildTimingSettingsRow('autoFetchPageDelayMs', '自动抓取间隔', settings),
+        buildTimingSettingsRow('mapDetailFetchDelayMs', '坐标读取间隔', settings),
+        buildTimingSettingsRow('captchaRetryDelayMs', '验证重试间隔', settings),
+        error,
+        actions
+    );
+
+    reset.addEventListener('click', () => {
+        error.textContent = '';
+        fillTimingSettingsPanel(panel, DEFAULT_TIMING_SETTINGS);
+    });
+
+    confirm.addEventListener('click', () => {
+        const nextSettings = readTimingSettingsPanel(panel);
+        if (!nextSettings) {
+            error.textContent = '请输入大于 0 的秒数';
+            return;
+        }
+        saveTimingSettings(nextSettings);
+        saveCoordinateSource(panel.querySelector('[data-lj-rent-coordinate-source]')?.value);
+        applyTimingSettingsNow();
+        setAutoFetchStatus('设置已保存');
+        mapState.timingSettingsPanel = null;
+        panel.remove();
+    });
+
+    mapState.timingSettingsPanel = panel;
+    return panel;
+}
+
+function buildTimingSettingsControl() {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'lj-rent-map-settings';
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'lj-rent-map-settings__button';
+    button.textContent = '设置';
+
+    button.addEventListener('click', () => {
+        if (mapState.timingSettingsPanel?.isConnected) {
+            mapState.timingSettingsPanel.remove();
+            mapState.timingSettingsPanel = null;
+            return;
+        }
+        wrapper.append(buildTimingSettingsPanel());
+    });
+
+    wrapper.append(button);
+    return wrapper;
+}
+
 function updateMapStatus(records) {
+    const mapped = records.filter((record) => mapState.fetchedListings.has(record.key)).length;
+    const failed = records.filter((record) => mapState.failedKeys.has(record.key)).length;
+    const pending = records.length - mapped - failed;
+
+    if (!isAutoFetchEnabled() && pending > 0) {
+        setMapStatus(mapped > 0 ? `已标记 ${mapped} 套，自动抓取已关闭` : '自动抓取已关闭');
+        return;
+    }
+
     if (mapState.blocked) {
         setMapStatus('遇到验证，稍后重试');
         return;
     }
-
-    const mapped = records.filter((record) => mapState.fetchedListings.has(record.key)).length;
-    const failed = records.filter((record) => mapState.failedKeys.has(record.key)).length;
-    const pending = records.length - mapped - failed;
 
     if (!records.length) {
         setMapStatus('暂无可标记房源');
@@ -846,13 +1298,28 @@ async function ensureMapReady() {
     return mapState.mapReadyPromise;
 }
 
-function buildInfoWindowHtml(record) {
+function buildPreviewHtml(record, options = {}) {
+    const previewImageUrl = normalizePreviewImageUrl(record?.previewImageUrl, record?.detailUrl);
+    if (previewImageUrl) {
+        return `<img class="lj-rent-map-info__preview" src="${escapeHtml(previewImageUrl)}" alt="">`;
+    }
+    if (options.previewLoading) {
+        return '<div class="lj-rent-map-info__preview-state">正在读取图片...</div>';
+    }
+    if (options.previewFailed) {
+        return '<div class="lj-rent-map-info__preview-state">图片获取失败</div>';
+    }
+    return '';
+}
+
+function buildInfoWindowHtml(record, options = {}) {
     const title = escapeHtml(record.title);
     const price = escapeHtml(record.price);
     const detailUrl = escapeHtml(record.detailUrl);
     return [
         '<div class="lj-rent-map-info">',
         `<div class="lj-rent-map-info__title">${title}</div>`,
+        buildPreviewHtml(record, options),
         price ? `<div class="lj-rent-map-info__price">${price}</div>` : '',
         `<a class="lj-rent-map-info__link" href="${detailUrl}" target="_blank" rel="noopener">查看房源</a>`,
         '</div>'
@@ -880,6 +1347,7 @@ function renderListingMap() {
             const infoWindow = new BMap.InfoWindow(buildInfoWindowHtml(record));
             marker.addEventListener('click', () => {
                 map.openInfoWindow(infoWindow, point);
+                loadPreviewImageForInfoWindow(record, infoWindow);
             });
             map.addOverlay(marker);
         });
@@ -895,7 +1363,123 @@ function renderListingMap() {
     });
 }
 
-async function fetchMapRecord(record) {
+function updateInfoWindowContent(infoWindow, record, options = {}) {
+    if (typeof infoWindow?.setContent === 'function') {
+        infoWindow.setContent(buildInfoWindowHtml(record, options));
+    }
+}
+
+async function loadPreviewImageForInfoWindow(record, infoWindow) {
+    if (record.previewImageUrl || mapState.previewImageLoadingKeys.has(record.key)) return;
+    if (mapState.previewImageFailedKeys.has(record.key)) {
+        updateInfoWindowContent(infoWindow, record, { previewFailed: true });
+        return;
+    }
+
+    mapState.previewImageLoadingKeys.add(record.key);
+    updateInfoWindowContent(infoWindow, record, { previewLoading: true });
+    try {
+        const previewImageUrl = await fetchPreviewImageForRecord(record);
+        const cachedRecord = { ...record, previewImageUrl };
+        mapState.fetchedListings.set(record.key, cachedRecord);
+        rememberMapRecords([cachedRecord]);
+        updateInfoWindowContent(infoWindow, cachedRecord);
+    } catch {
+        mapState.previewImageFailedKeys.add(record.key);
+        updateInfoWindowContent(infoWindow, record, { previewFailed: true });
+    } finally {
+        mapState.previewImageLoadingKeys.delete(record.key);
+    }
+}
+
+async function fetchPreviewImageForRecord(record) {
+    const response = await fetchWithTimeout(record.detailUrl, { credentials: 'same-origin' }, MAP_DETAIL_FETCH_TIMEOUT_MS);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+    if (isCaptchaResponse(response, html)) throw new Error('captcha');
+    const previewImageUrl = extractPreviewImageFromDetailHtml(html, record.detailUrl);
+    if (!previewImageUrl) throw new Error('preview image missing');
+    return previewImageUrl;
+}
+
+function rememberCoordinateRecord(record, point, coordinateSource) {
+    const cachedRecord = { ...record, point, coordinateSource };
+    mapState.fetchedListings.set(record.key, cachedRecord);
+    rememberMapRecords([cachedRecord]);
+    return cachedRecord;
+}
+
+function findCachedCoordinateRecord(record, cache = readStoredMapCache()) {
+    const parsed = parseStoredMapCache(cache);
+    const key = String(record?.key || '').trim();
+    const detailUrl = String(record?.detailUrl || '').trim();
+    const cached = parsed.listings[key] || Object.values(parsed.listings).find((item) => item.detailUrl === detailUrl);
+    const point = normalizeMapPoint(cached?.point);
+    return point ? { ...record, ...cached, point } : null;
+}
+
+function closeOpenedTab(tabHandle) {
+    try {
+        if (typeof tabHandle?.close === 'function') tabHandle.close();
+    } catch {
+        // The opened tab may already be closed by the browser or userscript manager.
+    }
+}
+
+function waitForCachedCoordinate(record, tabHandle) {
+    const startedAt = Date.now();
+    return new Promise((resolve, reject) => {
+        const poll = () => {
+            if (!isAutoFetchEnabled()) {
+                closeOpenedTab(tabHandle);
+                reject(new Error('auto disabled'));
+                return;
+            }
+            const cached = findCachedCoordinateRecord(record);
+            if (cached) {
+                closeOpenedTab(tabHandle);
+                resolve(cached.point);
+                return;
+            }
+            if (Date.now() - startedAt >= MAP_DETAIL_FETCH_TIMEOUT_MS) {
+                closeOpenedTab(tabHandle);
+                reject(new Error('coordinate missing'));
+                return;
+            }
+            window.setTimeout(poll, 1000);
+        };
+        poll();
+    });
+}
+
+function geocodePoint(query, city) {
+    return ensureMapReady().then(() => loadBaiduMap()).then((BMap) => new Promise((resolve, reject) => {
+        if (!BMap?.Geocoder) {
+            reject(new Error('geocoder missing'));
+            return;
+        }
+        const geocoder = new BMap.Geocoder();
+        const timeoutId = window.setTimeout(() => reject(new Error('coordinate missing')), MAP_DETAIL_FETCH_TIMEOUT_MS);
+        geocoder.getPoint(query, (point) => {
+            window.clearTimeout(timeoutId);
+            const normalized = normalizeMapPoint(point);
+            if (normalized) {
+                resolve(normalized);
+            } else {
+                reject(new Error('coordinate missing'));
+            }
+        }, city || undefined);
+    }));
+}
+
+async function fetchMapRecordByGeocode(record) {
+    const query = buildGeocodeQuery(record);
+    if (!query) throw new Error('coordinate missing');
+    const point = await geocodePoint(query, record.city || getCurrentCityName());
+    return rememberCoordinateRecord(record, point, COORDINATE_SOURCE_GEOCODE);
+}
+
+async function fetchMapRecordByFetch(record) {
     const response = await fetchWithTimeout(record.detailUrl, { credentials: 'same-origin' }, MAP_DETAIL_FETCH_TIMEOUT_MS);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const html = await response.text();
@@ -904,9 +1488,85 @@ async function fetchMapRecord(record) {
     }
     const point = extractMapPointFromDetailHtml(html);
     if (!point) throw new Error('coordinate missing');
-    const cachedRecord = { ...record, point };
-    mapState.fetchedListings.set(record.key, cachedRecord);
-    rememberMapRecords([cachedRecord]);
+    return rememberCoordinateRecord({
+        ...record,
+        previewImageUrl: extractPreviewImageFromDetailHtml(html, record.detailUrl) || record.previewImageUrl
+    }, point, COORDINATE_SOURCE_FETCH);
+}
+
+async function fetchMapRecordByIframe(record) {
+    if (typeof document !== 'object') throw new Error('iframe unavailable');
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;top:-9999px;border:0;visibility:hidden;';
+    iframe.src = record.detailUrl;
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+            window.clearTimeout(timeoutId);
+            iframe.remove();
+        };
+        const settle = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(value);
+        };
+        const timeoutId = window.setTimeout(() => settle(reject, new Error('coordinate missing')), MAP_DETAIL_FETCH_TIMEOUT_MS);
+
+        iframe.addEventListener('load', () => {
+            try {
+                const frameWindow = iframe.contentWindow;
+                const frameDocument = iframe.contentDocument || frameWindow?.document;
+                const html = frameDocument?.documentElement?.outerHTML || '';
+                if (isCaptchaResponse({ url: frameWindow?.location?.href || iframe.src }, html)) {
+                    settle(reject, new Error('captcha'));
+                    return;
+                }
+                const point = extractMapPointFromDetailHtml(html);
+                if (!point) {
+                    settle(reject, new Error('coordinate missing'));
+                    return;
+                }
+                settle(resolve, rememberCoordinateRecord({
+                    ...record,
+                    previewImageUrl: extractPreviewImageFromDetailHtml(html, record.detailUrl) || record.previewImageUrl
+                }, point, COORDINATE_SOURCE_IFRAME));
+            } catch {
+                settle(reject, new Error('coordinate missing'));
+            }
+        });
+        iframe.addEventListener('error', () => settle(reject, new Error('coordinate missing')));
+        document.body.append(iframe);
+    });
+}
+
+async function fetchMapRecordByTab(record) {
+    if (typeof GM_openInTab !== 'function') throw new Error('tab unavailable');
+    const tabHandle = GM_openInTab(record.detailUrl, { active: false, insert: true, setParent: true });
+    const point = await waitForCachedCoordinate(record, tabHandle);
+    return rememberCoordinateRecord(record, point, COORDINATE_SOURCE_TAB);
+}
+
+async function fetchMapRecordWithSource(record, source) {
+    if (source === COORDINATE_SOURCE_GEOCODE) return fetchMapRecordByGeocode(record);
+    if (source === COORDINATE_SOURCE_IFRAME) return fetchMapRecordByIframe(record);
+    if (source === COORDINATE_SOURCE_TAB) return fetchMapRecordByTab(record);
+    return fetchMapRecordByFetch(record);
+}
+
+async function fetchMapRecord(record) {
+    let lastError = null;
+    for (const source of getCoordinateSourceSequence(getCoordinateSource())) {
+        if (!isAutoFetchEnabled()) throw new Error('auto disabled');
+        try {
+            return await fetchMapRecordWithSource(record, source);
+        } catch (error) {
+            if (error?.message === 'captcha') throw error;
+            lastError = error;
+        }
+    }
+    throw lastError || new Error('coordinate missing');
 }
 
 function fetchWithTimeout(url, options = {}, timeoutMs = MAP_DETAIL_FETCH_TIMEOUT_MS, fetchImpl = fetch) {
@@ -922,6 +1582,33 @@ function fetchWithTimeout(url, options = {}, timeoutMs = MAP_DETAIL_FETCH_TIMEOU
     });
 }
 
+function isRentListPageUrl(url) {
+    return /^https:\/\/[^/]+\.lianjia\.com\/(?:ditiezufang|zufang)(?:\/|$)/.test(String(url || ''))
+        && !isRentDetailPageUrl(url);
+}
+
+function isRentDetailPageUrl(url) {
+    return /^https:\/\/[^/]+\.lianjia\.com\/(?:zufang|apartment)\/[^/?#]+\.html(?:[?#].*)?$/.test(String(url || ''));
+}
+
+function captureDetailPageCoordinate() {
+    const key = getListingKeyFromDetailUrl(window.location.href);
+    if (!key) return;
+    const point = extractMapPointFromDetailHtml(document.documentElement?.outerHTML || '');
+    if (!point) return;
+    const record = {
+        key,
+        detailUrl: window.location.href,
+        title: document.title || '',
+        price: '',
+        point,
+        previewImageUrl: extractPreviewImageFromDetailHtml(document.documentElement?.outerHTML || '', window.location.href),
+        coordinateSource: COORDINATE_SOURCE_TAB
+    };
+    mapState.cache = mergeMapCacheRecords(readStoredMapCache(), [record], Date.now(), '');
+    writeStoredMapCache(mapState.cache);
+}
+
 function isCaptchaResponse(response, html) {
     return /\/captcha(?:\?|$)/.test(response?.url || '') || /hip\.lianjia\.com\/captcha|人机验证|CAPTCHA/.test(String(html || ''));
 }
@@ -933,35 +1620,65 @@ function releaseQueuedMapRecordKeys(queuedKeys, records) {
     return queuedKeys;
 }
 
-function processMapQueue() {
-    if (mapState.blocked) return;
-
-    while (mapState.activeFetches < MAP_DETAIL_FETCH_LIMIT && mapState.pendingRecords.length) {
-        const record = mapState.pendingRecords.shift();
-        mapState.activeFetches += 1;
-        fetchMapRecord(record)
-            .catch((error) => {
-                if (error?.message === 'captcha') {
-                    pauseForCaptchaRetry();
-                    releaseQueuedMapRecordKeys(mapState.queuedKeys, mapState.pendingRecords);
-                    mapState.pendingRecords = [];
-                    return;
-                }
-                mapState.failedKeys.add(record.key);
-            })
-            .finally(() => {
-                mapState.activeFetches -= 1;
-                mapState.queuedKeys.delete(record.key);
-                renderListingMap();
-                if (!mapState.blocked) {
-                    window.setTimeout(processMapQueue, MAP_DETAIL_FETCH_DELAY_MS);
-                }
-            });
+function getMapQueueWaitMs(state, settingsOrNow = DEFAULT_TIMING_SETTINGS, nowOrUndefined) {
+    const settings = typeof settingsOrNow === 'number' ? DEFAULT_TIMING_SETTINGS : settingsOrNow;
+    const now = typeof settingsOrNow === 'number' ? settingsOrNow : (nowOrUndefined ?? Date.now());
+    if (state?.autoFetchEnabled === false || state?.blocked || (state?.activeFetches || 0) >= MAP_DETAIL_FETCH_LIMIT || !state?.pendingRecords?.length) {
+        return null;
     }
+    const lastFinishedAt = Number(state?.lastMapFetchFinishedAt) || 0;
+    if (!lastFinishedAt) return 0;
+    return Math.max(0, lastFinishedAt + getMapDetailFetchDelay(settings) - now);
+}
+
+function scheduleMapQueue(delay) {
+    window.clearTimeout(mapState.mapQueueTimer);
+    mapState.mapQueueTimer = 0;
+    if (delay === null || mapState.blocked || !isAutoFetchEnabled() || !mapState.pendingRecords.length) return;
+    mapState.mapQueueTimer = window.setTimeout(processMapQueue, Math.max(0, delay));
+}
+
+function processMapQueue() {
+    window.clearTimeout(mapState.mapQueueTimer);
+    mapState.mapQueueTimer = 0;
+
+    if (!isAutoFetchEnabled()) {
+        clearMapQueue();
+        return;
+    }
+
+    const waitMs = getMapQueueWaitMs({ ...mapState, autoFetchEnabled: true }, getTimingSettings());
+    if (waitMs === null) return;
+    if (waitMs > 0) {
+        scheduleMapQueue(waitMs);
+        return;
+    }
+
+    const record = mapState.pendingRecords.shift();
+    mapState.activeFetches += 1;
+    fetchMapRecord(record)
+        .catch((error) => {
+            if (error?.message === 'captcha') {
+                pauseForCaptchaRetry();
+                releaseQueuedMapRecordKeys(mapState.queuedKeys, mapState.pendingRecords);
+                mapState.pendingRecords = [];
+                return;
+            }
+            mapState.failedKeys.add(record.key);
+        })
+        .finally(() => {
+            mapState.activeFetches -= 1;
+            mapState.lastMapFetchFinishedAt = Date.now();
+            mapState.queuedKeys.delete(record.key);
+            renderListingMap();
+            if (!mapState.blocked) {
+                processMapQueue();
+            }
+        });
 }
 
 function enqueueMapRecords(records) {
-    if (mapState.blocked) return;
+    if (mapState.blocked || !isAutoFetchEnabled()) return;
 
     records.forEach((record) => {
         if (mapState.fetchedListings.has(record.key) || mapState.failedKeys.has(record.key) || mapState.queuedKeys.has(record.key)) return;
@@ -987,25 +1704,49 @@ function getAutoFetchPageUrl(page) {
 
 function stopAutoFetch() {
     window.clearTimeout(mapState.autoFetchTimer);
+    stopAutoFetchRetryCountdown();
+    clearMapQueue();
+    mapState.blocked = false;
     mapState.autoFetchTimer = 0;
     mapState.autoFetchLoading = false;
     setAutoFetchStatus('');
+    refreshListingMap();
 }
 
-function scheduleAutoFetch(delay = AUTO_FETCH_PAGE_DELAY_MS) {
+function scheduleAutoFetch(delay = getAutoFetchPageDelay(getTimingSettings())) {
     window.clearTimeout(mapState.autoFetchTimer);
-    if (!getAutoFetchState().enabled) return;
+    if (!isAutoFetchEnabled()) return;
     mapState.autoFetchTimer = window.setTimeout(runAutoFetchStep, delay);
 }
 
 function startAutoFetch() {
     if (mapState.blocked) {
-        setAutoFetchStatus('等待重试');
-        scheduleAutoFetch(getAutoFetchRetryDelay(getAutoFetchState()));
+        const delay = getAutoFetchRetryDelay(getAutoFetchState(), getTimingSettings());
+        startAutoFetchRetryCountdown(delay);
+        scheduleAutoFetch(delay);
         return;
     }
     setAutoFetchStatus('等待中');
     scheduleAutoFetch(0);
+}
+
+function stopAutoFetchRetryCountdown() {
+    window.clearInterval(mapState.autoFetchCountdownTimer);
+    mapState.autoFetchCountdownTimer = 0;
+}
+
+function startAutoFetchRetryCountdown(delay) {
+    const retryAt = Date.now() + delay;
+    stopAutoFetchRetryCountdown();
+    const render = () => {
+        const remaining = retryAt - Date.now();
+        setAutoFetchStatus(getAutoFetchRetryStatusText(remaining));
+        if (remaining <= 0) {
+            stopAutoFetchRetryCountdown();
+        }
+    };
+    render();
+    mapState.autoFetchCountdownTimer = window.setInterval(render, 1000);
 }
 
 function refreshMapAfterAutoFetchStep() {
@@ -1019,16 +1760,17 @@ function refreshMapAfterAutoFetchStep() {
 function pauseForCaptchaRetry() {
     mapState.blocked = true;
     const currentState = getAutoFetchState();
-    const delay = getAutoFetchRetryDelay(currentState);
+    const delay = getAutoFetchRetryDelay(currentState, getTimingSettings());
     const state = markAutoFetchCaptchaRetry(currentState);
     saveAutoFetchState(state);
-    setAutoFetchStatus(`遇到验证，${Math.round(delay / 1000)} 秒后重试`);
+    startAutoFetchRetryCountdown(delay);
     setMapStatus('遇到验证，稍后重试');
     scheduleAutoFetch(delay);
 }
 
 async function runAutoFetchStep() {
-    if (!getAutoFetchState().enabled || mapState.autoFetchLoading) return;
+    if (!isAutoFetchEnabled() || mapState.autoFetchLoading) return;
+    stopAutoFetchRetryCountdown();
     if (mapState.blocked) {
         mapState.blocked = false;
     }
@@ -1073,7 +1815,7 @@ async function runAutoFetchStep() {
             return;
         }
         setAutoFetchStatus('抓取失败');
-        scheduleAutoFetch(AUTO_FETCH_PAGE_DELAY_MS * 2);
+        scheduleAutoFetch(getAutoFetchPageDelay(getTimingSettings(), 2));
     } finally {
         mapState.autoFetchLoading = false;
     }
@@ -1097,7 +1839,7 @@ function initListingMap() {
     mapState.initialized = true;
     ensureMapCache();
     refreshListingMap();
-    if (getAutoFetchState().enabled) {
+    if (isAutoFetchEnabled()) {
         startAutoFetch();
     }
 }
@@ -1277,7 +2019,11 @@ function startContentObserver() {
 }
 
 function init() {
-    if (!/^https:\/\/[^/]+\.lianjia\.com\/(?:ditiezufang|zufang)\//.test(window.location.href)) return;
+    if (isRentDetailPageUrl(window.location.href)) {
+        captureDetailPageCoordinate();
+        return;
+    }
+    if (!isRentListPageUrl(window.location.href)) return;
     installStyles();
     scheduleApply();
     initInfiniteScroll();
@@ -1286,24 +2032,40 @@ function init() {
 }
 
 const api = {
+    AUTO_FETCH_PAGE_DELAY_MS,
+    COORDINATE_SOURCE_OPTIONS,
     buildPageUrl,
+    buildGeocodeQuery,
+    buildInfoWindowHtml,
     CONTENT_FILTER_HOST_LABEL,
+    DEFAULT_COORDINATE_SOURCE,
     DEFAULT_FILTER_STATE,
+    DEFAULT_TIMING_SETTINGS,
+    MAP_DETAIL_FETCH_DELAY_MS,
     classifyListingContent,
     extractMapPointFromDetailHtml,
+    extractPreviewImageFromDetailHtml,
     fetchWithTimeout,
     filterMapRecordsByState,
     filterNewListingKeys,
     getAutoFetchNextPage,
+    getAutoFetchPageDelay,
     getAutoFetchRetryDelay,
+    getAutoFetchRetryStatusText,
+    getCoordinateSourceSequence,
     getListingDetailUrl,
+    getListingKeyFromDetailUrl,
     getListingKey,
+    getMapQueueWaitMs,
     getSearchCacheRecords,
     hydrateMapRecordsFromCache,
     markAutoFetchCaptchaRetry,
     markAutoFetchPageFetched,
     mergeMapCacheRecords,
     normalizeAutoFetchState,
+    normalizeCoordinateSource,
+    normalizePreviewImageUrl,
+    normalizeTimingSettings,
     normalizeMapPoint,
     normalizeFilterState,
     parseStoredMapCache,

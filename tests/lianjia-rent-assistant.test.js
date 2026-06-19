@@ -5,23 +5,39 @@ const path = require('node:path');
 
 const {
     CONTENT_FILTER_HOST_LABEL,
+    COORDINATE_SOURCE_OPTIONS,
+    DEFAULT_COORDINATE_SOURCE,
     DEFAULT_FILTER_STATE,
+    DEFAULT_TIMING_SETTINGS,
+    AUTO_FETCH_PAGE_DELAY_MS,
+    MAP_DETAIL_FETCH_DELAY_MS,
+    buildGeocodeQuery,
+    buildInfoWindowHtml,
     buildPageUrl,
     classifyListingContent,
     extractMapPointFromDetailHtml,
+    extractPreviewImageFromDetailHtml,
     fetchWithTimeout,
     filterMapRecordsByState,
     filterNewListingKeys,
     getAutoFetchNextPage,
     getAutoFetchRetryDelay,
+    getAutoFetchRetryStatusText,
+    getAutoFetchPageDelay,
+    getCoordinateSourceSequence,
     getListingDetailUrl,
+    getListingKeyFromDetailUrl,
     getListingKey,
+    getMapQueueWaitMs,
     getSearchCacheRecords,
     hydrateMapRecordsFromCache,
     markAutoFetchCaptchaRetry,
     markAutoFetchPageFetched,
     mergeMapCacheRecords,
     normalizeAutoFetchState,
+    normalizeCoordinateSource,
+    normalizePreviewImageUrl,
+    normalizeTimingSettings,
     normalizeFilterState,
     normalizeMapPoint,
     parseStoredMapCache,
@@ -46,6 +62,120 @@ test('default content filters show all listings', () => {
 
 test('content filter controls are hosted in the brand row', () => {
     assert.equal(CONTENT_FILTER_HOST_LABEL, '品牌');
+});
+
+test('automatic fetching waits 4 seconds between requests', () => {
+    assert.equal(AUTO_FETCH_PAGE_DELAY_MS, 4000);
+    assert.equal(MAP_DETAIL_FETCH_DELAY_MS, 4000);
+    assert.deepEqual(DEFAULT_TIMING_SETTINGS, {
+        autoFetchPageDelayMs: 4000,
+        mapDetailFetchDelayMs: 4000,
+        captchaRetryDelayMs: 20000
+    });
+});
+
+test('map coordinate queue keeps the 4 second window across repeated wakeups', () => {
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 0,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, 1000), 4000);
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 0,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, 5000), 0);
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 1,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, 1000), null);
+});
+
+test('map coordinate queue stops when automatic fetching is disabled', () => {
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 0,
+        autoFetchEnabled: false,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, 1000), null);
+
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 0,
+        autoFetchEnabled: true,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, 1000), 4000);
+});
+
+test('custom timing settings drive every fetch scheduler', () => {
+    const settings = normalizeTimingSettings({
+        autoFetchPageDelayMs: 9000,
+        mapDetailFetchDelayMs: 7000,
+        captchaRetryDelayMs: 45000
+    });
+
+    assert.deepEqual(settings, {
+        autoFetchPageDelayMs: 9000,
+        mapDetailFetchDelayMs: 7000,
+        captchaRetryDelayMs: 45000
+    });
+    assert.equal(getAutoFetchPageDelay(settings), 9000);
+    assert.equal(getAutoFetchPageDelay(settings, 2), 18000);
+    assert.equal(getAutoFetchRetryDelay({ retryCount: 6 }, settings), 45000);
+    assert.equal(getMapQueueWaitMs({
+        activeFetches: 0,
+        blocked: false,
+        lastMapFetchFinishedAt: 1000,
+        pendingRecords: [{ key: 'house:SH1' }]
+    }, settings, 3000), 5000);
+});
+
+test('timing settings normalize invalid stored values to defaults', () => {
+    assert.deepEqual(normalizeTimingSettings(JSON.stringify({
+        autoFetchPageDelayMs: 'bad',
+        mapDetailFetchDelayMs: -1,
+        captchaRetryDelayMs: 30000
+    })), {
+        autoFetchPageDelayMs: 4000,
+        mapDetailFetchDelayMs: 4000,
+        captchaRetryDelayMs: 30000
+    });
+});
+
+test('coordinate source defaults to geocode with cascade as the final option', () => {
+    assert.equal(DEFAULT_COORDINATE_SOURCE, 'geocode');
+    assert.deepEqual(
+        COORDINATE_SOURCE_OPTIONS.map((option) => option.value),
+        ['geocode', 'fetch', 'tab', 'iframe', 'cascade']
+    );
+    assert.equal(normalizeCoordinateSource(''), 'geocode');
+    assert.equal(normalizeCoordinateSource('iframe'), 'iframe');
+    assert.equal(normalizeCoordinateSource('unknown'), 'geocode');
+});
+
+test('coordinate source sequences keep cascade explicit and ordered', () => {
+    assert.deepEqual(getCoordinateSourceSequence('fetch'), ['fetch']);
+    assert.deepEqual(getCoordinateSourceSequence('tab'), ['tab']);
+    assert.deepEqual(getCoordinateSourceSequence('iframe'), ['iframe']);
+    assert.deepEqual(getCoordinateSourceSequence('geocode'), ['geocode']);
+    assert.deepEqual(getCoordinateSourceSequence('cascade'), ['geocode', 'iframe', 'tab', 'fetch']);
+});
+
+test('detail URLs and listing text produce stable coordinate lookup keys', () => {
+    assert.equal(
+        getListingKeyFromDetailUrl('https://sh.lianjia.com/zufang/SH123456.html?foo=1'),
+        'house:SH123456'
+    );
+    assert.equal(
+        buildGeocodeQuery({ city: '上海', title: '经纬城市绿洲 1室1厅 南', address: '宝山 上大' }),
+        '上海经纬城市绿洲 1室1厅 南'
+    );
 });
 
 test('filter state normalizes and serializes JSON-compatible values', () => {
@@ -112,6 +242,40 @@ test('detail HTML map points are extracted from standard and apartment templates
     );
 });
 
+test('preview image URLs normalize protocol-relative and reject empty values', () => {
+    assert.equal(
+        normalizePreviewImageUrl('//image1.ljcdn.com/110000-inspection/test.jpg.280x210.jpg'),
+        'https://image1.ljcdn.com/110000-inspection/test.jpg.280x210.jpg'
+    );
+    assert.equal(normalizePreviewImageUrl(' https://image1.ljcdn.com/test.jpg '), 'https://image1.ljcdn.com/test.jpg');
+    assert.equal(normalizePreviewImageUrl('javascript:alert(1)'), '');
+    assert.equal(normalizePreviewImageUrl(''), '');
+});
+
+test('detail HTML preview image is extracted from common metadata and image tags', () => {
+    assert.equal(
+        extractPreviewImageFromDetailHtml('<meta property="og:image" content="//image1.ljcdn.com/preview.jpg">'),
+        'https://image1.ljcdn.com/preview.jpg'
+    );
+    assert.equal(
+        extractPreviewImageFromDetailHtml('<img data-src="//image1.ljcdn.com/lianjia/detail.jpg.280x210.jpg">'),
+        'https://image1.ljcdn.com/lianjia/detail.jpg.280x210.jpg'
+    );
+});
+
+test('map info window renders cached preview image above the price', () => {
+    const html = buildInfoWindowHtml({
+        key: 'house:SH1',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
+        title: '整租·缓存房源',
+        price: '3000 元/月',
+        previewImageUrl: 'https://image1.ljcdn.com/preview.jpg'
+    });
+
+    assert.match(html, /<img[^>]+src="https:\/\/image1\.ljcdn\.com\/preview\.jpg"/);
+    assert.ok(html.indexOf('lj-rent-map-info__preview') < html.indexOf('lj-rent-map-info__price'));
+});
+
 test('detail fetch aborts when the response hangs', async () => {
     let abortSignal;
 
@@ -166,6 +330,7 @@ test('streamed listing records merge into map cache without losing coordinates',
                 detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
                 title: '旧标题',
                 price: '2900 元/月',
+                previewImageUrl: 'https://image1.ljcdn.com/old.jpg',
                 point: { longitude: 121.4, latitude: 31.2 },
                 updatedAt: 1
             }
@@ -192,6 +357,7 @@ test('streamed listing records merge into map cache without losing coordinates',
                     detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
                     title: '新标题',
                     price: '3000 元/月',
+                    previewImageUrl: 'https://image1.ljcdn.com/old.jpg',
                     point: { longitude: 121.4, latitude: 31.2 },
                     updatedAt: 99
                 },
@@ -215,6 +381,7 @@ test('map records hydrate cached coordinates before detail fetches', () => {
                 detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
                 title: '缓存标题',
                 price: '3000 元/月',
+                previewImageUrl: 'https://image1.ljcdn.com/cached.jpg',
                 point: { longitude: 121.4, latitude: 31.2 },
                 updatedAt: 1
             }
@@ -239,6 +406,7 @@ test('map records hydrate cached coordinates before detail fetches', () => {
             title: '当前标题',
             price: '3100 元/月',
             point: { longitude: 121.4, latitude: 31.2 },
+            previewImageUrl: 'https://image1.ljcdn.com/cached.jpg',
             updatedAt: 1
         }, {
             key: 'house:SH2',
@@ -297,6 +465,13 @@ test('auto fetch captcha retry waits 20 seconds and keeps the toggle enabled', (
         markAutoFetchCaptchaRetry({ enabled: true, progress: { search: 4 }, retryCount: 1 }),
         { enabled: true, progress: { search: 4 }, retryCount: 2 }
     );
+});
+
+test('auto fetch captcha retry status counts down every second', () => {
+    assert.equal(getAutoFetchRetryStatusText(20000, 0), '遇到验证，20 秒后重试');
+    assert.equal(getAutoFetchRetryStatusText(19000, 0), '遇到验证，19 秒后重试');
+    assert.equal(getAutoFetchRetryStatusText(1, 0), '遇到验证，1 秒后重试');
+    assert.equal(getAutoFetchRetryStatusText(0, 0), '正在重试');
 });
 
 test('auto fetch retry count resets after a successful fetch', () => {
