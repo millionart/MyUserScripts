@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.5.14
+// @version      0.5.18
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -22,7 +22,7 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.5.14';
+const SCRIPT_VERSION = '0.5.18';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
 const MAP_CACHE_STORAGE_KEY = 'LIANJIA_RENT_MAP_LISTING_CACHE';
 const AUTO_FETCH_STORAGE_KEY = 'LIANJIA_RENT_MAP_AUTO_FETCH_STATE';
@@ -59,7 +59,8 @@ const CASCADE_COORDINATE_SOURCES = Object.freeze([
 ]);
 const DEFAULT_FILTER_STATE = Object.freeze({
     beikePreferred: true,
-    apartment: true
+    apartment: true,
+    guessYouLike: true
 });
 const DEFAULT_TIMING_SETTINGS = Object.freeze({
     autoFetchPageDelayMs: AUTO_FETCH_PAGE_DELAY_MS,
@@ -112,7 +113,8 @@ function normalizeFilterState(value) {
     const source = value && typeof value === 'object' ? value : {};
     return {
         beikePreferred: source.beikePreferred !== false,
-        apartment: source.apartment !== false
+        apartment: source.apartment !== false,
+        guessYouLike: source.guessYouLike !== false
     };
 }
 
@@ -125,20 +127,24 @@ function classifyListingContent(listing) {
     const hrefs = Array.isArray(listing?.hrefs) ? listing.hrefs : [];
     return {
         beikePreferred: /贝壳优选/.test(text),
-        apartment: /公寓/.test(text) || hrefs.some((href) => /\/apartment\//.test(String(href || '')))
+        apartment: /公寓/.test(text) || hrefs.some((href) => /\/apartment\//.test(String(href || ''))),
+        guessYouLike: listing?.guessYouLike === true
     };
 }
 
 function shouldShowListing(kinds, state) {
     const filters = normalizeFilterState(state);
-    return (filters.beikePreferred || !kinds.beikePreferred) && (filters.apartment || !kinds.apartment);
+    return (filters.beikePreferred || !kinds.beikePreferred)
+        && (filters.apartment || !kinds.apartment)
+        && (filters.guessYouLike || !kinds.guessYouLike);
 }
 
 function normalizeListingKinds(value) {
     if (!value || typeof value !== 'object') return null;
     return {
         beikePreferred: value.beikePreferred === true,
-        apartment: value.apartment === true
+        apartment: value.apartment === true,
+        guessYouLike: value.guessYouLike === true
     };
 }
 
@@ -262,6 +268,19 @@ function buildPageUrl(template, page, baseUrl) {
     const pageNumber = Number(page);
     if (!template || !Number.isFinite(pageNumber) || pageNumber < 1) return '';
     return new URL(String(template).replace('{page}', String(pageNumber)).replace(/#.*$/, ''), baseUrl).href;
+}
+
+function normalizeSubwayStationLinkHref(href) {
+    const source = String(href || '').trim();
+    if (!source) return '';
+    return source
+        .replace(/^(https?:\/\/[^/]+\.lianjia\.com)\/zufang(?=\/|$|\?)/i, '$1/ditiezufang')
+        .replace(/^(\/\/[^/]+\.lianjia\.com)\/zufang(?=\/|$|\?)/i, '$1/ditiezufang')
+        .replace(/^\/zufang(?=\/|$|\?)/, '/ditiezufang');
+}
+
+function isSubwaySwitchLinkText(text) {
+    return /^按地铁(?:线|站)$/.test(String(text || '').replace(/\s+/g, ''));
 }
 
 function getListingKey(listing) {
@@ -635,8 +654,13 @@ function buildFilterOption(key, text, checked) {
 function getCurrentFilterState(row) {
     return normalizeFilterState({
         beikePreferred: row.querySelector('[data-lj-content-filter-option="beikePreferred"]')?.checked,
-        apartment: row.querySelector('[data-lj-content-filter-option="apartment"]')?.checked
+        apartment: row.querySelector('[data-lj-content-filter-option="apartment"]')?.checked,
+        guessYouLike: row.querySelector('[data-lj-content-filter-option="guessYouLike"]')?.checked
     });
+}
+
+function isGuessYouLikeCard(card) {
+    return (card?.parentElement?.previousElementSibling?.textContent || '').replace(/\s+/g, '') === '猜你喜欢';
 }
 
 function getListingData(card) {
@@ -644,7 +668,8 @@ function getListingData(card) {
     return {
         houseCode: card.getAttribute('data-house_code') || '',
         text: (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim(),
-        hrefs
+        hrefs,
+        guessYouLike: isGuessYouLikeCard(card)
     };
 }
 
@@ -731,6 +756,9 @@ function ensureFilterControls() {
     if (!hostRow.querySelector('[data-lj-content-filter-option="apartment"]')) {
         hostRow.append(buildFilterOption('apartment', '公寓', state.apartment));
     }
+    if (!hostRow.querySelector('[data-lj-content-filter-option="guessYouLike"]')) {
+        hostRow.append(buildFilterOption('guessYouLike', '猜你喜欢', state.guessYouLike));
+    }
 
     if (hostRow.dataset.ljContentFilterBound !== 'true') {
         hostRow.addEventListener('change', (event) => {
@@ -746,9 +774,24 @@ function ensureFilterControls() {
     return hostRow;
 }
 
+function fixSubwayStationLinks(root = document) {
+    const links = Array.from(root?.querySelectorAll?.('a[href]') || []);
+    let changed = 0;
+    links.forEach((link) => {
+        if (!isSubwaySwitchLinkText(link.textContent)) return;
+        const href = link.getAttribute('href') || '';
+        const nextHref = normalizeSubwayStationLinkHref(href);
+        if (!nextHref || nextHref === href) return;
+        link.setAttribute('href', nextHref);
+        changed += 1;
+    });
+    return changed;
+}
+
 function scheduleApply() {
     window.clearTimeout(scheduleApply.timer);
     scheduleApply.timer = window.setTimeout(() => {
+        fixSubwayStationLinks();
         const hostRow = ensureFilterControls();
         applyFilters(hostRow ? getCurrentFilterState(hostRow) : readStoredFilterState());
         refreshListingMap();
@@ -756,6 +799,7 @@ function scheduleApply() {
 }
 
 function applyCurrentFilters() {
+    fixSubwayStationLinks();
     const hostRow = ensureFilterControls();
     applyFilters(hostRow ? getCurrentFilterState(hostRow) : readStoredFilterState());
     refreshListingMap();
@@ -1326,6 +1370,12 @@ function buildInfoWindowHtml(record, options = {}) {
     ].join('');
 }
 
+function clearMapOverlaysIfPresent(map) {
+    if (typeof map?.clearOverlays !== 'function') return false;
+    map.clearOverlays();
+    return true;
+}
+
 function renderListingMap() {
     const records = getCurrentMapRecords();
     updateMapStatus(records);
@@ -1333,13 +1383,16 @@ function renderListingMap() {
     const mappedRecords = records
         .map((record) => mapState.fetchedListings.get(record.key))
         .filter((record) => record?.point);
-    if (!mappedRecords.length) return;
+    if (!mappedRecords.length) {
+        clearMapOverlaysIfPresent(mapState.map);
+        return;
+    }
 
     ensureMapReady().then((map) => {
         const BMap = getPageWindow().BMap;
         if (!BMap) return;
 
-        map.clearOverlays();
+        clearMapOverlaysIfPresent(map);
         const points = mappedRecords.map((record) => new BMap.Point(record.point.longitude, record.point.latitude));
         mappedRecords.forEach((record, index) => {
             const point = points[index];
@@ -2038,6 +2091,7 @@ const api = {
     buildGeocodeQuery,
     buildInfoWindowHtml,
     CONTENT_FILTER_HOST_LABEL,
+    clearMapOverlaysIfPresent,
     DEFAULT_COORDINATE_SOURCE,
     DEFAULT_FILTER_STATE,
     DEFAULT_TIMING_SETTINGS,
@@ -2056,6 +2110,7 @@ const api = {
     getListingDetailUrl,
     getListingKeyFromDetailUrl,
     getListingKey,
+    isSubwaySwitchLinkText,
     getMapQueueWaitMs,
     getSearchCacheRecords,
     hydrateMapRecordsFromCache,
@@ -2065,6 +2120,7 @@ const api = {
     normalizeAutoFetchState,
     normalizeCoordinateSource,
     normalizePreviewImageUrl,
+    normalizeSubwayStationLinkHref,
     normalizeTimingSettings,
     normalizeMapPoint,
     normalizeFilterState,

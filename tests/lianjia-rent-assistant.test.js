@@ -15,6 +15,7 @@ const {
     buildInfoWindowHtml,
     buildPageUrl,
     classifyListingContent,
+    clearMapOverlaysIfPresent,
     extractMapPointFromDetailHtml,
     extractPreviewImageFromDetailHtml,
     fetchWithTimeout,
@@ -29,6 +30,7 @@ const {
     getListingKeyFromDetailUrl,
     getListingKey,
     getMapQueueWaitMs,
+    isSubwaySwitchLinkText,
     getSearchCacheRecords,
     hydrateMapRecordsFromCache,
     markAutoFetchCaptchaRetry,
@@ -37,6 +39,7 @@ const {
     normalizeAutoFetchState,
     normalizeCoordinateSource,
     normalizePreviewImageUrl,
+    normalizeSubwayStationLinkHref,
     normalizeTimingSettings,
     normalizeFilterState,
     normalizeMapPoint,
@@ -55,7 +58,7 @@ test('userscript metadata uses a general assistant name', () => {
 });
 
 test('default content filters show all listings', () => {
-    assert.deepEqual(DEFAULT_FILTER_STATE, { beikePreferred: true, apartment: true });
+    assert.deepEqual(DEFAULT_FILTER_STATE, { beikePreferred: true, apartment: true, guessYouLike: true });
     assert.deepEqual(normalizeFilterState(null), DEFAULT_FILTER_STATE);
     assert.deepEqual(normalizeFilterState({}), DEFAULT_FILTER_STATE);
 });
@@ -179,10 +182,10 @@ test('detail URLs and listing text produce stable coordinate lookup keys', () =>
 });
 
 test('filter state normalizes and serializes JSON-compatible values', () => {
-    const state = normalizeFilterState({ beikePreferred: false, apartment: true, ignored: false });
+    const state = normalizeFilterState({ beikePreferred: false, apartment: true, guessYouLike: false, ignored: false });
 
-    assert.deepEqual(state, { beikePreferred: false, apartment: true });
-    assert.equal(serializeFilterState(state), '{"beikePreferred":false,"apartment":true}');
+    assert.deepEqual(state, { beikePreferred: false, apartment: true, guessYouLike: false });
+    assert.equal(serializeFilterState(state), '{"beikePreferred":false,"apartment":true,"guessYouLike":false}');
     assert.deepEqual(normalizeFilterState(JSON.parse(serializeFilterState(state))), state);
 });
 
@@ -195,6 +198,22 @@ test('pagination URL templates resolve relative next-page URLs', () => {
         ),
         'https://sh.lianjia.com/ditiezufang/li99620692s99635743/pg2rco21/'
     );
+});
+
+test('subway station switch links use ditiezufang paths', () => {
+    assert.equal(isSubwaySwitchLinkText('按地铁线'), true);
+    assert.equal(isSubwaySwitchLinkText('按地铁站'), true);
+    assert.equal(isSubwaySwitchLinkText('按区域'), false);
+    assert.equal(normalizeSubwayStationLinkHref('/zufang/'), '/ditiezufang/');
+    assert.equal(
+        normalizeSubwayStationLinkHref('https://sh.lianjia.com/zufang/jingan/'),
+        'https://sh.lianjia.com/ditiezufang/jingan/'
+    );
+    assert.equal(
+        normalizeSubwayStationLinkHref('//sh.lianjia.com/zufang/?showMore=1'),
+        '//sh.lianjia.com/ditiezufang/?showMore=1'
+    );
+    assert.equal(normalizeSubwayStationLinkHref('https://example.com/zufang/'), 'https://example.com/zufang/');
 });
 
 test('listing keys prefer stable house codes and skip duplicates', () => {
@@ -274,6 +293,13 @@ test('map info window renders cached preview image above the price', () => {
 
     assert.match(html, /<img[^>]+src="https:\/\/image1\.ljcdn\.com\/preview\.jpg"/);
     assert.ok(html.indexOf('lj-rent-map-info__preview') < html.indexOf('lj-rent-map-info__price'));
+});
+
+test('map overlays are cleared when no listings remain renderable', () => {
+    let clearCount = 0;
+    assert.equal(clearMapOverlaysIfPresent({ clearOverlays: () => { clearCount += 1; } }), true);
+    assert.equal(clearCount, 1);
+    assert.equal(clearMapOverlaysIfPresent(null), false);
 });
 
 test('detail fetch aborts when the response hangs', async () => {
@@ -506,7 +532,7 @@ test('search cache records return cached listings for the active search', () => 
             title: '本搜索房源',
             price: '3000 元/月',
             point: { longitude: 121.4, latitude: 31.2 },
-            kinds: { beikePreferred: false, apartment: false },
+            kinds: { beikePreferred: false, apartment: false, guessYouLike: false },
             searchKeys: ['/zufang/pg{page}/'],
             updatedAt: 99
         }]
@@ -533,7 +559,13 @@ test('auto fetch skips map records hidden by current content filters', () => {
             title: '贝壳优选',
             price: '3200 元/月',
             kinds: { beikePreferred: true, apartment: false }
-        }], { beikePreferred: false, apartment: false }),
+        }, {
+            key: 'house:SH4',
+            detailUrl: 'https://sh.lianjia.com/zufang/SH4.html',
+            title: '推荐房源',
+            price: '2800 元/月',
+            kinds: { beikePreferred: false, apartment: false, guessYouLike: true }
+        }], { beikePreferred: false, apartment: false, guessYouLike: false }),
         [{
             key: 'house:SH1',
             detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
@@ -550,7 +582,7 @@ test('listing classification catches Beike preferred and apartment markers', () 
             text: '整租·徐泾北城欣沁苑东区 贝壳优选 3780 元/月',
             hrefs: ['/zufang/SH2172678357441839104.html']
         }),
-        { beikePreferred: true, apartment: false }
+        { beikePreferred: true, apartment: false, guessYouLike: false }
     );
 
     assert.deepEqual(
@@ -558,16 +590,28 @@ test('listing classification catches Beike preferred and apartment markers', () 
             text: '独栋·壹间公寓 虹桥公馆壹间C 1室1厅',
             hrefs: ['/apartment/64659.html']
         }),
-        { beikePreferred: false, apartment: true }
+        { beikePreferred: false, apartment: true, guessYouLike: false }
+    );
+
+    assert.deepEqual(
+        classifyListingContent({
+            text: '整租·富力桃园B区 3室2厅 南',
+            hrefs: ['/zufang/SH999.html'],
+            guessYouLike: true
+        }),
+        { beikePreferred: false, apartment: false, guessYouLike: true }
     );
 });
 
 test('unchecked content options hide matching listings only', () => {
-    const hideApartment = normalizeFilterState({ beikePreferred: true, apartment: false });
-    const hidePreferred = normalizeFilterState({ beikePreferred: false, apartment: true });
+    const hideApartment = normalizeFilterState({ beikePreferred: true, apartment: false, guessYouLike: true });
+    const hidePreferred = normalizeFilterState({ beikePreferred: false, apartment: true, guessYouLike: true });
+    const hideGuessYouLike = normalizeFilterState({ beikePreferred: true, apartment: true, guessYouLike: false });
 
     assert.equal(shouldShowListing({ beikePreferred: false, apartment: true }, hideApartment), false);
     assert.equal(shouldShowListing({ beikePreferred: true, apartment: false }, hideApartment), true);
     assert.equal(shouldShowListing({ beikePreferred: true, apartment: false }, hidePreferred), false);
     assert.equal(shouldShowListing({ beikePreferred: false, apartment: false }, hidePreferred), true);
+    assert.equal(shouldShowListing({ beikePreferred: false, apartment: false, guessYouLike: true }, hideGuessYouLike), false);
+    assert.equal(shouldShowListing({ beikePreferred: false, apartment: false, guessYouLike: false }, hideGuessYouLike), true);
 });
