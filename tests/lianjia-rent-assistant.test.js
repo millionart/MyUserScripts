@@ -8,11 +8,20 @@ const {
     COORDINATE_SOURCE_OPTIONS,
     DEFAULT_COORDINATE_SOURCE,
     DEFAULT_FILTER_STATE,
+    DEFAULT_MAP_HEIGHT,
+    DEFAULT_NEXT_PAGE_FETCH_MODE,
+    DEFAULT_SHOW_ALL_FETCHED_ON_MAP,
     DEFAULT_TIMING_SETTINGS,
+    MAX_MAP_HEIGHT,
     AUTO_FETCH_PAGE_DELAY_MS,
     MAP_DETAIL_FETCH_DELAY_MS,
+    MIN_MAP_HEIGHT,
+    NEXT_PAGE_FETCH_MODE_OPTIONS,
+    applyMapCanvasHeight,
+    applyMarkerGroupLabel,
     buildGeocodeQuery,
     buildInfoWindowHtml,
+    buildMapGroupInfoWindowHtml,
     buildPageUrl,
     classifyListingContent,
     clearMapOverlaysIfPresent,
@@ -21,24 +30,36 @@ const {
     fetchWithTimeout,
     filterMapRecordsByState,
     filterNewListingKeys,
+    formatShowAllFetchedText,
     getAutoFetchNextPage,
     getAutoFetchRetryDelay,
     getAutoFetchRetryStatusText,
     getAutoFetchPageDelay,
+    getAllFetchedMapRecords,
+    getMapClusterSplitZoom,
     getCoordinateSourceSequence,
     getListingDetailUrl,
     getListingKeyFromDetailUrl,
     getListingKey,
     getMapQueueWaitMs,
+    getMapOverlayBatchSize,
+    getMapPointGroupPrecision,
+    getMapRenderGroupPrecision,
+    getMapRenderProgressText,
+    groupMapRecordsByPoint,
     isSubwaySwitchLinkText,
     getSearchCacheRecords,
+    insertMapPanel,
     hydrateMapRecordsFromCache,
     markAutoFetchCaptchaRetry,
     markAutoFetchPageFetched,
     mergeMapCacheRecords,
     normalizeAutoFetchState,
     normalizeCoordinateSource,
+    normalizeMapHeight,
+    normalizeNextPageFetchMode,
     normalizePreviewImageUrl,
+    normalizeShowAllFetchedOnMap,
     normalizeSubwayStationLinkHref,
     normalizeTimingSettings,
     normalizeFilterState,
@@ -67,6 +88,128 @@ test('content filter controls are hosted in the brand row', () => {
     assert.equal(CONTENT_FILTER_HOST_LABEL, '品牌');
 });
 
+test('show all fetched map toggle is hosted beside auto fetch', () => {
+    assert.match(script, /actions\.append\(buildShowAllFetchedControl\(\), buildAutoFetchControl\(\), buildTimingSettingsControl\(\), status\)/);
+    assert.doesNotMatch(script, /buildShowAllFetchedRow/);
+});
+
+test('show all fetched map toggle displays cached count in parentheses', () => {
+    assert.equal(formatShowAllFetchedText(0), '显示所有（0）');
+    assert.equal(formatShowAllFetchedText(791), '显示所有（791）');
+    assert.equal(formatShowAllFetchedText('bad'), '显示所有（0）');
+});
+
+test('large map overlay renders are split into bounded batches', () => {
+    assert.equal(getMapOverlayBatchSize(0), 0);
+    assert.equal(getMapOverlayBatchSize(38), 38);
+    assert.equal(getMapOverlayBatchSize(791), 40);
+    assert.equal(getMapRenderProgressText(40, 791), '正在标记 40/791 套');
+});
+
+test('map marker records are grouped by normalized coordinates', () => {
+    assert.equal(getMapPointGroupPrecision(38), 5);
+    assert.equal(getMapPointGroupPrecision(300), 3);
+    assert.equal(getMapPointGroupPrecision(791), 2);
+    assert.deepEqual(groupMapRecordsByPoint([{
+        key: 'house:SH1',
+        point: { longitude: 121.400001, latitude: 31.200001 }
+    }, {
+        key: 'house:SH2',
+        point: { longitude: 121.400002, latitude: 31.200002 }
+    }, {
+        key: 'house:SH3',
+        point: { longitude: 121.5, latitude: 31.3 }
+    }, {
+        key: 'house:SH4'
+    }]).map((group) => ({
+        count: group.records.length,
+        keys: group.records.map((record) => record.key),
+        point: group.point
+    })), [{
+        count: 2,
+        keys: ['house:SH1', 'house:SH2'],
+        point: { longitude: 121.4, latitude: 31.2 }
+    }, {
+        count: 1,
+        keys: ['house:SH3'],
+        point: { longitude: 121.5, latitude: 31.3 }
+    }]);
+});
+
+test('large map marker groups use coarse coordinate buckets', () => {
+    assert.equal(groupMapRecordsByPoint([{
+        key: 'house:SH1',
+        point: { longitude: 121.4001, latitude: 31.2001 }
+    }, {
+        key: 'house:SH2',
+        point: { longitude: 121.4042, latitude: 31.2042 }
+    }], 2).length, 1);
+});
+
+test('show-all map grouping gets finer as the user zooms in', () => {
+    assert.equal(getMapRenderGroupPrecision(791, 12, true), 1);
+    assert.equal(getMapRenderGroupPrecision(791, 13, true), 2);
+    assert.equal(getMapRenderGroupPrecision(791, 14, true), 3);
+    assert.equal(getMapRenderGroupPrecision(791, 16, true), 4);
+    assert.equal(getMapRenderGroupPrecision(791, 17, true), 5);
+    assert.equal(getMapRenderGroupPrecision(791, 12, false), 2);
+    assert.equal(getMapRenderGroupPrecision(791, 16, false), 5);
+});
+
+test('cluster marker clicks zoom in until the maximum split level', () => {
+    assert.equal(getMapClusterSplitZoom(10), 12);
+    assert.equal(getMapClusterSplitZoom(17), 18);
+    assert.equal(getMapClusterSplitZoom(18), 18);
+    assert.equal(getMapClusterSplitZoom('bad'), 14);
+});
+
+test('map count labels reuse the marker click handler', () => {
+    let labelClickHandler = null;
+    let labelStyle = null;
+    const marker = {
+        label: null,
+        setLabel(label) {
+            this.label = label;
+        }
+    };
+    const BMap = {
+        Label: class {
+            constructor(text, options) {
+                this.text = text;
+                this.options = options;
+            }
+
+            addEventListener(eventName, handler) {
+                if (eventName === 'click') labelClickHandler = handler;
+            }
+
+            setStyle(style) {
+                labelStyle = style;
+            }
+        },
+        Size: class {
+            constructor(width, height) {
+                this.width = width;
+                this.height = height;
+            }
+        }
+    };
+    let clickCount = 0;
+
+    applyMarkerGroupLabel(marker, BMap, 3, '121.1,31.2', () => {
+        clickCount += 1;
+    });
+
+    assert.match(marker.label.text, /data-lj-rent-map-cluster="121\.1,31\.2"/);
+    assert.match(marker.label.text, /class="lj-rent-map-cluster-label"/);
+    assert.match(marker.label.text, />3<\/span>/);
+    assert.equal(labelStyle.cursor, 'pointer');
+    assert.equal(labelStyle.pointerEvents, 'auto');
+    assert.equal(typeof labelClickHandler, 'function');
+    labelClickHandler();
+    assert.equal(clickCount, 1);
+});
+
 test('automatic fetching waits 4 seconds between requests', () => {
     assert.equal(AUTO_FETCH_PAGE_DELAY_MS, 4000);
     assert.equal(MAP_DETAIL_FETCH_DELAY_MS, 4000);
@@ -75,6 +218,25 @@ test('automatic fetching waits 4 seconds between requests', () => {
         mapDetailFetchDelayMs: 4000,
         captchaRetryDelayMs: 20000
     });
+});
+
+test('map height settings normalize to the supported drag range', () => {
+    assert.equal(DEFAULT_MAP_HEIGHT, 360);
+    assert.equal(MIN_MAP_HEIGHT, 240);
+    assert.equal(MAX_MAP_HEIGHT, 1200);
+    assert.equal(normalizeMapHeight(null), 360);
+    assert.equal(normalizeMapHeight('900'), 900);
+    assert.equal(normalizeMapHeight(239), 240);
+    assert.equal(normalizeMapHeight(1201), 1200);
+    assert.equal(normalizeMapHeight(455.6), 456);
+});
+
+test('map canvas height is applied as a normalized pixel value', () => {
+    const canvas = { style: {} };
+    assert.equal(applyMapCanvasHeight(canvas, 1300), 1200);
+    assert.equal(canvas.style.height, '1200px');
+    assert.equal(applyMapCanvasHeight(canvas, 180), 240);
+    assert.equal(canvas.style.height, '240px');
 });
 
 test('map coordinate queue keeps the 4 second window across repeated wakeups', () => {
@@ -160,6 +322,23 @@ test('coordinate source defaults to geocode with cascade as the final option', (
     assert.equal(normalizeCoordinateSource(''), 'geocode');
     assert.equal(normalizeCoordinateSource('iframe'), 'iframe');
     assert.equal(normalizeCoordinateSource('unknown'), 'geocode');
+});
+
+test('next page fetch mode defaults to fetch and supports iframe loading', () => {
+    assert.equal(DEFAULT_NEXT_PAGE_FETCH_MODE, 'fetch');
+    assert.deepEqual(NEXT_PAGE_FETCH_MODE_OPTIONS.map((option) => option.value), ['fetch', 'iframe']);
+    assert.equal(normalizeNextPageFetchMode(null), 'fetch');
+    assert.equal(normalizeNextPageFetchMode('iframe'), 'iframe');
+    assert.equal(normalizeNextPageFetchMode('off'), 'fetch');
+});
+
+test('show all fetched map setting defaults off and normalizes booleans', () => {
+    assert.equal(DEFAULT_SHOW_ALL_FETCHED_ON_MAP, false);
+    assert.equal(normalizeShowAllFetchedOnMap(null), false);
+    assert.equal(normalizeShowAllFetchedOnMap(false), false);
+    assert.equal(normalizeShowAllFetchedOnMap(true), true);
+    assert.equal(normalizeShowAllFetchedOnMap('true'), true);
+    assert.equal(normalizeShowAllFetchedOnMap('false'), false);
 });
 
 test('coordinate source sequences keep cascade explicit and ordered', () => {
@@ -295,11 +474,72 @@ test('map info window renders cached preview image above the price', () => {
     assert.ok(html.indexOf('lj-rent-map-info__preview') < html.indexOf('lj-rent-map-info__price'));
 });
 
+test('map group info window lists every listing in the grouped marker', () => {
+    const html = buildMapGroupInfoWindowHtml({
+        records: [{
+            title: '整租·一号房源',
+            price: '3000 元/月',
+            detailUrl: 'https://sh.lianjia.com/zufang/SH1.html'
+        }, {
+            title: '整租·二号房源',
+            price: '3200 元/月',
+            detailUrl: 'https://sh.lianjia.com/zufang/SH2.html'
+        }]
+    });
+
+    assert.match(html, /共 2 套/);
+    assert.match(html, /整租·一号房源/);
+    assert.match(html, /3000 元\/月/);
+    assert.match(html, /SH1\.html/);
+    assert.match(html, /整租·二号房源/);
+    assert.match(html, /3200 元\/月/);
+    assert.match(html, /SH2\.html/);
+});
+
 test('map overlays are cleared when no listings remain renderable', () => {
     let clearCount = 0;
     assert.equal(clearMapOverlaysIfPresent({ clearOverlays: () => { clearCount += 1; } }), true);
     assert.equal(clearCount, 1);
     assert.equal(clearMapOverlaysIfPresent(null), false);
+});
+
+test('map panel is inserted into the full content width above result title', () => {
+    const panel = {};
+    const firstChild = {};
+    const calls = [];
+    const content = {
+        firstChild,
+        insertBefore(node, reference) {
+            calls.push({ node, reference });
+        }
+    };
+    const title = {
+        closest(selector) {
+            return selector === '#content, .content.w1150, .content' ? content : null;
+        },
+        after() {
+            throw new Error('title.after should not be used when content container exists');
+        }
+    };
+
+    assert.equal(insertMapPanel(panel, title), 'content');
+    assert.deepEqual(calls, [{ node: panel, reference: firstChild }]);
+});
+
+test('map panel falls back to result title insertion when full content container is missing', () => {
+    const panel = {};
+    const calls = [];
+    const title = {
+        closest() {
+            return null;
+        },
+        after(node) {
+            calls.push(node);
+        }
+    };
+
+    assert.equal(insertMapPanel(panel, title), 'title');
+    assert.deepEqual(calls, [panel]);
 });
 
 test('detail fetch aborts when the response hangs', async () => {
@@ -536,6 +776,32 @@ test('search cache records return cached listings for the active search', () => 
             searchKeys: ['/zufang/pg{page}/'],
             updatedAt: 99
         }]
+    );
+});
+
+test('all fetched map records return every cached listing with coordinates', () => {
+    const cache = mergeMapCacheRecords(parseStoredMapCache(null), [{
+        key: 'house:SH1',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
+        title: '当前区域房源',
+        price: '3000 元/月',
+        point: { longitude: 121.4, latitude: 31.2 }
+    }, {
+        key: 'house:SH2',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH2.html',
+        title: '其他地铁线房源',
+        price: '2500 元/月',
+        point: { longitude: 121.5, latitude: 31.3 }
+    }, {
+        key: 'house:SH3',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH3.html',
+        title: '尚未读取坐标房源',
+        price: '2800 元/月'
+    }], 99, '/ditiezufang/pg{page}/');
+
+    assert.deepEqual(
+        getAllFetchedMapRecords(cache).map((record) => record.key),
+        ['house:SH1', 'house:SH2']
     );
 });
 

@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.5.18
+// @version      0.5.34
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -22,12 +22,15 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.5.18';
+const SCRIPT_VERSION = '0.5.34';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
 const MAP_CACHE_STORAGE_KEY = 'LIANJIA_RENT_MAP_LISTING_CACHE';
 const AUTO_FETCH_STORAGE_KEY = 'LIANJIA_RENT_MAP_AUTO_FETCH_STATE';
 const TIMING_SETTINGS_STORAGE_KEY = 'LIANJIA_RENT_TIMING_SETTINGS';
 const COORDINATE_SOURCE_STORAGE_KEY = 'LIANJIA_RENT_COORDINATE_SOURCE';
+const MAP_HEIGHT_STORAGE_KEY = 'LIANJIA_RENT_MAP_HEIGHT';
+const NEXT_PAGE_FETCH_MODE_STORAGE_KEY = 'LIANJIA_RENT_NEXT_PAGE_FETCH_MODE';
+const SHOW_ALL_FETCHED_ON_MAP_STORAGE_KEY = 'LIANJIA_RENT_SHOW_ALL_FETCHED_ON_MAP';
 const MAP_CACHE_VERSION = 1;
 const CONTENT_FILTER_HOST_LABEL = '品牌';
 const STREAM_LOAD_THRESHOLD_PX = 900;
@@ -35,6 +38,10 @@ const BAIDU_MAP_AK = 'djAasQ167kYWRGbjL2az8aGmHBUmXp4V';
 const MAP_DETAIL_FETCH_LIMIT = 1;
 const MAP_DETAIL_FETCH_DELAY_MS = 4000;
 const MAP_DETAIL_FETCH_TIMEOUT_MS = 10000;
+const MAP_OVERLAY_BATCH_SIZE = 40;
+const DEFAULT_MAP_HEIGHT = 360;
+const MIN_MAP_HEIGHT = 240;
+const MAX_MAP_HEIGHT = 1200;
 const AUTO_FETCH_PAGE_DELAY_MS = 4000;
 const CAPTCHA_RETRY_DELAY_MS = 20000;
 const MAX_AUTO_FETCH_RETRY_COUNT = 99;
@@ -44,6 +51,10 @@ const COORDINATE_SOURCE_TAB = 'tab';
 const COORDINATE_SOURCE_IFRAME = 'iframe';
 const COORDINATE_SOURCE_CASCADE = 'cascade';
 const DEFAULT_COORDINATE_SOURCE = COORDINATE_SOURCE_GEOCODE;
+const NEXT_PAGE_FETCH_MODE_FETCH = 'fetch';
+const DEFAULT_NEXT_PAGE_FETCH_MODE = NEXT_PAGE_FETCH_MODE_FETCH;
+const NEXT_PAGE_FETCH_MODE_IFRAME = 'iframe';
+const DEFAULT_SHOW_ALL_FETCHED_ON_MAP = false;
 const COORDINATE_SOURCE_OPTIONS = Object.freeze([
     { value: COORDINATE_SOURCE_GEOCODE, label: '地理编码' },
     { value: COORDINATE_SOURCE_FETCH, label: 'fetch' },
@@ -56,6 +67,10 @@ const CASCADE_COORDINATE_SOURCES = Object.freeze([
     COORDINATE_SOURCE_IFRAME,
     COORDINATE_SOURCE_TAB,
     COORDINATE_SOURCE_FETCH
+]);
+const NEXT_PAGE_FETCH_MODE_OPTIONS = Object.freeze([
+    { value: NEXT_PAGE_FETCH_MODE_FETCH, label: '后台请求' },
+    { value: NEXT_PAGE_FETCH_MODE_IFRAME, label: 'iframe' }
 ]);
 const DEFAULT_FILTER_STATE = Object.freeze({
     beikePreferred: true,
@@ -83,6 +98,7 @@ const mapState = {
     initialized: false,
     panel: null,
     canvas: null,
+    resizeHandle: null,
     status: null,
     map: null,
     mapScriptPromise: null,
@@ -96,6 +112,8 @@ const mapState = {
     timingSettings: null,
     timingSettingsPanel: null,
     coordinateSource: null,
+    nextPageFetchMode: null,
+    showAllFetchedOnMap: null,
     queuedKeys: new Set(),
     fetchedListings: new Map(),
     failedKeys: new Set(),
@@ -106,7 +124,11 @@ const mapState = {
     lastMapFetchFinishedAt: 0,
     pendingRecords: [],
     blocked: false,
-    cache: null
+    cache: null,
+    mapHeight: 0,
+    mapRenderToken: 0,
+    mapViewportTimer: 0,
+    markerGroupClickHandlers: new Map()
 };
 
 function normalizeFilterState(value) {
@@ -216,6 +238,20 @@ function getCaptchaRetryDelay(settings = DEFAULT_TIMING_SETTINGS) {
     return normalizeTimingSettings(settings).captchaRetryDelayMs;
 }
 
+function normalizeMapHeight(value) {
+    const number = Number(value);
+    const height = Number.isFinite(number) && number > 0 ? Math.round(number) : DEFAULT_MAP_HEIGHT;
+    return Math.min(MAX_MAP_HEIGHT, Math.max(MIN_MAP_HEIGHT, height));
+}
+
+function applyMapCanvasHeight(canvas, height) {
+    const normalized = normalizeMapHeight(height);
+    if (canvas?.style) {
+        canvas.style.height = `${normalized}px`;
+    }
+    return normalized;
+}
+
 function normalizeCoordinateSource(value) {
     const source = String(value || '').trim();
     return COORDINATE_SOURCE_OPTIONS.some((option) => option.value === source) ? source : DEFAULT_COORDINATE_SOURCE;
@@ -224,6 +260,15 @@ function normalizeCoordinateSource(value) {
 function getCoordinateSourceSequence(source) {
     const normalized = normalizeCoordinateSource(source);
     return normalized === COORDINATE_SOURCE_CASCADE ? Array.from(CASCADE_COORDINATE_SOURCES) : [normalized];
+}
+
+function normalizeNextPageFetchMode(value) {
+    const mode = String(value || '').trim();
+    return NEXT_PAGE_FETCH_MODE_OPTIONS.some((option) => option.value === mode) ? mode : DEFAULT_NEXT_PAGE_FETCH_MODE;
+}
+
+function normalizeShowAllFetchedOnMap(value) {
+    return value === true || value === 1 || String(value || '').trim() === 'true' || String(value || '').trim() === '1';
 }
 
 function getAutoFetchNextPage(state, searchKey, currentPage, totalPage) {
@@ -466,6 +511,79 @@ function getSearchCacheRecords(cache, searchKey, filterState) {
     });
 }
 
+function getAllFetchedMapRecords(cache) {
+    return Object.values(parseStoredMapCache(cache).listings).filter((record) => normalizeMapPoint(record.point));
+}
+
+function formatShowAllFetchedText(count) {
+    const number = Number(count);
+    return `显示所有（${Number.isFinite(number) && number > 0 ? Math.round(number) : 0}）`;
+}
+
+function getMapOverlayBatchSize(total) {
+    const count = Math.max(0, Math.round(Number(total) || 0));
+    return Math.min(count, MAP_OVERLAY_BATCH_SIZE);
+}
+
+function getMapRenderProgressText(rendered, total) {
+    const totalCount = Math.max(0, Math.round(Number(total) || 0));
+    const renderedCount = Math.min(totalCount, Math.max(0, Math.round(Number(rendered) || 0)));
+    return `正在标记 ${renderedCount}/${totalCount} 套`;
+}
+
+function getMapPointGroupPrecision(total) {
+    const count = Math.max(0, Math.round(Number(total) || 0));
+    if (count > 500) return 2;
+    return count > 200 ? 3 : 5;
+}
+
+function getMapRenderGroupPrecision(total, zoom, showAllFetched) {
+    const currentZoom = Math.max(0, Math.round(Number(zoom) || 0));
+    if (showAllFetched) {
+        if (currentZoom >= 17) return 5;
+        if (currentZoom >= 16) return 4;
+        if (currentZoom >= 14) return 3;
+        if (currentZoom >= 13) return 2;
+        return 1;
+    }
+    return Math.max(getMapPointGroupPrecision(total), currentZoom >= 16 ? 5 : (currentZoom >= 14 ? 4 : 0));
+}
+
+function getMapClusterSplitZoom(currentZoom) {
+    const zoom = Math.max(0, Math.round(Number(currentZoom) || 12));
+    return Math.min(18, zoom + 2);
+}
+
+function getMapPointGroupKey(point, precision = getMapPointGroupPrecision(0)) {
+    const normalized = normalizeMapPoint(point);
+    if (!normalized) return '';
+    return `${normalized.longitude.toFixed(precision)},${normalized.latitude.toFixed(precision)}`;
+}
+
+function groupMapRecordsByPoint(records, precision = getMapPointGroupPrecision(records?.length)) {
+    const groups = [];
+    const groupMap = new Map();
+    records.forEach((record) => {
+        const point = normalizeMapPoint(record?.point);
+        const groupKey = getMapPointGroupKey(point, precision);
+        if (!groupKey) return;
+        if (!groupMap.has(groupKey)) {
+            const group = {
+                key: groupKey,
+                point: {
+                    longitude: Number(point.longitude.toFixed(precision)),
+                    latitude: Number(point.latitude.toFixed(precision))
+                },
+                records: []
+            };
+            groupMap.set(groupKey, group);
+            groups.push(group);
+        }
+        groupMap.get(groupKey).records.push({ ...record, point });
+    });
+    return groups;
+}
+
 function filterMapRecordsByState(records, filterState) {
     const filters = normalizeFilterState(filterState);
     return records.filter((record) => {
@@ -622,6 +740,81 @@ function writeStoredCoordinateSource(source) {
     }
 }
 
+function readStoredNextPageFetchMode() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeNextPageFetchMode(GM_getValue(NEXT_PAGE_FETCH_MODE_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeNextPageFetchMode(window.localStorage?.getItem(NEXT_PAGE_FETCH_MODE_STORAGE_KEY));
+    } catch {
+        return DEFAULT_NEXT_PAGE_FETCH_MODE;
+    }
+}
+
+function writeStoredNextPageFetchMode(mode) {
+    const normalized = normalizeNextPageFetchMode(mode);
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(NEXT_PAGE_FETCH_MODE_STORAGE_KEY, normalized);
+        return normalized;
+    }
+    try {
+        window.localStorage?.setItem(NEXT_PAGE_FETCH_MODE_STORAGE_KEY, normalized);
+    } catch {
+        // Next-page mode changes still apply for the current page session when storage is unavailable.
+    }
+    return normalized;
+}
+
+function readStoredShowAllFetchedOnMap() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeShowAllFetchedOnMap(GM_getValue(SHOW_ALL_FETCHED_ON_MAP_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeShowAllFetchedOnMap(window.localStorage?.getItem(SHOW_ALL_FETCHED_ON_MAP_STORAGE_KEY));
+    } catch {
+        return DEFAULT_SHOW_ALL_FETCHED_ON_MAP;
+    }
+}
+
+function writeStoredShowAllFetchedOnMap(value) {
+    const normalized = normalizeShowAllFetchedOnMap(value);
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(SHOW_ALL_FETCHED_ON_MAP_STORAGE_KEY, normalized);
+        return normalized;
+    }
+    try {
+        window.localStorage?.setItem(SHOW_ALL_FETCHED_ON_MAP_STORAGE_KEY, String(normalized));
+    } catch {
+        // Map display mode changes still apply for the current page session when storage is unavailable.
+    }
+    return normalized;
+}
+
+function readStoredMapHeight() {
+    if (typeof GM_getValue === 'function') {
+        return normalizeMapHeight(GM_getValue(MAP_HEIGHT_STORAGE_KEY, null));
+    }
+    try {
+        return normalizeMapHeight(window.localStorage?.getItem(MAP_HEIGHT_STORAGE_KEY));
+    } catch {
+        return DEFAULT_MAP_HEIGHT;
+    }
+}
+
+function writeStoredMapHeight(height) {
+    const normalized = normalizeMapHeight(height);
+    if (typeof GM_setValue === 'function') {
+        GM_setValue(MAP_HEIGHT_STORAGE_KEY, normalized);
+        return normalized;
+    }
+    try {
+        window.localStorage?.setItem(MAP_HEIGHT_STORAGE_KEY, String(normalized));
+    } catch {
+        // Height changes still apply for the current page session when storage is unavailable.
+    }
+    return normalized;
+}
+
 function getAsideText(row) {
     const aside = row?.querySelector?.('.filter__item--aside');
     return (aside?.textContent || '').replace(/\s+/g, '');
@@ -698,7 +891,7 @@ function installStyles() {
         '.lj-stream-hidden-pager{display:none!important;}',
         '.lj-stream-status{margin:24px 0 8px;text-align:center;color:#888;font-size:13px;line-height:32px;}',
         '.lj-stream-status[data-clickable="true"]{cursor:pointer;color:#00ae66;}',
-        '.lj-rent-map-panel{margin:10px 0 18px;border:1px solid #e5e5e5;background:#fff;}',
+        '.lj-rent-map-panel{clear:both;box-sizing:border-box;margin:18px 0 18px;border:1px solid #e5e5e5;background:#fff;}',
         '.lj-rent-map-panel__header{display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 14px;border-bottom:1px solid #f0f0f0;color:#394043;font-size:14px;}',
         '.lj-rent-map-panel__header strong{font-weight:600;}',
         '.lj-rent-map-panel__actions{display:flex;align-items:center;gap:12px;}',
@@ -709,6 +902,7 @@ function installStyles() {
         '.lj-rent-map-settings__panel{position:absolute;top:28px;right:0;z-index:10;width:210px;padding:10px;border:1px solid #ddd;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.12);color:#394043;font-size:12px;}',
         '.lj-rent-map-settings__row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px;}',
         '.lj-rent-map-settings__row input{width:64px;height:24px;padding:0 5px;border:1px solid #ddd;color:#394043;font-size:12px;}',
+        '.lj-rent-map-settings__row input[type="checkbox"]{width:13px;height:13px;margin:0;padding:0;border:0;accent-color:#00ae66;}',
         '.lj-rent-map-settings__row select{width:94px;height:24px;border:1px solid #ddd;background:#fff;color:#394043;font-size:12px;}',
         '.lj-rent-map-settings__field{display:inline-flex;align-items:center;gap:4px;}',
         '.lj-rent-map-settings__actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:2px;}',
@@ -717,12 +911,23 @@ function installStyles() {
         '.lj-rent-map-settings__error{min-height:16px;color:#fa5741;font-size:12px;line-height:16px;}',
         '.lj-rent-map-panel__status{color:#888;font-size:12px;}',
         '.lj-rent-map-panel__canvas{height:360px;background:#f7f7f7;}',
+        '.lj-rent-map-resizer{position:relative;height:9px;border-top:1px solid #eee;background:#fafafa;cursor:ns-resize;}',
+        '.lj-rent-map-resizer::before{content:"";position:absolute;left:50%;top:3px;width:44px;height:3px;margin-left:-22px;border-radius:2px;background:#d8d8d8;}',
+        '.lj-rent-map-resizer:hover::before,.lj-rent-map-resizing .lj-rent-map-resizer::before{background:#9aa4ad;}',
+        '.lj-rent-map-resizing{cursor:ns-resize!important;user-select:none;}',
         '.lj-rent-map-info{min-width:180px;max-width:260px;color:#394043;line-height:1.5;}',
         '.lj-rent-map-info__title{font-weight:600;margin-bottom:4px;}',
         '.lj-rent-map-info__preview{width:220px;max-width:100%;height:128px;margin:4px 0 6px;border-radius:2px;background:#f5f5f5;object-fit:cover;display:block;}',
         '.lj-rent-map-info__preview-state{width:220px;max-width:100%;height:34px;margin:4px 0 6px;color:#999;font-size:12px;line-height:34px;text-align:center;background:#f7f7f7;}',
         '.lj-rent-map-info__price{color:#fa5741;margin-bottom:4px;}',
-        '.lj-rent-map-info__link{color:#00ae66;text-decoration:none;}'
+        '.lj-rent-map-info__link{color:#00ae66;text-decoration:none;}',
+        '.lj-rent-map-info--group{max-height:260px;overflow:auto;}',
+        '.lj-rent-map-info__list{display:flex;flex-direction:column;gap:6px;}',
+        '.lj-rent-map-info__item{display:block;padding-bottom:6px;border-bottom:1px solid #f0f0f0;color:#394043;text-decoration:none;}',
+        '.lj-rent-map-info__item-title{display:block;}',
+        '.lj-rent-map-info__item-price{display:block;color:#fa5741;}',
+        '.lj-rent-map-info__more{color:#999;font-size:12px;}',
+        '.lj-rent-map-cluster-label{display:inline-block;cursor:pointer;}'
     ].join('');
 
     if (typeof GM_addStyle === 'function') {
@@ -918,6 +1123,7 @@ function rememberMapRecords(records, searchKey = '') {
     if (!records.length) return;
     mapState.cache = mergeMapCacheRecords(ensureMapCache(), records, Date.now(), searchKey);
     writeStoredMapCache(mapState.cache);
+    updateShowAllFetchedText();
 }
 
 function getCurrentMapFilterState() {
@@ -941,6 +1147,14 @@ function mergeMapRecordsByKey(records) {
 
 function getCurrentMapRecords() {
     const cache = ensureMapCache();
+    if (getShowAllFetchedOnMap()) {
+        const allRecords = getAllFetchedMapRecords(cache);
+        allRecords.forEach((record) => {
+            mapState.fetchedListings.set(record.key, record);
+        });
+        return allRecords;
+    }
+
     const searchKey = getCurrentSearchKey();
     const records = hydrateMapRecordsFromCache(mergeMapRecordsByKey([
         ...getSearchCacheRecords(cache, searchKey, getCurrentMapFilterState()),
@@ -958,6 +1172,105 @@ function findResultTitle() {
     return document.querySelector('.content__article > .content__title')
         || Array.from(document.querySelectorAll('.content__title')).find((node) => /已为您找到\s*\d+\s*套/.test(node.textContent || ''))
         || null;
+}
+
+function insertMapPanel(panel, title) {
+    const content = title?.closest?.('#content, .content.w1150, .content');
+    if (content && typeof content.insertBefore === 'function') {
+        content.insertBefore(panel, content.firstChild);
+        return 'content';
+    }
+    title.after(panel);
+    return 'title';
+}
+
+function getMapHeight() {
+    if (!mapState.mapHeight) {
+        mapState.mapHeight = readStoredMapHeight();
+    }
+    return mapState.mapHeight;
+}
+
+function notifyMapResized(map = mapState.map) {
+    if (typeof map?.checkResize === 'function') {
+        map.checkResize();
+        return;
+    }
+    if (typeof map?.getCenter === 'function' && typeof map?.setCenter === 'function') {
+        map.setCenter(map.getCenter());
+    }
+}
+
+function scheduleViewportMapRender() {
+    if (!getShowAllFetchedOnMap()) return;
+    window.clearTimeout(mapState.mapViewportTimer);
+    mapState.mapViewportTimer = window.setTimeout(() => {
+        renderListingMap({ preserveViewport: true });
+    }, 120);
+}
+
+function handleMapClusterLabelClick(event) {
+    const target = event.target?.closest?.('[data-lj-rent-map-cluster]');
+    if (!target) return;
+    const handler = mapState.markerGroupClickHandlers.get(target.dataset.ljRentMapCluster);
+    if (typeof handler !== 'function') return;
+    event.preventDefault();
+    event.stopPropagation();
+    handler(event);
+}
+
+function buildMapResizeHandle() {
+    const handle = document.createElement('div');
+    handle.className = 'lj-rent-map-resizer';
+    handle.title = '拖拽调整地图高度';
+    handle.setAttribute('role', 'separator');
+    handle.setAttribute('aria-orientation', 'horizontal');
+    handle.addEventListener('pointerdown', handleMapResizeStart);
+    return handle;
+}
+
+function handleMapResizeStart(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    if (!mapState.canvas) return;
+
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startY = event.clientY;
+    const startHeight = mapState.canvas.getBoundingClientRect?.().height || getMapHeight();
+    if (pointerId !== undefined) {
+        handle?.setPointerCapture?.(pointerId);
+    }
+    document.body.classList.add('lj-rent-map-resizing');
+
+    const applyHeight = (clientY, persist) => {
+        const nextHeight = applyMapCanvasHeight(mapState.canvas, startHeight + clientY - startY);
+        mapState.mapHeight = nextHeight;
+        notifyMapResized();
+        if (persist) writeStoredMapHeight(nextHeight);
+    };
+    const onMove = (moveEvent) => {
+        moveEvent.preventDefault();
+        applyHeight(moveEvent.clientY, false);
+    };
+    const cleanup = (endEvent) => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', cleanup);
+        window.removeEventListener('pointercancel', cleanup);
+        document.body.classList.remove('lj-rent-map-resizing');
+        if (pointerId !== undefined) {
+            handle?.releasePointerCapture?.(pointerId);
+        }
+        if (endEvent?.clientY !== undefined) {
+            applyHeight(endEvent.clientY, true);
+        } else {
+            writeStoredMapHeight(mapState.mapHeight || startHeight);
+        }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', cleanup);
+    window.addEventListener('pointercancel', cleanup);
 }
 
 function ensureMapPanel() {
@@ -984,18 +1297,23 @@ function ensureMapPanel() {
 
     const actions = document.createElement('div');
     actions.className = 'lj-rent-map-panel__actions';
-    actions.append(buildAutoFetchControl(), buildTimingSettingsControl(), status);
+    actions.append(buildShowAllFetchedControl(), buildAutoFetchControl(), buildTimingSettingsControl(), status);
 
     const canvas = document.createElement('div');
     canvas.className = 'lj-rent-map-panel__canvas';
     canvas.id = 'lj-rent-map-canvas';
+    mapState.mapHeight = applyMapCanvasHeight(canvas, getMapHeight());
+    canvas.addEventListener('click', handleMapClusterLabelClick, true);
+
+    const resizeHandle = buildMapResizeHandle();
 
     header.append(heading, actions);
-    panel.append(header, canvas);
-    title.after(panel);
+    panel.append(header, canvas, resizeHandle);
+    insertMapPanel(panel, title);
 
     mapState.panel = panel;
     mapState.canvas = canvas;
+    mapState.resizeHandle = resizeHandle;
     mapState.status = status;
     return panel;
 }
@@ -1030,6 +1348,20 @@ function getCoordinateSource() {
     return mapState.coordinateSource;
 }
 
+function getNextPageFetchMode() {
+    if (!mapState.nextPageFetchMode) {
+        mapState.nextPageFetchMode = readStoredNextPageFetchMode();
+    }
+    return mapState.nextPageFetchMode;
+}
+
+function getShowAllFetchedOnMap() {
+    if (mapState.showAllFetchedOnMap === null) {
+        mapState.showAllFetchedOnMap = readStoredShowAllFetchedOnMap();
+    }
+    return mapState.showAllFetchedOnMap;
+}
+
 function saveAutoFetchState(state) {
     mapState.autoFetchState = normalizeAutoFetchState(state);
     writeStoredAutoFetchState(mapState.autoFetchState);
@@ -1045,6 +1377,18 @@ function saveCoordinateSource(source) {
     mapState.coordinateSource = normalizeCoordinateSource(source);
     writeStoredCoordinateSource(mapState.coordinateSource);
     return mapState.coordinateSource;
+}
+
+function saveNextPageFetchMode(mode) {
+    mapState.nextPageFetchMode = normalizeNextPageFetchMode(mode);
+    writeStoredNextPageFetchMode(mapState.nextPageFetchMode);
+    return mapState.nextPageFetchMode;
+}
+
+function saveShowAllFetchedOnMap(value) {
+    mapState.showAllFetchedOnMap = normalizeShowAllFetchedOnMap(value);
+    writeStoredShowAllFetchedOnMap(mapState.showAllFetchedOnMap);
+    return mapState.showAllFetchedOnMap;
 }
 
 function setAutoFetchStatus(text) {
@@ -1113,6 +1457,35 @@ function buildAutoFetchControl() {
     return label;
 }
 
+function buildShowAllFetchedControl() {
+    const label = document.createElement('label');
+    label.className = 'lj-rent-map-auto';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = getShowAllFetchedOnMap();
+    input.dataset.ljRentShowAllFetched = 'true';
+
+    const text = document.createElement('span');
+    text.dataset.ljRentShowAllFetchedText = 'true';
+    text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache()).length);
+
+    input.addEventListener('change', () => {
+        saveShowAllFetchedOnMap(input.checked);
+        refreshListingMap();
+    });
+
+    label.append(input, text);
+    return label;
+}
+
+function updateShowAllFetchedText() {
+    const text = document.querySelector('[data-lj-rent-show-all-fetched-text="true"]');
+    if (text) {
+        text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache()).length);
+    }
+}
+
 function getTimingSettingSeconds(settings, key) {
     return Math.max(1, Math.round(normalizeTimingSettings(settings)[key] / 1000));
 }
@@ -1123,6 +1496,8 @@ function fillTimingSettingsPanel(panel, settings) {
     });
     const sourceSelect = panel.querySelector('[data-lj-rent-coordinate-source]');
     if (sourceSelect) sourceSelect.value = DEFAULT_COORDINATE_SOURCE;
+    const nextPageModeSelect = panel.querySelector('[data-lj-rent-next-page-fetch-mode]');
+    if (nextPageModeSelect) nextPageModeSelect.value = DEFAULT_NEXT_PAGE_FETCH_MODE;
 }
 
 function readTimingSettingsPanel(panel) {
@@ -1185,9 +1560,31 @@ function buildCoordinateSourceRow(source) {
     return row;
 }
 
+function buildNextPageFetchModeRow(mode) {
+    const row = document.createElement('label');
+    row.className = 'lj-rent-map-settings__row';
+
+    const label = document.createElement('span');
+    label.textContent = '下一页抓取';
+
+    const select = document.createElement('select');
+    select.dataset.ljRentNextPageFetchMode = 'true';
+    NEXT_PAGE_FETCH_MODE_OPTIONS.forEach((option) => {
+        const item = document.createElement('option');
+        item.value = option.value;
+        item.textContent = option.label;
+        select.append(item);
+    });
+    select.value = normalizeNextPageFetchMode(mode);
+
+    row.append(label, select);
+    return row;
+}
+
 function buildTimingSettingsPanel() {
     const settings = getTimingSettings();
     const coordinateSource = getCoordinateSource();
+    const nextPageFetchMode = getNextPageFetchMode();
     const panel = document.createElement('div');
     panel.className = 'lj-rent-map-settings__panel';
     panel.dataset.ljRentTimingSettingsPanel = 'true';
@@ -1210,6 +1607,7 @@ function buildTimingSettingsPanel() {
 
     panel.append(
         buildCoordinateSourceRow(coordinateSource),
+        buildNextPageFetchModeRow(nextPageFetchMode),
         buildTimingSettingsRow('autoFetchPageDelayMs', '自动抓取间隔', settings),
         buildTimingSettingsRow('mapDetailFetchDelayMs', '坐标读取间隔', settings),
         buildTimingSettingsRow('captchaRetryDelayMs', '验证重试间隔', settings),
@@ -1230,6 +1628,7 @@ function buildTimingSettingsPanel() {
         }
         saveTimingSettings(nextSettings);
         saveCoordinateSource(panel.querySelector('[data-lj-rent-coordinate-source]')?.value);
+        saveNextPageFetchMode(panel.querySelector('[data-lj-rent-next-page-fetch-mode]')?.value);
         applyTimingSettingsNow();
         setAutoFetchStatus('设置已保存');
         mapState.timingSettingsPanel = null;
@@ -1333,6 +1732,10 @@ async function ensureMapReady() {
         if (typeof map.addControl === 'function' && BMap.NavigationControl) {
             map.addControl(new BMap.NavigationControl({ type: getPageWindow().BMAP_NAVIGATION_CONTROL_SMALL }));
         }
+        if (typeof map.addEventListener === 'function') {
+            map.addEventListener('zoomend', scheduleViewportMapRender);
+            map.addEventListener('moveend', scheduleViewportMapRender);
+        }
         mapState.map = map;
         return map;
     }).catch((error) => {
@@ -1370,15 +1773,156 @@ function buildInfoWindowHtml(record, options = {}) {
     ].join('');
 }
 
+function buildMapGroupInfoWindowHtml(group) {
+    const records = Array.isArray(group?.records) ? group.records : [];
+    if (records.length <= 1) return buildInfoWindowHtml(records[0] || {});
+
+    const visibleRecords = records.slice(0, 20);
+    const restCount = records.length - visibleRecords.length;
+    return [
+        '<div class="lj-rent-map-info lj-rent-map-info--group">',
+        `<div class="lj-rent-map-info__title">共 ${records.length} 套</div>`,
+        '<div class="lj-rent-map-info__list">',
+        visibleRecords.map((record) => {
+            const title = escapeHtml(record.title);
+            const price = escapeHtml(record.price);
+            const detailUrl = escapeHtml(record.detailUrl);
+            return [
+                '<a class="lj-rent-map-info__item" href="', detailUrl, '" target="_blank" rel="noopener">',
+                `<span class="lj-rent-map-info__item-title">${title}</span>`,
+                price ? `<span class="lj-rent-map-info__item-price">${price}</span>` : '',
+                '</a>'
+            ].join('');
+        }).join(''),
+        restCount > 0 ? `<div class="lj-rent-map-info__more">还有 ${restCount} 套，放大地图后可继续查看</div>` : '',
+        '</div>',
+        '</div>'
+    ].join('');
+}
+
 function clearMapOverlaysIfPresent(map) {
     if (typeof map?.clearOverlays !== 'function') return false;
     map.clearOverlays();
     return true;
 }
 
-function renderListingMap() {
+function scheduleMapOverlayBatch(callback) {
+    if (typeof window?.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(callback);
+        return;
+    }
+    window.setTimeout(callback, 0);
+}
+
+function getMapGroupInfoRecord(group) {
+    const records = Array.isArray(group?.records) ? group.records : [];
+    return records[0];
+}
+
+function applyMarkerGroupLabel(marker, BMap, count, groupKey, clickHandler) {
+    if (count < 2 || !BMap.Label) return;
+    const options = BMap.Size ? { offset: new BMap.Size(12, -8) } : undefined;
+    const content = groupKey
+        ? `<span class="lj-rent-map-cluster-label" data-lj-rent-map-cluster="${escapeHtml(groupKey)}">${escapeHtml(count)}</span>`
+        : String(count);
+    const label = new BMap.Label(content, options);
+    if (typeof label.setStyle === 'function') {
+        label.setStyle({
+            border: '1px solid #00ae66',
+            borderRadius: '9px',
+            color: '#00ae66',
+            cursor: 'pointer',
+            fontSize: '11px',
+            lineHeight: '16px',
+            padding: '0 5px',
+            pointerEvents: 'auto',
+            background: '#fff'
+        });
+    }
+    if (typeof clickHandler === 'function' && typeof label.addEventListener === 'function') {
+        label.addEventListener('click', clickHandler);
+    }
+    if (typeof marker.setLabel === 'function') marker.setLabel(label);
+}
+
+function filterRecordsByMapBounds(records, map, BMap) {
+    if (typeof map?.getBounds !== 'function' || !BMap?.Point) return records;
+    const bounds = map.getBounds();
+    if (typeof bounds?.containsPoint !== 'function') return records;
+    const filtered = records.filter((record) => {
+        const point = normalizeMapPoint(record?.point);
+        return point && bounds.containsPoint(new BMap.Point(point.longitude, point.latitude));
+    });
+    return filtered.length ? filtered : records;
+}
+
+function addListingMarker(map, BMap, group, point) {
+    const record = getMapGroupInfoRecord(group);
+    if (!record) return;
+    const marker = new BMap.Marker(point);
+    const handleMarkerClick = (event) => {
+        event?.domEvent?.preventDefault?.();
+        event?.domEvent?.stopPropagation?.();
+        const currentZoom = typeof map.getZoom === 'function' ? map.getZoom() : 12;
+        const splitZoom = getMapClusterSplitZoom(currentZoom);
+        if (group.records.length > 1 && splitZoom > currentZoom) {
+            if (typeof map.centerAndZoom === 'function') {
+                map.centerAndZoom(point, splitZoom);
+            }
+            setMapStatus(`正在拆分 ${group.records.length} 套`);
+            window.setTimeout(() => renderListingMap({ preserveViewport: true }), 250);
+            return;
+        }
+
+        const infoWindow = new BMap.InfoWindow(group.records.length > 1 ? buildMapGroupInfoWindowHtml(group) : buildInfoWindowHtml(record));
+        map.openInfoWindow(infoWindow, point);
+        if (group.records.length === 1) {
+            loadPreviewImageForInfoWindow(record, infoWindow);
+        }
+    };
+    if (group.records.length > 1) {
+        mapState.markerGroupClickHandlers.set(group.key, handleMarkerClick);
+    }
+    applyMarkerGroupLabel(marker, BMap, group.records.length, group.key, handleMarkerClick);
+    marker.addEventListener('click', handleMarkerClick);
+    map.addOverlay(marker);
+}
+
+function renderMapOverlaysInBatches(map, BMap, markerGroups, points, records, renderToken, options = {}) {
+    const total = markerGroups.length;
+    const batchSize = getMapOverlayBatchSize(total);
+    let index = 0;
+
+    const renderBatch = () => {
+        if (renderToken !== mapState.mapRenderToken) return;
+        const limit = Math.min(index + batchSize, total);
+        for (; index < limit; index += 1) {
+            addListingMarker(map, BMap, markerGroups[index], points[index]);
+        }
+        if (index < total) {
+            setMapStatus(getMapRenderProgressText(index, total));
+            scheduleMapOverlayBatch(renderBatch);
+            return;
+        }
+
+        if (options.preserveViewport) {
+            updateMapStatus(records);
+        } else if (points.length === 1) {
+            map.centerAndZoom(points[0], 15);
+        } else {
+            map.setViewport(points, { margins: [40, 40, 40, 40] });
+            updateMapStatus(records);
+        }
+    };
+
+    renderBatch();
+}
+
+function renderListingMap(options = {}) {
     const records = getCurrentMapRecords();
     updateMapStatus(records);
+    const renderToken = mapState.mapRenderToken + 1;
+    mapState.mapRenderToken = renderToken;
 
     const mappedRecords = records
         .map((record) => mapState.fetchedListings.get(record.key))
@@ -1390,27 +1934,19 @@ function renderListingMap() {
 
     ensureMapReady().then((map) => {
         const BMap = getPageWindow().BMap;
-        if (!BMap) return;
+        if (!BMap || renderToken !== mapState.mapRenderToken) return;
 
+        mapState.markerGroupClickHandlers.clear();
         clearMapOverlaysIfPresent(map);
-        const points = mappedRecords.map((record) => new BMap.Point(record.point.longitude, record.point.latitude));
-        mappedRecords.forEach((record, index) => {
-            const point = points[index];
-            const marker = new BMap.Marker(point);
-            const infoWindow = new BMap.InfoWindow(buildInfoWindowHtml(record));
-            marker.addEventListener('click', () => {
-                map.openInfoWindow(infoWindow, point);
-                loadPreviewImageForInfoWindow(record, infoWindow);
-            });
-            map.addOverlay(marker);
-        });
-
-        if (points.length === 1) {
-            map.centerAndZoom(points[0], 15);
-        } else {
-            map.setViewport(points, { margins: [40, 40, 40, 40] });
+        const visibleRecords = options.preserveViewport ? filterRecordsByMapBounds(mappedRecords, map, BMap) : mappedRecords;
+        const zoom = typeof map.getZoom === 'function' ? map.getZoom() : 0;
+        const markerGroups = groupMapRecordsByPoint(visibleRecords, getMapRenderGroupPrecision(visibleRecords.length, zoom, getShowAllFetchedOnMap()));
+        if (!markerGroups.length) {
+            updateMapStatus(records);
+            return;
         }
-        updateMapStatus(records);
+        const points = markerGroups.map((group) => new BMap.Point(group.point.longitude, group.point.latitude));
+        renderMapOverlaysInBatches(map, BMap, markerGroups, points, records, renderToken, options);
     }).catch(() => {
         setMapStatus('地图加载失败');
     });
@@ -1635,6 +2171,59 @@ function fetchWithTimeout(url, options = {}, timeoutMs = MAP_DETAIL_FETCH_TIMEOU
     });
 }
 
+async function fetchNextPageHtmlByFetch(pageUrl, fetchImpl = fetch) {
+    const response = await fetchImpl(pageUrl, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const html = await response.text();
+    if (isCaptchaResponse(response, html)) throw new Error('captcha');
+    return html;
+}
+
+function fetchNextPageHtmlByIframe(pageUrl) {
+    if (typeof document !== 'object') throw new Error('iframe unavailable');
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;top:-9999px;border:0;visibility:hidden;';
+    iframe.src = pageUrl;
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+            window.clearTimeout(timeoutId);
+            iframe.remove();
+        };
+        const settle = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(value);
+        };
+        const timeoutId = window.setTimeout(() => settle(reject, new Error('page unavailable')), MAP_DETAIL_FETCH_TIMEOUT_MS);
+
+        iframe.addEventListener('load', () => {
+            try {
+                const frameWindow = iframe.contentWindow;
+                const frameDocument = iframe.contentDocument || frameWindow?.document;
+                const html = frameDocument?.documentElement?.outerHTML || '';
+                if (isCaptchaResponse({ url: frameWindow?.location?.href || iframe.src }, html)) {
+                    settle(reject, new Error('captcha'));
+                    return;
+                }
+                settle(resolve, html);
+            } catch {
+                settle(reject, new Error('captcha'));
+            }
+        });
+        iframe.addEventListener('error', () => settle(reject, new Error('page unavailable')));
+        document.body.append(iframe);
+    });
+}
+
+function fetchNextPageHtml(pageUrl, mode = getNextPageFetchMode()) {
+    return normalizeNextPageFetchMode(mode) === NEXT_PAGE_FETCH_MODE_IFRAME
+        ? fetchNextPageHtmlByIframe(pageUrl)
+        : fetchNextPageHtmlByFetch(pageUrl);
+}
+
 function isRentListPageUrl(url) {
     return /^https:\/\/[^/]+\.lianjia\.com\/(?:ditiezufang|zufang)(?:\/|$)/.test(String(url || ''))
         && !isRentDetailPageUrl(url);
@@ -1846,11 +2435,7 @@ async function runAutoFetchStep() {
     setAutoFetchStatus(`第 ${page} 页`);
 
     try {
-        const response = await fetch(pageUrl, { credentials: 'same-origin' });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const html = await response.text();
-        if (isCaptchaResponse(response, html)) throw new Error('captcha');
-
+        const html = await fetchNextPageHtml(pageUrl, getNextPageFetchMode());
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const records = filterMapRecordsByState(
             getCardsFromDocument(doc).map(getMapRecordFromCard).filter(Boolean),
@@ -2090,36 +2675,57 @@ const api = {
     buildPageUrl,
     buildGeocodeQuery,
     buildInfoWindowHtml,
+    buildMapGroupInfoWindowHtml,
     CONTENT_FILTER_HOST_LABEL,
     clearMapOverlaysIfPresent,
     DEFAULT_COORDINATE_SOURCE,
     DEFAULT_FILTER_STATE,
+    DEFAULT_MAP_HEIGHT,
+    DEFAULT_NEXT_PAGE_FETCH_MODE,
+    DEFAULT_SHOW_ALL_FETCHED_ON_MAP,
     DEFAULT_TIMING_SETTINGS,
+    MAX_MAP_HEIGHT,
     MAP_DETAIL_FETCH_DELAY_MS,
+    MIN_MAP_HEIGHT,
+    NEXT_PAGE_FETCH_MODE_OPTIONS,
+    applyMapCanvasHeight,
+    applyMarkerGroupLabel,
     classifyListingContent,
     extractMapPointFromDetailHtml,
     extractPreviewImageFromDetailHtml,
     fetchWithTimeout,
     filterMapRecordsByState,
     filterNewListingKeys,
+    formatShowAllFetchedText,
     getAutoFetchNextPage,
     getAutoFetchPageDelay,
     getAutoFetchRetryDelay,
     getAutoFetchRetryStatusText,
+    getAllFetchedMapRecords,
+    getMapClusterSplitZoom,
     getCoordinateSourceSequence,
     getListingDetailUrl,
     getListingKeyFromDetailUrl,
     getListingKey,
+    getMapOverlayBatchSize,
+    getMapPointGroupPrecision,
+    getMapRenderGroupPrecision,
     isSubwaySwitchLinkText,
+    insertMapPanel,
     getMapQueueWaitMs,
+    getMapRenderProgressText,
     getSearchCacheRecords,
+    groupMapRecordsByPoint,
     hydrateMapRecordsFromCache,
     markAutoFetchCaptchaRetry,
     markAutoFetchPageFetched,
     mergeMapCacheRecords,
     normalizeAutoFetchState,
     normalizeCoordinateSource,
+    normalizeMapHeight,
+    normalizeNextPageFetchMode,
     normalizePreviewImageUrl,
+    normalizeShowAllFetchedOnMap,
     normalizeSubwayStationLinkHref,
     normalizeTimingSettings,
     normalizeMapPoint,
