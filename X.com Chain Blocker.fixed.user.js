@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.52
+// @version      2.15.53
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -91,7 +91,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.52';
+const SPAM_SCANNER_BUILD = '2.15.53';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1631,6 +1631,22 @@ function textContentWithImageAlt(root) {
 function normalizePromoHandle(handle) {
     return String(handle || '').trim().replace(/^@+/, '').toLowerCase();
 }
+function normalizeNukeTaskIds(taskIds) {
+    const values = Array.isArray(taskIds) ? taskIds : (taskIds ? [taskIds] : []);
+    return [...new Set(values.map(String).filter(Boolean))];
+}
+function mergeNukeTaskIds(...sources) {
+    return normalizeNukeTaskIds(sources.flatMap((source) => normalizeNukeTaskIds(source)));
+}
+function getEntryNukeTaskIds(entry) {
+    return mergeNukeTaskIds(entry?.nukeTaskIds, entry?.nukeTaskId);
+}
+function attachNukeTaskIdsToEntry(entry, taskIds) {
+    if (!entry) return entry;
+    const merged = mergeNukeTaskIds(getEntryNukeTaskIds(entry), taskIds);
+    if (merged.length) entry.nukeTaskIds = merged;
+    return entry;
+}
 function getHiddenUserStorageKey(entry) {
     const userId = entry?.userId ? String(entry.userId) : '';
     if (userId) return `id:${userId}`;
@@ -1667,6 +1683,7 @@ function mergePendingHiddenUserEntries(existing = [], incoming = [], now = Date.
             userId: entry.userId || prev?.userId || null,
             screenName: normalizePromoHandle(entry.screenName || prev?.screenName),
             userNameText: entry.userNameText || prev?.userNameText || normalizePromoHandle(entry.screenName || prev?.screenName),
+            nukeTaskIds: mergeNukeTaskIds(prev?.nukeTaskIds, entry.nukeTaskIds),
             addedAt: prev?.addedAt || entry.addedAt || now,
             lastSeenAt: now
         });
@@ -2679,6 +2696,10 @@ function createManualDetectedNukeTask(capturedTargets, now = Date.now()) {
     }).filter((capture) => capture.authorHandle || capture.tweetContext?.tweetId);
     const targetTweetIds = getManualDetectedNukeTaskTweetIds({ captures });
     const taskId = `manual-detected:${now}:${targetTweetIds.join(',') || captures.length}`;
+    captures.forEach((capture) => {
+        capture.nukeTaskIds = [taskId];
+        capture.tweetContext = { ...(capture.tweetContext || {}), nukeTaskIds: [taskId] };
+    });
     return {
         taskId,
         status: 'pending',
@@ -2690,6 +2711,10 @@ function createManualDetectedNukeTask(capturedTargets, now = Date.now()) {
         apiCollectedCount: 0,
         queuedAuthorCount: 0,
         queuedChainUserCount: 0,
+        queuedUserIds: [],
+        blockedUserIds: [],
+        failedUserIds: [],
+        skippedUserIds: [],
         targetTweetIds,
         captures
     };
@@ -2700,6 +2725,22 @@ function upsertManualDetectedNukeTask(userData, task) {
     const limit = typeof MANUAL_DETECTED_NUKE_TASK_LIMIT === 'number' ? MANUAL_DETECTED_NUKE_TASK_LIMIT : 20;
     userData.manualDetectedNukeTasks = [task, ...existing.filter((item) => item?.taskId !== task.taskId)].slice(0, limit);
     return task;
+}
+function recordManualDetectedNukeQueueOutcome(userData, entry, outcome) {
+    const userId = entry?.userId ? String(entry.userId) : '';
+    const taskIds = new Set(getEntryNukeTaskIds(entry));
+    if (!userId || !taskIds.size) return 0;
+    let updated = 0;
+    for (const task of userData?.manualDetectedNukeTasks || []) {
+        if (!taskIds.has(String(task?.taskId || ''))) continue;
+        task.queuedUserIds = mergeNukeTaskIds(task.queuedUserIds, userId);
+        if (outcome === 'blocked') task.blockedUserIds = mergeNukeTaskIds(task.blockedUserIds, userId);
+        if (outcome === 'failed') task.failedUserIds = mergeNukeTaskIds(task.failedUserIds, userId);
+        if (outcome === 'skipped') task.skippedUserIds = mergeNukeTaskIds(task.skippedUserIds, userId);
+        task.updatedAt = Date.now();
+        updated += 1;
+    }
+    return updated;
 }
 function getActiveManualDetectedNukeTasks(userData) {
     return (userData?.manualDetectedNukeTasks || [])
@@ -2757,16 +2798,31 @@ function pauseManualDetectedNukeTaskForApiLimit(task, apiRateLimitState, now = D
 function getManualDetectedNukeTaskStats(task, userData) {
     userData = userData || {};
     const tweetIds = new Set(getManualDetectedNukeTaskTweetIds(task));
-    const matchesTaskTweet = (entry) => tweetIds.size > 0 && tweetIds.has(String(entry?.sourceTweetId || ''));
+    const taskIds = new Set((task?.tasks || [task]).map((item) => String(item?.taskId || '')).filter(Boolean));
+    const matchesTask = (entry) => {
+        const entryTaskIds = getEntryNukeTaskIds(entry);
+        if (entryTaskIds.length && taskIds.size) return entryTaskIds.some((taskId) => taskIds.has(taskId));
+        return tweetIds.size > 0 && tweetIds.has(String(entry?.sourceTweetId || ''));
+    };
+    const getEntryUserIds = (entries) => new Set((entries || []).filter(matchesTask).map((entry) => String(entry?.userId || '')).filter(Boolean));
+    const queuedIds = getEntryUserIds(userData.queue);
+    const blockedIds = new Set(mergeNukeTaskIds(task?.blockedUserIds));
+    getEntryUserIds(userData.blockedLog).forEach((userId) => blockedIds.add(userId));
+    const failedIds = new Set(mergeNukeTaskIds(task?.failedUserIds));
+    const skippedIds = new Set(mergeNukeTaskIds(task?.skippedUserIds));
+    const workflowIds = new Set(mergeNukeTaskIds(task?.queuedUserIds, Array.from(queuedIds), Array.from(blockedIds), Array.from(failedIds), Array.from(skippedIds)));
     const hiddenTargets = Number(task?.hiddenTargets);
     const expectedBlockCount = Number(task?.expectedBlockCount);
     const apiCollectedCount = Number(task?.apiCollectedCount);
     return {
         hiddenTargets: Number.isFinite(hiddenTargets) ? hiddenTargets : (task?.captures || []).length,
         expectedBlockCount: Number.isFinite(expectedBlockCount) ? expectedBlockCount : sumManualDetectedExpectedBlockCount(task?.captures || []),
-        apiCollectedCount: Number.isFinite(apiCollectedCount) ? apiCollectedCount : 0,
-        blockedCount: (userData.blockedLog || []).filter(matchesTaskTweet).length,
-        queuedCount: (userData.queue || []).filter(matchesTaskTweet).length
+        apiCollectedCount: Number.isFinite(apiCollectedCount) ? apiCollectedCount : normalizeNukeTaskIds(task?.apiUserIds).length,
+        workflowCount: workflowIds.size,
+        blockedCount: blockedIds.size,
+        queuedCount: queuedIds.size,
+        failedCount: failedIds.size,
+        skippedCount: skippedIds.size
     };
 }
 function getManualDetectedNukeTaskSummary(userData) {
@@ -2775,6 +2831,10 @@ function getManualDetectedNukeTaskSummary(userData) {
     const apiUserIds = new Set();
     let apiCountFallback = 0;
     const targetTweetIds = new Set();
+    const queuedUserIds = new Set();
+    const blockedUserIds = new Set();
+    const failedUserIds = new Set();
+    const skippedUserIds = new Set();
     const captures = [];
     let hiddenTargets = 0;
     let expectedBlockCount = 0;
@@ -2787,6 +2847,10 @@ function getManualDetectedNukeTaskSummary(userData) {
             apiCountFallback += Number(task.apiCollectedCount) || 0;
         }
         getManualDetectedNukeTaskTweetIds(task).forEach((tweetId) => targetTweetIds.add(tweetId));
+        normalizeNukeTaskIds(task.queuedUserIds).forEach((userId) => queuedUserIds.add(userId));
+        normalizeNukeTaskIds(task.blockedUserIds).forEach((userId) => blockedUserIds.add(userId));
+        normalizeNukeTaskIds(task.failedUserIds).forEach((userId) => failedUserIds.add(userId));
+        normalizeNukeTaskIds(task.skippedUserIds).forEach((userId) => skippedUserIds.add(userId));
         captures.push(...(task.captures || []));
     }
     const statuses = new Set(tasks.map((task) => task.status));
@@ -2800,6 +2864,10 @@ function getManualDetectedNukeTaskSummary(userData) {
         hiddenTargets,
         expectedBlockCount,
         apiCollectedCount: apiUserIds.size + apiCountFallback,
+        queuedUserIds: Array.from(queuedUserIds),
+        blockedUserIds: Array.from(blockedUserIds),
+        failedUserIds: Array.from(failedUserIds),
+        skippedUserIds: Array.from(skippedUserIds),
         targetTweetIds: Array.from(targetTweetIds),
         captures,
         tasks
@@ -2808,11 +2876,16 @@ function getManualDetectedNukeTaskSummary(userData) {
 function formatManualDetectedNukeTaskStatus(task, userData) {
     userData = userData || {};
     const stats = getManualDetectedNukeTaskStats(task, userData);
+    const terminal = [
+        stats.failedCount ? `失败 ${stats.failedCount}` : '',
+        stats.skippedCount ? `跳过 ${stats.skippedCount}` : ''
+    ].filter(Boolean).join('，');
     return [
         `已隐藏 ${stats.hiddenTargets} 个目标`,
-        `预期拉黑数（回复数+转推数）: ${stats.expectedBlockCount}`,
-        `九族拉黑数（API真实获取到的数量）: ${stats.apiCollectedCount}`,
-        `已拉黑数量: ${stats.blockedCount}`
+        `网页预期关联数（回复数+转推数）: ${stats.expectedBlockCount}`,
+        `API 已发现关联数: ${stats.apiCollectedCount}`,
+        `已进入拉黑流程: ${stats.workflowCount}`,
+        `已拉黑数量: ${stats.blockedCount} / ${stats.workflowCount}（待处理 ${stats.queuedCount}${terminal ? `，${terminal}` : ''}）`
     ].map((line) => `<div>${line}</div>`).join('');
 }
 function showManualDetectedNukeTaskToast(task, userData, duration = null) {
@@ -2900,11 +2973,13 @@ async function resolveManualDetectedNukeCapture(capture) {
         authorId,
         rootAuthorHandle,
         rootAuthorId,
-        engagementCounts: capture.engagementCounts || {}
+        engagementCounts: capture.engagementCounts || {},
+        nukeTaskIds: getEntryNukeTaskIds(capture)
     };
 }
 function createManualDetectedCollectTarget(capture) {
-    const tweetContext = { ...(capture?.tweetContext || {}) };
+    const nukeTaskIds = getEntryNukeTaskIds(capture);
+    const tweetContext = { ...(capture?.tweetContext || {}), nukeTaskIds };
     const authorHandle = normalizePromoHandle(capture?.authorHandle || tweetContext.authorHandle);
     tweetContext.authorHandle = normalizePromoHandle(tweetContext.authorHandle || authorHandle);
     tweetContext.rootAuthorHandle = normalizePromoHandle(tweetContext.rootAuthorHandle);
@@ -2917,13 +2992,17 @@ function createManualDetectedCollectTarget(capture) {
         authorId: capture?.authorId || null,
         rootAuthorHandle: tweetContext.rootAuthorHandle || '',
         rootAuthorId: capture?.rootAuthorId || tweetContext.rootAuthorId || null,
-        engagementCounts: capture?.engagementCounts || {}
+        engagementCounts: capture?.engagementCounts || {},
+        nukeTaskIds
     };
 }
 function getManualDetectedChainCollectTargets(task) {
     const collectedTweetIds = new Set((task?.collectedTweetIds || []).map(String));
     return (task?.captures || [])
-        .map((capture, index) => ({ ...createManualDetectedCollectTarget(capture), manualOrder: index }))
+        .map((capture, index) => ({
+            ...createManualDetectedCollectTarget({ ...capture, nukeTaskIds: mergeNukeTaskIds(capture?.nukeTaskIds, task?.taskId) }),
+            manualOrder: index
+        }))
         .filter((target) => {
             const tweetId = target.tweetContext?.tweetId;
             return tweetId && !collectedTweetIds.has(String(tweetId));
@@ -3018,7 +3097,7 @@ async function processManualDetectedNukeBackground(taskId) {
             for (const [index, capture] of captures.entries()) {
                 try {
                     const resolvedTarget = await resolveManualDetectedNukeCapture(capture);
-                    resolvedTargets.push({ ...resolvedTarget, manualOrder: index });
+                    resolvedTargets.push({ ...resolvedTarget, nukeTaskIds: mergeNukeTaskIds(resolvedTarget.nukeTaskIds, task.taskId), manualOrder: index });
                     task.updatedAt = Date.now();
                     showManualDetectedNukeProgressToast(userData);
                     await saveUserData(userData);
@@ -3823,6 +3902,7 @@ function createQueueEntryFromUser(userResult, chainSources, context) {
         sourceAuthorHandle: context.authorHandle || '',
         sourceRootAuthorHandle: context.rootAuthorHandle || '',
         sourceRootAuthorId: context.rootAuthorId || null,
+        nukeTaskIds: getEntryNukeTaskIds(context),
         blockReason: meta.blockReason,
         blockNote: meta.blockNote
     };
@@ -3830,7 +3910,8 @@ function createQueueEntryFromUser(userResult, chainSources, context) {
 function mergeQueueEntries(existingEntry, incomingEntry, context) {
     const chainSources = [...new Set([...(existingEntry.chainSources || []), ...(incomingEntry.chainSources || [])])];
     const meta = buildChainBlockNote(chainSources, context);
-    return { ...existingEntry, ...incomingEntry, chainSources, blockReason: meta.blockReason, blockNote: meta.blockNote };
+    const nukeTaskIds = mergeNukeTaskIds(getEntryNukeTaskIds(existingEntry), getEntryNukeTaskIds(incomingEntry), getEntryNukeTaskIds(context));
+    return { ...existingEntry, ...incomingEntry, chainSources, nukeTaskIds, blockReason: meta.blockReason, blockNote: meta.blockNote };
 }
 function createPendingHiddenUserEntry(entry, context = {}) {
     return {
@@ -3841,6 +3922,7 @@ function createPendingHiddenUserEntry(entry, context = {}) {
         sourceTweetUrl: entry.sourceTweetUrl || context.tweetUrl || '',
         sourceTweetText: entry.sourceTweetText || context.tweetText || '',
         sourceAuthorHandle: entry.sourceAuthorHandle || context.authorHandle || '',
+        nukeTaskIds: mergeNukeTaskIds(getEntryNukeTaskIds(entry), getEntryNukeTaskIds(context)),
         blockReason: entry.blockReason || '',
         blockNote: entry.blockNote || ''
     };
@@ -3858,6 +3940,7 @@ function createAuthorQueueEntry(resolvedTarget) {
         sourceAuthorHandle: tweetContext.authorHandle || authorHandle,
         sourceRootAuthorHandle: tweetContext.rootAuthorHandle || '',
         sourceRootAuthorId: tweetContext.rootAuthorId || null,
+        nukeTaskIds: mergeNukeTaskIds(getEntryNukeTaskIds(resolvedTarget), getEntryNukeTaskIds(tweetContext)),
         ...meta
     };
 }
@@ -4901,6 +4984,7 @@ async function processQueue() {
         }
         if (isQueueEntryProtectedRootAuthor(userToBlock)) {
             console.warn(`[CB] 跳过队列中的主贴作者 @${userToBlock.screenName || userToBlock.userId}`);
+            recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'skipped');
             queueHiddenUserRelease(userData, userToBlock);
             applyHiddenUserReleaseQueue(userData);
             userData.queue.shift();
@@ -4908,6 +4992,7 @@ async function processQueue() {
         }
         await blockUserById(userToBlock.userId);
         userData.queue.shift();
+        recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'blocked');
         userData.blockedLog.push({ ...userToBlock, blockTimestamp: Date.now(), blockNote: userToBlock.blockNote || '', blockReason: userToBlock.blockReason || '' });
         queueHiddenUserRelease(userData, userToBlock);
         applyHiddenUserReleaseQueue(userData);
@@ -4920,6 +5005,7 @@ async function processQueue() {
             showApiLimitRetryToast(error);
         } else {
         console.error(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 失败，移除.`, error);
+        recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'failed');
         userData.queue.shift();
         }
     } finally {
@@ -5116,10 +5202,22 @@ function queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptH
         showToast('nuke-fetch-toast', '🛡️ 用户在白名单或豁免列表', `已跳过 @${authorHandle}`, 4000);
         return false;
     }
-    const existingIds = new Set([...userData.queue.map((u) => u.userId), ...userData.blockedLog.map((u) => u.userId)]);
-    if (existingIds.has(authorId) || authorId === currentUserId) return false;
     const entry = createAuthorQueueEntry(resolvedTarget);
+    const existingQueueEntry = userData.queue.find((item) => item.userId === authorId);
+    if (existingQueueEntry) {
+        attachNukeTaskIdsToEntry(existingQueueEntry, getEntryNukeTaskIds(entry));
+        recordManualDetectedNukeQueueOutcome(userData, existingQueueEntry, 'queued');
+        return false;
+    }
+    const existingBlockedEntry = userData.blockedLog.find((item) => item.userId === authorId);
+    if (existingBlockedEntry) {
+        attachNukeTaskIdsToEntry(existingBlockedEntry, getEntryNukeTaskIds(entry));
+        recordManualDetectedNukeQueueOutcome(userData, existingBlockedEntry, 'blocked');
+        return false;
+    }
+    if (authorId === currentUserId) return false;
     userData.queue.push(entry);
+    recordManualDetectedNukeQueueOutcome(userData, entry, 'queued');
     addPendingHiddenUsers(userData, [createPendingHiddenUserEntry(entry, resolvedTarget.tweetContext)]);
     applyPendingHiddenUsersToPage(userData);
     return true;
@@ -5164,9 +5262,22 @@ function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHan
     return Array.from(queueById.values()).filter(u => u.userId && u.userId !== currentUserId && !existingUserIds.has(u.userId) && !exemptHandleSet.has(normalizePromoHandle(u.screenName)));
 }
 function addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
+    for (const incomingEntry of queueById.values()) {
+        const existingQueueEntry = userData.queue.find((entry) => entry.userId === incomingEntry.userId);
+        if (existingQueueEntry) {
+            attachNukeTaskIdsToEntry(existingQueueEntry, getEntryNukeTaskIds(incomingEntry));
+            recordManualDetectedNukeQueueOutcome(userData, existingQueueEntry, 'queued');
+        }
+        const existingBlockedEntry = userData.blockedLog.find((entry) => entry.userId === incomingEntry.userId);
+        if (existingBlockedEntry) {
+            attachNukeTaskIdsToEntry(existingBlockedEntry, getEntryNukeTaskIds(incomingEntry));
+            recordManualDetectedNukeQueueOutcome(userData, existingBlockedEntry, 'blocked');
+        }
+    }
     const newUsersToQueue = selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds);
     if (newUsersToQueue.length > 0) {
         userData.queue.push(...newUsersToQueue);
+        newUsersToQueue.forEach((entry) => recordManualDetectedNukeQueueOutcome(userData, entry, 'queued'));
         addPendingHiddenUsers(userData, newUsersToQueue.map((entry) => createPendingHiddenUserEntry(entry)));
         applyPendingHiddenUsersToPage(userData);
     }

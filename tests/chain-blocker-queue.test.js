@@ -25,10 +25,16 @@ function extractFunction(source, name) {
 
 function loadHelpers(names) {
     const source = fs.readFileSync(sourcePath, 'utf8');
-    const sandbox = { module: { exports: {} }, MANUAL_DETECTED_NUKE_STALE_RUNNING_MS: 120000 };
+    const sandbox = {
+        module: { exports: {} },
+        MANUAL_DETECTED_NUKE_STALE_RUNNING_MS: 120000,
+        buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
+    };
+    const baseNames = ['normalizeNukeTaskIds', 'mergeNukeTaskIds', 'getEntryNukeTaskIds'];
     const code = [
         extractFunction(source, 'normalizePromoHandle'),
-        ...names.map((name) => extractFunction(source, name)),
+        ...baseNames.map((name) => extractFunction(source, name)),
+        ...names.filter((name) => !baseNames.includes(name)).map((name) => extractFunction(source, name)),
         `module.exports = { ${names.join(', ')} };`
     ].join('\n');
     vm.runInNewContext(code, sandbox);
@@ -204,6 +210,8 @@ test('manual detected button is disabled only during capture or when no targets 
 
 test('manual detected nuke task status shows hidden expected api and blocked counts', () => {
     const { formatManualDetectedNukeTaskStatus } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
         'getManualDetectedNukeTaskTweetIds',
         'getManualDetectedNukeTaskStats',
         'formatManualDetectedNukeTaskStatus'
@@ -218,16 +226,88 @@ test('manual detected nuke task status shows hidden expected api and blocked cou
         ]
     };
     const userData = {
-        queue: [{ sourceTweetId: 'tweet-2' }],
-        blockedLog: [{ sourceTweetId: 'tweet-1' }, { sourceTweetId: 'other' }]
+        queue: [{ userId: 'queued-1', sourceTweetId: 'tweet-2' }],
+        blockedLog: [{ userId: 'blocked-1', sourceTweetId: 'tweet-1' }, { userId: 'other', sourceTweetId: 'other' }]
     };
 
     const html = formatManualDetectedNukeTaskStatus(task, userData);
 
     assert.match(html, /已隐藏 2 个目标/);
-    assert.match(html, /预期拉黑数（回复数\+转推数）: 7/);
-    assert.match(html, /九族拉黑数（API真实获取到的数量）: 5/);
-    assert.match(html, /已拉黑数量: 1/);
+    assert.match(html, /网页预期关联数（回复数\+转推数）: 7/);
+    assert.match(html, /API 已发现关联数: 5/);
+    assert.match(html, /已进入拉黑流程: 2/);
+    assert.match(html, /已拉黑数量: 1 \/ 2（待处理 1）/);
+});
+
+test('manual detected task stats stay linked after the global block log is trimmed', () => {
+    const { getManualDetectedNukeTaskStats } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
+        'getManualDetectedNukeTaskTweetIds',
+        'getManualDetectedNukeTaskStats'
+    ]);
+    const task = {
+        taskId: 'task-a',
+        hiddenTargets: 2,
+        expectedBlockCount: 9,
+        apiUserIds: ['api-1', 'api-2', 'api-3'],
+        queuedUserIds: ['user-1', 'user-2', 'user-3', 'user-4'],
+        blockedUserIds: ['user-1', 'user-2'],
+        failedUserIds: ['user-4'],
+        captures: [{ tweetContext: { tweetId: 'tweet-shared' } }]
+    };
+    const userData = {
+        queue: [
+            { userId: 'user-3', sourceTweetId: 'tweet-shared', nukeTaskIds: ['task-a'] },
+            { userId: 'other-task-user', sourceTweetId: 'tweet-shared', nukeTaskIds: ['task-b'] }
+        ],
+        blockedLog: []
+    };
+
+    const stats = getManualDetectedNukeTaskStats(task, userData);
+
+    assert.equal(stats.apiCollectedCount, 3);
+    assert.equal(stats.workflowCount, 4);
+    assert.equal(stats.queuedCount, 1);
+    assert.equal(stats.blockedCount, 2);
+    assert.equal(stats.failedCount, 1);
+});
+
+test('queue outcomes update every linked manual detected task', () => {
+    const { recordManualDetectedNukeQueueOutcome } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
+        'recordManualDetectedNukeQueueOutcome'
+    ]);
+    const userData = {
+        manualDetectedNukeTasks: [
+            { taskId: 'task-a' },
+            { taskId: 'task-b', queuedUserIds: ['existing'] },
+            { taskId: 'task-c' }
+        ]
+    };
+    const entry = { userId: 'user-1', nukeTaskIds: ['task-a', 'task-b'] };
+
+    assert.equal(recordManualDetectedNukeQueueOutcome(userData, entry, 'queued'), 2);
+    assert.equal(recordManualDetectedNukeQueueOutcome(userData, entry, 'blocked'), 2);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].queuedUserIds), ['user-1']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].blockedUserIds), ['user-1']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].queuedUserIds), ['existing', 'user-1']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].blockedUserIds), ['user-1']);
+    assert.equal(userData.manualDetectedNukeTasks[2].queuedUserIds, undefined);
+});
+
+test('merged queue entries retain all manual task links', () => {
+    const { mergeQueueEntries } = loadHelpers([
+        'mergeQueueEntries'
+    ]);
+    const merged = mergeQueueEntries(
+        { userId: 'user-1', chainSources: ['reply'], nukeTaskIds: ['task-a'] },
+        { userId: 'user-1', chainSources: ['retweet'], nukeTaskIds: ['task-b'] },
+        { authorHandle: 'source' }
+    );
+
+    assert.deepEqual(Array.from(merged.nukeTaskIds), ['task-a', 'task-b']);
 });
 
 test('manual detected captures can be stored as a resumable nuke task', () => {
@@ -271,6 +351,8 @@ test('manual detected captures can be stored as a resumable nuke task', () => {
 
 test('manual detected nuke status aggregates multiple active tasks', () => {
     const { getManualDetectedNukeTaskSummary, formatManualDetectedNukeTaskStatus } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
         'getManualDetectedNukeTaskTweetIds',
         'sumManualDetectedExpectedBlockCount',
         'getActiveManualDetectedNukeTasks',
@@ -302,8 +384,8 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
                 captures: [{ tweetContext: { tweetId: 'tweet-3' } }]
             }
         ],
-        queue: [{ sourceTweetId: 'tweet-2' }],
-        blockedLog: [{ sourceTweetId: 'tweet-1' }, { sourceTweetId: 'tweet-3' }]
+        queue: [{ userId: 'queued-1', sourceTweetId: 'tweet-2' }],
+        blockedLog: [{ userId: 'blocked-1', sourceTweetId: 'tweet-1' }, { userId: 'blocked-complete', sourceTweetId: 'tweet-3' }]
     };
 
     const summary = getManualDetectedNukeTaskSummary(userData);
@@ -313,9 +395,9 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
     assert.equal(summary.expectedBlockCount, 196);
     assert.equal(summary.apiCollectedCount, 2);
     assert.match(html, /已隐藏 12 个目标/);
-    assert.match(html, /预期拉黑数（回复数\+转推数）: 196/);
-    assert.match(html, /九族拉黑数（API真实获取到的数量）: 2/);
-    assert.match(html, /已拉黑数量: 1/);
+    assert.match(html, /网页预期关联数（回复数\+转推数）: 196/);
+    assert.match(html, /API 已发现关联数: 2/);
+    assert.match(html, /已拉黑数量: 1 \/ 2（待处理 1）/);
 });
 
 test('manual detected nuke runner selects pending task instead of latest queued task', () => {
@@ -450,6 +532,8 @@ test('manual detected nuke migration reruns stale running tasks with zero api us
 
 test('manual detected nuke completion removes terminal tasks from storage', () => {
     const { completeFinishedManualDetectedNukeTasks } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
         'getManualDetectedNukeTaskTweetIds',
         'sumManualDetectedExpectedBlockCount',
         'getManualDetectedNukeTaskStats',
