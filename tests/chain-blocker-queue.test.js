@@ -499,7 +499,7 @@ test('panel toggle remains available with a panel and shifts above the manual bu
     assert.match(toggleSource, /aria-controls/);
 });
 
-test('manual detected nuke task status shows hidden expected api and blocked counts', () => {
+test('manual detected nuke task status leaves queue execution progress to the global status', () => {
     const { formatManualDetectedNukeTaskStatus } = loadHelpers([
         'normalizeNukeTaskIds',
         'getEntryNukeTaskIds',
@@ -525,7 +525,7 @@ test('manual detected nuke task status shows hidden expected api and blocked cou
 
     assert.match(html, /已隐藏: 2/);
     assert.match(html, /关联用户: 网页预计 7 \/ API 发现 5/);
-    assert.match(html, /拉黑进度: 1 \/ 2/);
+    assert.doesNotMatch(html, /拉黑进度/);
     assert.doesNotMatch(html, /待处理/);
 });
 
@@ -782,7 +782,7 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
     assert.equal(summary.apiCollectedCount, 2);
     assert.match(html, /已隐藏: 12/);
     assert.match(html, /关联用户: 网页预计 196 \/ API 发现 2/);
-    assert.match(html, /拉黑进度: 1 \/ 2/);
+    assert.doesNotMatch(html, /拉黑进度/);
     assert.doesNotMatch(html, /待处理/);
 });
 
