@@ -38,7 +38,15 @@ function loadHelpers(names) {
         currentUserId: 'self',
         buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
     };
-    const baseNames = ['normalizeNukeTaskIds', 'mergeNukeTaskIds', 'getEntryNukeTaskIds'];
+    const baseNames = [
+        'normalizeNukeTaskIds',
+        'mergeNukeTaskIds',
+        'getEntryNukeTaskIds',
+        'sumManualDetectedExpectedBlockCount',
+        'isManualDetectedCaptureAuthorPending',
+        'getManualDetectedPendingAuthorCaptures',
+        'getManualDetectedNukeTaskPipelineStats'
+    ];
     const code = [
         extractFunction(source, 'normalizePromoHandle'),
         ...baseNames.map((name) => extractFunction(source, name)),
@@ -511,9 +519,10 @@ test('manual detected nuke task status leaves queue execution progress to the gl
         hiddenTargets: 2,
         expectedBlockCount: 7,
         apiCollectedCount: 5,
+        collectedTweetIds: ['tweet-1'],
         captures: [
-            { tweetContext: { tweetId: 'tweet-1' } },
-            { tweetContext: { tweetId: 'tweet-2' } }
+            { status: 'resolved', tweetContext: { tweetId: 'tweet-1' }, engagementCounts: { replies: 4, retweets: 1 } },
+            { status: 'pending', tweetContext: { tweetId: 'tweet-2' }, engagementCounts: { replies: 1, retweets: 1 } }
         ]
     };
     const userData = {
@@ -523,8 +532,9 @@ test('manual detected nuke task status leaves queue execution progress to the gl
 
     const html = formatManualDetectedNukeTaskStatus(task, userData);
 
-    assert.match(html, /已隐藏: 2/);
-    assert.match(html, /关联用户: 网页预计 7 \/ API 发现 5/);
+    assert.match(html, /待移交目标: 1/);
+    assert.match(html, /待收集回复\/转推: 约 2/);
+    assert.doesNotMatch(html, /已隐藏|API 发现/);
     assert.doesNotMatch(html, /拉黑进度/);
     assert.doesNotMatch(html, /待处理/);
 });
@@ -735,7 +745,7 @@ test('manual detected captures can be stored as a resumable nuke task', () => {
     assert.deepEqual(Array.from(task.captures, (capture) => capture.authorHandle), ['first', 'second']);
 });
 
-test('manual detected nuke status aggregates multiple active tasks', () => {
+test('manual detected nuke status aggregates remaining pipeline stages', () => {
     const { getManualDetectedNukeTaskSummary, formatManualDetectedNukeTaskStatus } = loadHelpers([
         'normalizeNukeTaskIds',
         'getEntryNukeTaskIds',
@@ -753,14 +763,15 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
                 hiddenTargets: 8,
                 expectedBlockCount: 188,
                 apiUserIds: ['u1'],
-                captures: [{ tweetContext: { tweetId: 'tweet-1' } }]
+                collectedTweetIds: ['tweet-1'],
+                captures: [{ status: 'resolved', tweetContext: { tweetId: 'tweet-1' }, engagementCounts: { replies: 180, retweets: 8 } }]
             },
             {
                 status: 'pending',
                 hiddenTargets: 4,
                 expectedBlockCount: 8,
                 apiUserIds: ['u2', 'u1'],
-                captures: [{ tweetContext: { tweetId: 'tweet-2' } }]
+                captures: [{ status: 'pending', tweetContext: { tweetId: 'tweet-2' }, engagementCounts: { replies: 5, retweets: 3 } }]
             },
             {
                 status: 'complete',
@@ -780,8 +791,9 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
     assert.equal(summary.hiddenTargets, 12);
     assert.equal(summary.expectedBlockCount, 196);
     assert.equal(summary.apiCollectedCount, 2);
-    assert.match(html, /已隐藏: 12/);
-    assert.match(html, /关联用户: 网页预计 196 \/ API 发现 2/);
+    assert.match(html, /待移交目标: 1/);
+    assert.match(html, /待收集回复\/转推: 约 8/);
+    assert.doesNotMatch(html, /已隐藏|API 发现/);
     assert.doesNotMatch(html, /拉黑进度/);
     assert.doesNotMatch(html, /待处理/);
 });
@@ -913,7 +925,27 @@ test('manual detected nuke migration reruns stale running tasks with zero api us
     normalizeManualDetectedNukeTasks(userData);
 
     assert.equal(userData.manualDetectedNukeTasks[0].status, 'pending');
-    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].collectedTweetIds), []);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].collectedTweetIds), ['tweet-1']);
+});
+
+test('legacy paused collection resumes once without losing completed pipeline stages', () => {
+    const { normalizeManualDetectedNukeTasks } = loadHelpers([
+        'shouldRetryQueuedManualDetectedNukeTask',
+        'normalizeManualDetectedNukeTasks'
+    ]);
+    const userData = {
+        manualDetectedNukeTasks: [{
+            taskId: 'legacy-paused',
+            status: 'paused',
+            retryAfter: Date.now() + 300000,
+            collectedTweetIds: ['tweet-done']
+        }]
+    };
+
+    assert.equal(normalizeManualDetectedNukeTasks(userData), 1);
+    assert.equal(userData.manualDetectedNukeTasks[0].status, 'pending');
+    assert.equal(userData.manualDetectedNukeTasks[0].retryAfter, 0);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].collectedTweetIds), ['tweet-done']);
 });
 
 test('manual detected nuke completion removes terminal tasks from storage', () => {
@@ -993,22 +1025,24 @@ test('manual detected chain collection targets do not wait for author resolution
     assert.equal(targets[0].manualOrder, 0);
 });
 
-test('manual detected positive-count tweet stays uncollected when api returns zero users', () => {
+test('successful empty chain response completes the collection stage', () => {
     const { shouldMarkManualDetectedTweetCollected } = loadHelpers([
-        'getManualDetectedVisibleChainCount',
         'shouldMarkManualDetectedTweetCollected'
     ]);
     const target = {
         tweetContext: { tweetId: 'tweet-first' },
         engagementCounts: { replies: 4, retweets: 1, likes: 0 }
     };
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const runnerSource = extractFunction(source, 'processManualDetectedNukeBackground');
 
-    assert.equal(shouldMarkManualDetectedTweetCollected(target, 0, 3, 3), false);
-    assert.equal(shouldMarkManualDetectedTweetCollected(target, 0, 3, 4), true);
-    assert.equal(shouldMarkManualDetectedTweetCollected({ ...target, engagementCounts: { replies: 0, retweets: 0, likes: 0 } }, 0, 3, 3), true);
+    assert.equal(shouldMarkManualDetectedTweetCollected(target), true);
+    assert.equal(shouldMarkManualDetectedTweetCollected({ tweetContext: {} }), false);
+    assert.match(runnerSource, /getManualDetectedPendingAuthorCaptures\(task\)/);
+    assert.doesNotMatch(runnerSource, /API 本轮返回 0|chainCollectionIncomplete/);
 });
 
-test('manual detected author queue still runs when only chain collection is incomplete', () => {
+test('manual detected pipeline pauses only for real api failures', () => {
     const { shouldContinueManualDetectedAuthorQueue, getManualDetectedPostCollectStatus } = loadHelpers([
         'shouldContinueManualDetectedAuthorQueue',
         'getManualDetectedPostCollectStatus'
@@ -1016,9 +1050,8 @@ test('manual detected author queue still runs when only chain collection is inco
 
     assert.equal(shouldContinueManualDetectedAuthorQueue(false), true);
     assert.equal(shouldContinueManualDetectedAuthorQueue(true), false);
-    assert.equal(getManualDetectedPostCollectStatus(false, true), 'paused');
-    assert.equal(getManualDetectedPostCollectStatus(false, false), 'queued');
-    assert.equal(getManualDetectedPostCollectStatus(true, false), 'paused');
+    assert.equal(getManualDetectedPostCollectStatus(false), 'queued');
+    assert.equal(getManualDetectedPostCollectStatus(true), 'paused');
 });
 
 test('queue root protection does not skip detected source authors', () => {

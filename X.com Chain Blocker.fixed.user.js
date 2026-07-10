@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.76
+// @version      2.15.77
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.76';
+const SPAM_SCANNER_BUILD = '2.15.77';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2813,6 +2813,35 @@ function sumManualDetectedExpectedBlockCount(captures) {
         return sum + (Number.isFinite(replies) ? replies : 0) + (Number.isFinite(retweets) ? retweets : 0);
     }, 0);
 }
+function isManualDetectedCaptureAuthorPending(capture) {
+    return !['resolved', 'chain_only'].includes(String(capture?.status || 'pending'));
+}
+function getManualDetectedPendingAuthorCaptures(task) {
+    return (task?.captures || []).filter(isManualDetectedCaptureAuthorPending);
+}
+function getManualDetectedNukeTaskPipelineStats(task) {
+    const tasks = Array.isArray(task?.tasks) ? task.tasks : [task];
+    let pendingTargetCount = 0;
+    let pendingExpectedBlockCount = 0;
+    for (const item of tasks) {
+        if (!item) continue;
+        const captures = item.captures || [];
+        if (!captures.length) {
+            if (!['queued', 'complete'].includes(item.status)) {
+                pendingTargetCount += Number(item.hiddenTargets) || 0;
+                pendingExpectedBlockCount += Number(item.expectedBlockCount) || 0;
+            }
+            continue;
+        }
+        pendingTargetCount += getManualDetectedPendingAuthorCaptures(item).length;
+        const collectedTweetIds = new Set((item.collectedTweetIds || []).map(String));
+        pendingExpectedBlockCount += sumManualDetectedExpectedBlockCount(captures.filter((capture) => {
+            const tweetId = capture?.tweetContext?.tweetId;
+            return tweetId && !collectedTweetIds.has(String(tweetId));
+        }));
+    }
+    return { pendingTargetCount, pendingExpectedBlockCount };
+}
 function createManualDetectedNukeTask(capturedTargets, now = Date.now()) {
     const captures = (capturedTargets || []).map((job, index) => {
         const source = job.capture || {};
@@ -2938,10 +2967,16 @@ function normalizeManualDetectedNukeTasks(userData) {
     let changed = userData.manualDetectedNukeTasks.length - retainedTasks.length;
     userData.manualDetectedNukeTasks = retainedTasks;
     for (const task of userData.manualDetectedNukeTasks) {
+        if (task?.status === 'paused' && !task.pauseReason) {
+            task.status = 'pending';
+            task.retryAfter = 0;
+            task.updatedAt = Date.now();
+            changed += 1;
+            continue;
+        }
         if (!shouldRetryQueuedManualDetectedNukeTask(task)) continue;
         task.status = 'pending';
         task.retryAfter = 0;
-        task.collectedTweetIds = [];
         task.updatedAt = Date.now();
         changed += 1;
     }
@@ -2972,6 +3007,7 @@ function pauseManualDetectedNukeTaskForApiLimit(task, apiRateLimitState, now = D
     if (!task || !Number.isFinite(retryAt) || retryAt <= now) return false;
     task.status = 'paused';
     task.retryAfter = retryAt;
+    task.pauseReason = 'api';
     task.updatedAt = now;
     return true;
 }
@@ -3000,6 +3036,7 @@ function getManualDetectedNukeTaskStats(task, userData) {
     const hiddenTargets = Number(task?.hiddenTargets);
     const expectedBlockCount = Number(task?.expectedBlockCount);
     const apiCollectedCount = Number(task?.apiCollectedCount);
+    const pipelineStats = getManualDetectedNukeTaskPipelineStats(task);
     return {
         hiddenTargets: Number.isFinite(hiddenTargets) ? hiddenTargets : (task?.captures || []).length,
         expectedBlockCount: Number.isFinite(expectedBlockCount) ? expectedBlockCount : sumManualDetectedExpectedBlockCount(task?.captures || []),
@@ -3008,7 +3045,8 @@ function getManualDetectedNukeTaskStats(task, userData) {
         blockedCount: blockedIds.size,
         queuedCount: queuedIds.size,
         failedCount: failedIds.size,
-        skippedCount: skippedIds.size
+        skippedCount: skippedIds.size,
+        ...pipelineStats
     };
 }
 function getManualDetectedNukeTaskSummary(userData) {
@@ -3067,8 +3105,8 @@ function formatManualDetectedNukeTaskStatus(task, userData) {
         stats.skippedCount ? `跳过 ${stats.skippedCount}` : ''
     ].filter(Boolean).join('，');
     const lines = [
-        `已隐藏: ${stats.hiddenTargets}`,
-        `关联用户: 网页预计 ${stats.expectedBlockCount} / API 发现 ${stats.apiCollectedCount}`
+        `待移交目标: ${stats.pendingTargetCount}`,
+        `待收集回复/转推: 约 ${stats.pendingExpectedBlockCount}`
     ];
     if (terminal) lines.push(`异常结果: ${terminal}`);
     return lines.map((line) => `<div>${line}</div>`).join('');
@@ -3100,7 +3138,7 @@ function completeFinishedManualDetectedNukeTasks(userData) {
         if (task?.status === 'complete') continue;
         if (task?.status === 'queued') {
             const stats = getManualDetectedNukeTaskStats(task, userData);
-            if (stats.queuedCount === 0) {
+            if (stats.pendingTargetCount === 0 && stats.pendingExpectedBlockCount === 0 && stats.queuedCount === 0) {
                 task.status = 'complete';
                 task.updatedAt = Date.now();
                 completedTask = task;
@@ -3196,23 +3234,14 @@ function getManualDetectedChainCollectTargets(task) {
             return tweetId && !collectedTweetIds.has(String(tweetId));
         });
 }
-function getManualDetectedVisibleChainCount(target) {
-    const counts = target?.engagementCounts || {};
-    const replies = Number(counts.replies);
-    const retweets = Number(counts.retweets);
-    return (Number.isFinite(replies) ? replies : 0) + (Number.isFinite(retweets) ? retweets : 0);
-}
-function shouldMarkManualDetectedTweetCollected(target, queuedUsersForTweet, apiUserCountBefore, apiUserCountAfter) {
-    if (!target?.tweetContext?.tweetId) return false;
-    if ((Number(queuedUsersForTweet) || 0) > 0) return true;
-    if ((Number(apiUserCountAfter) || 0) > (Number(apiUserCountBefore) || 0)) return true;
-    return getManualDetectedVisibleChainCount(target) <= 0;
+function shouldMarkManualDetectedTweetCollected(target) {
+    return !!target?.tweetContext?.tweetId;
 }
 function shouldContinueManualDetectedAuthorQueue(stoppedByApiFailure) {
     return !stoppedByApiFailure;
 }
-function getManualDetectedPostCollectStatus(stoppedByApiFailure, chainCollectionIncomplete) {
-    return stoppedByApiFailure || chainCollectionIncomplete ? 'paused' : 'queued';
+function getManualDetectedPostCollectStatus(stoppedByApiFailure) {
+    return stoppedByApiFailure ? 'paused' : 'queued';
 }
 async function processManualDetectedNukeBackground(taskId) {
     if (!backgroundWorkerLeader || manualDetectedNukeTaskRunning) return;
@@ -3226,9 +3255,9 @@ async function processManualDetectedNukeBackground(taskId) {
         const captures = task.captures || [];
         const chainExemptHandles = [...new Set(captures.flatMap((capture) => capture.chainExemptHandles || []).map(normalizePromoHandle).filter(Boolean))];
         let stoppedByApiFailure = false;
-        let chainCollectionIncomplete = false;
         task.status = 'running';
         task.retryAfter = 0;
+        delete task.pauseReason;
         task.updatedAt = Date.now();
         showManualDetectedNukeProgressToast(userData);
         await saveUserData(userData);
@@ -3247,7 +3276,7 @@ async function processManualDetectedNukeBackground(taskId) {
         let queuedAuthors = 0;
         const handledAuthorIds = new Set();
         if (shouldContinueManualDetectedAuthorQueue(stoppedByApiFailure)) {
-            for (const capture of sortManualDetectedCapturesForAuthorResolution(captures)) {
+            for (const capture of sortManualDetectedCapturesForAuthorResolution(getManualDetectedPendingAuthorCaptures(task))) {
                 try {
                     const resolvedTarget = await resolveManualDetectedNukeCapture(capture);
                     const queuedTarget = { ...resolvedTarget, nukeTaskIds: mergeNukeTaskIds(resolvedTarget.nukeTaskIds, task.taskId) };
@@ -3264,6 +3293,7 @@ async function processManualDetectedNukeBackground(taskId) {
                         showManualDetectedApiStopToast(error);
                         task.status = 'paused';
                         task.retryAfter = error.retryAt || Date.now() + API_RETRY_DELAY_MS;
+                        task.pauseReason = 'api';
                         task.updatedAt = Date.now();
                         stoppedByApiFailure = true;
                         break;
@@ -3286,17 +3316,10 @@ async function processManualDetectedNukeBackground(taskId) {
             for (const collectTarget of getManualDetectedChainCollectTargets(task)) {
                 const tweetId = collectTarget.tweetContext?.tweetId;
                 try {
-                    const apiUserCountBefore = apiUserIds.size;
                     const queuedUsersForTweet = await collectChainUsersForResolvedTarget(collectTarget, userData, whitelistIds, chainExemptHandles, onCollectProgress, showManualDetectedChainCollectPausedToast, onApiUsersPage);
                     queuedChainUsers += queuedUsersForTweet;
-                    if (shouldMarkManualDetectedTweetCollected(collectTarget, queuedUsersForTweet, apiUserCountBefore, apiUserIds.size)) {
+                    if (shouldMarkManualDetectedTweetCollected(collectTarget)) {
                         task.collectedTweetIds = [...new Set([...(task.collectedTweetIds || []), tweetId])];
-                    } else {
-                        task.status = 'paused';
-                        task.retryAfter = Date.now() + API_RETRY_DELAY_MS;
-                        chainCollectionIncomplete = true;
-                        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '可见回复/转推不为 0，但 API 本轮返回 0 个用户，稍后重试', 5000);
-                        break;
                     }
                     task.updatedAt = Date.now();
                     await saveUserData(userData);
@@ -3306,6 +3329,7 @@ async function processManualDetectedNukeBackground(taskId) {
                         showManualDetectedApiStopToast(error);
                         task.status = 'paused';
                         task.retryAfter = error.retryAt || Date.now() + API_RETRY_DELAY_MS;
+                        task.pauseReason = 'api';
                         task.updatedAt = Date.now();
                         stoppedByApiFailure = true;
                         break;
@@ -3320,9 +3344,10 @@ async function processManualDetectedNukeBackground(taskId) {
         task.updatedAt = Date.now();
         await saveUserData(userData);
         showManualDetectedNukeProgressToast(userData);
-        if (getManualDetectedPostCollectStatus(stoppedByApiFailure, chainCollectionIncomplete) === 'queued') {
+        if (getManualDetectedPostCollectStatus(stoppedByApiFailure) === 'queued') {
             task.status = 'queued';
             task.retryAfter = 0;
+            delete task.pauseReason;
         } else {
             task.status = 'paused';
         }
