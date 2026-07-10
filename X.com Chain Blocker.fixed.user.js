@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.60
+// @version      2.15.61
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.60';
+const SPAM_SCANNER_BUILD = '2.15.61';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1181,6 +1181,11 @@ function handleUserscriptBuildRerun() {
 }
 function closeDialogSurface(surface) {
     if (!surface) return;
+    if (typeof surface._nukeDialogCleanup === 'function') {
+        const cleanup = surface._nukeDialogCleanup;
+        delete surface._nukeDialogCleanup;
+        cleanup();
+    }
     if (typeof surface.close === 'function' && surface.open) surface.close();
     surface.remove();
 }
@@ -1309,11 +1314,11 @@ function enableDraggableDialog(panel, options = {}) {
         window.removeEventListener('pointerup', endDrag, true);
         window.removeEventListener('pointercancel', endDrag, true);
     };
-    panel.addEventListener('remove', () => {
+    panel._nukeDialogCleanup = () => {
         cleanupDragListeners();
         resizeObserver?.disconnect();
         window.removeEventListener('resize', onResize);
-    }, { once: true });
+    };
 }
 async function showConfigPanel() {
     if (isConfigPanelBusy) return;

@@ -313,6 +313,21 @@ test('userscript initialization is single-flight and registers its menu once', (
     assert.match(menuSource, /if \(menuCommandRegistered\) return/);
 });
 
+test('closing a dialog releases its resize and drag resources', () => {
+    const { closeDialogSurface } = loadHelpers(['closeDialogSurface']);
+    const calls = [];
+    const surface = {
+        open: true,
+        _nukeDialogCleanup: () => calls.push('cleanup'),
+        close: () => calls.push('close'),
+        remove: () => calls.push('remove')
+    };
+
+    closeDialogSurface(surface);
+
+    assert.deepEqual(calls, ['cleanup', 'close', 'remove']);
+});
+
 test('manual detected author resolution puts zero-engagement targets first', () => {
     const { sortManualDetectedCapturesForAuthorResolution } = loadHelpers([
         'isZeroEngagementNukeTarget',
