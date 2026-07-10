@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.59
+// @version      2.15.60
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.59';
+const SPAM_SCANNER_BUILD = '2.15.60';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1051,6 +1051,7 @@ let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, manualDetectedNukeResumeTimeoutId = null;
 let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false, unifiedToastPanelPlacementBound = false;
+let menuCommandRegistered = false, userscriptBootstrapPromise = null, initializeRunning = false, initializeRetryTimeoutId = null;
 let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
 const pendingDetectionArticles = new Set();
 let detectionScanTimeoutId = null, detectionScanIdleId = null, detectionScanRunning = false, detectionFullScanPending = false;
@@ -1108,7 +1109,38 @@ async function loadConfig() {
     return scriptConfig;
 }
 async function saveConfig(config) { await GM_setValue(CONFIG_STORAGE_KEY, config); scriptConfig = config; }
-function updateMenuCommands() { GM_registerMenuCommand('配置与记录', showConfigPanel); }
+function updateMenuCommands() {
+    if (menuCommandRegistered) return;
+    GM_registerMenuCommand('配置与记录', showConfigPanel);
+    menuCommandRegistered = true;
+}
+function ensureUserscriptBootstrap() {
+    if (userscriptBootstrapPromise) return userscriptBootstrapPromise;
+    userscriptBootstrapPromise = (async () => {
+        console.log("[Chain Blocker] Initializing...");
+        await loadConfig();
+        try {
+            delete document.documentElement.dataset.cbSpamOcrLastError;
+            delete document.documentElement.dataset.cbSpamOcrUiState;
+            delete document.documentElement.dataset.cbSpamOcrUiProgress;
+        } catch {
+            /* ignore */
+        }
+        exposePageSpamProbe();
+        updateMenuCommands();
+    })().catch((error) => {
+        userscriptBootstrapPromise = null;
+        throw error;
+    });
+    return userscriptBootstrapPromise;
+}
+function scheduleInitializeRetry(delay = 500) {
+    if (initializeRetryTimeoutId) return;
+    initializeRetryTimeoutId = window.setTimeout(() => {
+        initializeRetryTimeoutId = null;
+        void initialize();
+    }, Math.max(0, delay));
+}
 function shouldShowDebugConfigTrigger() {
     const href = String(window.location.href || '');
     const hash = String(window.location.hash || '');
@@ -5999,41 +6031,43 @@ function exposePageSpamProbe() {
 
 // --- INITIALIZATION & EXECUTION ---
 async function initialize() {
-    console.log("[Chain Blocker] Initializing...");
-    if (!handleUserscriptBuildRerun()) return;
-    await loadConfig();
+    if (initializeRunning) return;
+    initializeRunning = true;
     try {
-        delete document.documentElement.dataset.cbSpamOcrLastError;
-        delete document.documentElement.dataset.cbSpamOcrUiState;
-        delete document.documentElement.dataset.cbSpamOcrUiProgress;
-    } catch {
-        /* ignore */
-    }
-    exposePageSpamProbe();
-    updateMenuCommands();
-    const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
-    if (!profileLink) { setTimeout(initialize, 500); return; }
-    try {
-        const profileScreenName = normalizePromoHandle(getScreenNameFromProfileHref(profileLink.href));
-        let identity = {
-            userId: parseTwidUserId(),
-            screenName: profileScreenName
-        };
-        if (!identity.userId || !identity.screenName) {
-            const user = await getUserDataByScreenName(profileScreenName);
-            const apiIdentity = getNormalizedUserIdentity(user);
-            identity = {
-                userId: identity.userId || apiIdentity?.userId || '',
-                screenName: identity.screenName || apiIdentity?.screenName || ''
-            };
+        if (!handleUserscriptBuildRerun()) return;
+        await ensureUserscriptBootstrap();
+        const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
+        if (!profileLink) {
+            scheduleInitializeRetry();
+            return;
         }
-        if (!identity.userId) throw new Error('无法确定当前登录用户 ID');
-        clearApiLimitTimers();
+        if (!currentUserId) {
+            const profileScreenName = normalizePromoHandle(getScreenNameFromProfileHref(profileLink.href));
+            let identity = {
+                userId: parseTwidUserId(),
+                screenName: profileScreenName
+            };
+            if (!identity.userId || !identity.screenName) {
+                const user = await getUserDataByScreenName(profileScreenName);
+                const apiIdentity = getNormalizedUserIdentity(user);
+                identity = {
+                    userId: identity.userId || apiIdentity?.userId || '',
+                    screenName: identity.screenName || apiIdentity?.screenName || ''
+                };
+            }
+            if (!identity.userId) throw new Error('无法确定当前登录用户 ID');
+            currentUserId = identity.userId;
+            currentUserScreenName = identity.screenName || profileScreenName || 'unknown';
+            console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
+        }
         await clearExpiredApiRateLimitState();
-        document.getElementById('nuke-api-limit-toast')?.remove();
-        currentUserId = identity.userId;
-        currentUserScreenName = identity.screenName || profileScreenName || 'unknown';
-        console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
+        const apiRateLimitState = await getActiveApiRateLimitState();
+        if (apiRateLimitState) {
+            showApiLimitRetryToast(buildApiRateLimitError(apiRateLimitState));
+        } else {
+            clearApiLimitTimers();
+            dismissToast('nuke-api-limit-toast');
+        }
         await updateStatusToast();
         ensureManualDetectedNukeButton();
         const debugConfigTriggerEnabled = shouldShowDebugConfigTrigger();
@@ -6049,6 +6083,8 @@ async function initialize() {
             console.warn(`[CB] API rate limit hit. Retrying in ${API_RETRY_DELAY_MS / 60000} minutes.`);
             showApiLimitRetryToast(error);
         } else { console.error("[CB] Initialization failed.", error); }
+    } finally {
+        initializeRunning = false;
     }
 }
 const observer = new MutationObserver(mutations => {

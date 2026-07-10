@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const sourcePath = path.join(__dirname, '..', 'X.com Chain Blocker.fixed.user.js');
 
 function extractFunction(source, name) {
-    const marker = `function ${name}`;
+    const marker = `function ${name}(`;
     const start = source.indexOf(marker);
     if (start < 0) throw new Error(`Missing function ${name}`);
     const braceStart = source.indexOf('{', start);
@@ -296,6 +296,21 @@ test('automatic profile bio scans defer articles outside the nearby viewport', (
     assert.match(scheduleSource, /deferProfileBioUntilNearViewport/);
     assert.match(processSource, /scheduleProfileBioScanForArticle/);
     assert.doesNotMatch(processSource, /enqueueProfileBioScan\(article/);
+});
+
+test('userscript initialization is single-flight and registers its menu once', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const initializeSource = extractFunction(source, 'initialize');
+    const retrySource = extractFunction(source, 'scheduleInitializeRetry');
+    const menuSource = extractFunction(source, 'updateMenuCommands');
+
+    assert.match(source, /initializeRunning\s*=\s*false/);
+    assert.match(initializeSource, /if \(initializeRunning\) return/);
+    assert.match(initializeSource, /ensureUserscriptBootstrap/);
+    assert.match(initializeSource, /scheduleInitializeRetry/);
+    assert.doesNotMatch(initializeSource, /setTimeout\(initialize, 500\)/);
+    assert.match(retrySource, /if \(initializeRetryTimeoutId\) return/);
+    assert.match(menuSource, /if \(menuCommandRegistered\) return/);
 });
 
 test('manual detected author resolution puts zero-engagement targets first', () => {
