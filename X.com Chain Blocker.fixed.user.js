@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.72
+// @version      2.15.73
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.72';
+const SPAM_SCANNER_BUILD = '2.15.73';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1065,7 +1065,7 @@ GM_addStyle(`.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-fill{fill:#00b
 GM_addStyle(`.nuke-settings-module{border-top:1px solid #253341;padding-top:14px;margin-top:14px}.nuke-settings-module:first-child{border-top:0;padding-top:0;margin-top:0}.nuke-settings-module-title{font-size:13px;font-weight:700;color:#eff3f4;margin:0 0 10px}`);
 GM_addStyle(`.nuke-aggregated-toast-summary{font-weight:700;margin-bottom:4px}.nuke-aggregated-toast-line{color:#d7dbdc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}`);
 GM_addStyle(`#nuke-toast-panel{position:fixed;right:var(--nuke-toast-panel-right,20px);bottom:20px;z-index:100000;width:var(--nuke-toast-panel-width,min(360px,calc(100vw - 40px)));max-height:min(420px,calc(100vh - 40px));box-sizing:border-box;background:rgb(22,24,28);color:#e7e9ea;border:1px solid rgb(47,51,54);border-radius:16px;box-shadow:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow:hidden}#nuke-toast-panel.nuke-toast-panel-empty{display:none}.nuke-toast-panel-list{display:flex;flex-direction:column;gap:0;max-height:min(420px,calc(100vh - 40px));overflow-y:auto}#nuke-toast-panel .nuke-toast{position:relative;top:auto!important;right:auto;z-index:auto;background:transparent;color:inherit;padding:10px 15px;border:0;border-radius:0;box-shadow:none;width:auto;max-width:none;transform:none;border-bottom:1px solid rgb(47,51,54)}#nuke-toast-panel .nuke-toast:last-child{border-bottom:0}#nuke-toast-panel .nuke-toast.fading-out{opacity:0;transform:translateX(12px)}#nuke-toast-panel #nuke-api-limit-toast{background:rgba(217,161,0,.18);color:#fff;border-color:rgb(47,51,54)}@media(max-width:1000px){#nuke-toast-panel{right:12px;bottom:12px;width:min(360px,calc(100vw - 24px))}}`);
-GM_addStyle(`#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button{position:fixed;right:20px;bottom:146px;z-index:100002;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-toast-panel-toggle-button{bottom:213px}#nuke-manual-detected-nuke-button:hover:not(:disabled),#nuke-toast-panel-toggle-button:hover{background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg,#nuke-toast-panel-toggle-button svg{width:32px;height:32px;display:block}#nuke-toast-panel.nuke-toast-panel-collapsed{display:none!important}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
+GM_addStyle(`#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button{position:fixed;right:20px;bottom:146px;z-index:100002;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-toast-panel-toggle-button.nuke-toast-panel-toggle-with-manual{bottom:213px}#nuke-manual-detected-nuke-button:hover:not(:disabled),#nuke-toast-panel-toggle-button:hover{background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg,#nuke-toast-panel-toggle-button svg{width:32px;height:32px;display:block}#nuke-toast-panel.nuke-toast-panel-collapsed{display:none!important}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
 
 // --- CONFIGURATION MANAGEMENT ---
 async function loadConfig() {
@@ -2736,8 +2736,9 @@ function setUnifiedToastPanelCollapsed(collapsed) {
 }
 function ensureUnifiedToastPanelToggleButton() {
     const manualButton = document.getElementById('nuke-manual-detected-nuke-button');
+    const panel = document.getElementById('nuke-toast-panel');
     let button = document.getElementById('nuke-toast-panel-toggle-button');
-    if (!manualButton) {
+    if (!document.body || (!manualButton && !panel)) {
         button?.remove();
         return;
     }
@@ -2749,6 +2750,7 @@ function ensureUnifiedToastPanelToggleButton() {
         button.addEventListener('click', () => setUnifiedToastPanelCollapsed(!unifiedToastPanelCollapsed));
         document.body.appendChild(button);
     }
+    button.classList.toggle('nuke-toast-panel-toggle-with-manual', Boolean(manualButton));
     updateUnifiedToastPanelToggleButton();
 }
 function ensureManualDetectedNukeButton() {
@@ -5172,6 +5174,7 @@ function getUnifiedToastPanel() {
         bindUnifiedToastPanelPlacement();
     }
     panel.classList.toggle('nuke-toast-panel-collapsed', unifiedToastPanelCollapsed);
+    ensureUnifiedToastPanelToggleButton();
     syncUnifiedToastPanelPlacement(panel);
     return panel;
 }

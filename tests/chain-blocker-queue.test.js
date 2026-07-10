@@ -481,7 +481,7 @@ test('manual detected button is disabled only during capture or when no targets 
     assert.equal(shouldDisableManualDetectedNukeButton(false, 2), false);
 });
 
-test('panel toggle follows the manual button and exposes collapse state', () => {
+test('panel toggle remains available with a panel and shifts above the manual button', () => {
     const { getUnifiedToastPanelToggleLabel } = loadHelpers([
         'getUnifiedToastPanelToggleLabel'
     ]);
@@ -490,9 +490,11 @@ test('panel toggle follows the manual button and exposes collapse state', () => 
 
     assert.equal(getUnifiedToastPanelToggleLabel(false), '收起队列面板');
     assert.equal(getUnifiedToastPanelToggleLabel(true), '展开队列面板');
-    assert.match(source, /#nuke-toast-panel-toggle-button\{bottom:213px\}/);
+    assert.match(source, /#nuke-toast-panel-toggle-button\.nuke-toast-panel-toggle-with-manual\{bottom:213px\}/);
     assert.match(source, /#nuke-toast-panel\.nuke-toast-panel-collapsed\{display:none!important\}/);
     assert.match(toggleSource, /nuke-manual-detected-nuke-button/);
+    assert.match(toggleSource, /!manualButton && !panel/);
+    assert.match(toggleSource, /nuke-toast-panel-toggle-with-manual/);
     assert.match(toggleSource, /aria-controls/);
 });
 
