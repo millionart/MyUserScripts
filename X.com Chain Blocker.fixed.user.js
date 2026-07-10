@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.69
+// @version      2.15.70
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.69';
+const SPAM_SCANNER_BUILD = '2.15.70';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1046,7 +1046,7 @@ const DETECTION_SAFETY_INTERVAL_MS = 15000;
 const DETECTION_SCAN_DELAY_MS = 160;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
-let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
+let isProcessingQueue = false, processIntervalId = null, queueStatusCountdownInterval = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
 let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, manualDetectedNukeResumeTimeoutId = null;
 let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
@@ -5118,6 +5118,7 @@ function layoutToasts() {
 function dismissToast(id) {
     const toast = document.getElementById(id);
     if (!toast) return;
+    if (id === 'nuke-status-toast') clearQueueStatusCountdown();
     if (toast._nukeToastTimer) clearTimeout(toast._nukeToastTimer);
     if (toast._nukeToastRemoveTimer) clearTimeout(toast._nukeToastRemoveTimer);
     toast.remove();
@@ -5183,14 +5184,55 @@ function showAggregatedToast(id, title, status, duration = 4000) {
     const linesHtml = state.lines.map((item) => `<div class="nuke-aggregated-toast-line">${escapeHtml(item)}</div>`).join('');
     showToast(id, title, trustedToastHtml(`<div class="nuke-aggregated-toast-summary">本轮 ${state.count} 条操作</div>${linesHtml}`), duration);
 }
+function getNextQueueActionAt(userData, apiRateLimitState = null, now = Date.now(), blockIntervalMs = BLOCK_INTERVAL_MS) {
+    const queue = userData?.queue || [];
+    if (!queue.length) return 0;
+    const lastBlockAt = Number(userData?.lastBlockTimestamp) || 0;
+    const intervalReadyAt = lastBlockAt ? lastBlockAt + blockIntervalMs : now;
+    const apiReadyAt = Number(apiRateLimitState?.retryAt) || now;
+    const hasRunnableEntry = queue.some((entry) => !entry?.retryAfter || Number(entry.retryAfter) <= now);
+    const retryTimes = queue.map((entry) => Number(entry?.retryAfter) || 0).filter((retryAt) => retryAt > now);
+    const queueReadyAt = hasRunnableEntry || !retryTimes.length ? now : Math.min(...retryTimes);
+    return Math.max(now, intervalReadyAt, apiReadyAt, queueReadyAt);
+}
+function formatQueueCountdown(nextActionAt, now = Date.now()) {
+    const seconds = Math.max(0, Math.ceil((Number(nextActionAt) - now) / 1000));
+    if (seconds <= 0) return '即将执行';
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+    const clock = `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
+    return hours ? `${String(hours).padStart(2, '0')}:${clock}` : clock;
+}
+function clearQueueStatusCountdown() {
+    if (queueStatusCountdownInterval) clearInterval(queueStatusCountdownInterval);
+    queueStatusCountdownInterval = null;
+}
+function renderQueueStatusCountdown(nextActionAt) {
+    const countdown = document.querySelector('#nuke-status-toast [data-nuke-queue-countdown]');
+    if (!countdown) {
+        clearQueueStatusCountdown();
+        return;
+    }
+    countdown.textContent = ` · ${formatQueueCountdown(nextActionAt)}`;
+}
+function startQueueStatusCountdown(nextActionAt) {
+    clearQueueStatusCountdown();
+    renderQueueStatusCountdown(nextActionAt);
+    queueStatusCountdownInterval = setInterval(() => renderQueueStatusCountdown(nextActionAt), 1000);
+}
 async function updateStatusToast() {
     const userData = await loadUserData();
     if (!userData || userData.queue.length === 0) {
+        clearQueueStatusCountdown();
         let toast = document.getElementById('nuke-status-toast');
         if (toast) { toast.classList.add('fading-out'); setTimeout(() => toast.remove(), 500); }
         return;
     }
-    showToast('nuke-status-toast', '🚀 九族拉黑队列', trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}`));
+    const apiRateLimitState = await getActiveApiRateLimitState();
+    const nextActionAt = getNextQueueActionAt(userData, apiRateLimitState);
+    showToast('nuke-status-toast', '🚀 九族拉黑队列', trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}<span data-nuke-queue-countdown></span>`));
+    startQueueStatusCountdown(nextActionAt);
 }
 function hideElement(element) {
     if (!element) return;

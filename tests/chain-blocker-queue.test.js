@@ -1038,6 +1038,21 @@ test('unified toast panel placement follows right sidebar width and edge', () =>
     assert.equal(placement.width, 350);
 });
 
+test('queue countdown uses block pacing api limits and entry retries', () => {
+    const { getNextQueueActionAt, formatQueueCountdown } = loadHelpers([
+        'getNextQueueActionAt',
+        'formatQueueCountdown'
+    ]);
+    const now = 20_000;
+    const queue = [{ userId: 'one' }, { userId: 'two', retryAfter: 80_000 }];
+
+    assert.equal(getNextQueueActionAt({ queue, lastBlockTimestamp: 10_000 }, null, now, 60_000), 70_000);
+    assert.equal(getNextQueueActionAt({ queue, lastBlockTimestamp: 10_000 }, { retryAt: 90_000 }, now, 60_000), 90_000);
+    assert.equal(getNextQueueActionAt({ queue: [{ retryAfter: 80_000 }, { retryAfter: 95_000 }], lastBlockTimestamp: 0 }, null, now, 60_000), 80_000);
+    assert.equal(formatQueueCountdown(85_000, now), '01:05');
+    assert.equal(formatQueueCountdown(now, now), '即将执行');
+});
+
 test('panel and toast dynamic values are escaped by default', () => {
     const { escapeHtml, trustedToastHtml, getToastContent } = loadHelpers([
         'escapeHtml',
