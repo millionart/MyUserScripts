@@ -279,6 +279,19 @@ test('GraphQL user wrappers normalize ids and core screen names', () => {
     assert.equal(identity.screenName, 'corename');
 });
 
+test('TweetDetail uses the live X operation and GraphQL errors are not empty timelines', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const endpointStart = source.indexOf('API_ENDPOINTS.TweetDetail = {');
+    const endpointEnd = source.indexOf('\n};', endpointStart);
+    const endpointSource = source.slice(endpointStart, endpointEnd + 3);
+    const { getGraphqlErrorMessage } = loadHelpers(['getGraphqlErrorMessage']);
+
+    assert.match(endpointSource, /hash: 'jd3V43oDY9cY7obs1YMfbQ'/);
+    assert.match(endpointSource, /"withArticleSummaryText":true/);
+    assert.equal(getGraphqlErrorMessage({ errors: [{ message: 'PersistedQueryNotFound' }] }), 'PersistedQueryNotFound');
+    assert.equal(getGraphqlErrorMessage({ data: {} }), '');
+});
+
 test('profile bio lookup waits for its real request instead of leaking it after a local timeout', () => {
     const source = fs.readFileSync(sourcePath, 'utf8');
     const cachedLookupSource = extractFunction(source, 'getCachedProfileBioUserData');
