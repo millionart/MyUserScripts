@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.67
+// @version      2.15.68
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.67';
+const SPAM_SCANNER_BUILD = '2.15.68';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -3009,17 +3009,20 @@ function formatManualDetectedNukeTaskStatus(task, userData) {
         `已拉黑数量: ${stats.blockedCount} / ${stats.workflowCount}（待处理 ${stats.queuedCount}${terminal ? `，${terminal}` : ''}）`
     ].map((line) => `<div>${line}</div>`).join('');
 }
-function showManualDetectedNukeTaskToast(task, userData, duration = null) {
-    if (!task) return;
+function getManualDetectedNukeTaskTitle(status) {
     const titleByStatus = {
         pending: '标记用户已隐藏',
         running: '后台建立九族列表',
-        paused: '手动执行已暂停',
-        queued: '手动执行已入队',
-        complete: '手动执行完成',
-        failed: '手动执行失败'
+        paused: '后台列表等待重试',
+        queued: '后台拉黑已入队',
+        complete: '后台拉黑已完成',
+        failed: '后台任务失败'
     };
-    showToast('nuke-manual-detected-toast', titleByStatus[task.status] || '手动九族进度', trustedToastHtml(formatManualDetectedNukeTaskStatus(task, userData)), duration);
+    return titleByStatus[status] || '后台九族进度';
+}
+function showManualDetectedNukeTaskToast(task, userData, duration = null) {
+    if (!task) return;
+    showToast('nuke-manual-detected-toast', getManualDetectedNukeTaskTitle(task.status), trustedToastHtml(formatManualDetectedNukeTaskStatus(task, userData)), duration);
 }
 function showManualDetectedNukeProgressToast(userData, duration = null) {
     const summary = getManualDetectedNukeTaskSummary(userData);
@@ -4638,11 +4641,11 @@ function showApiLimitRetryToast(error = null) {
 function showManualDetectedApiStopToast(error) {
     if (isApiRateLimitError(error)) {
         showApiLimitRetryToast(error);
-        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'X API 已达上限，已保留本地隐藏和队列；稍后可重试', 5000);
+        showToast('nuke-manual-detected-toast', '后台列表等待重试', 'X API 已达上限，已保留本地隐藏和队列；稍后自动重试', 5000);
         return;
     }
     if (isApiTimeoutError(error)) {
-        showToast('nuke-manual-detected-toast', '手动执行已暂停', 'API 请求超时，已保留本地隐藏和队列；稍后可重试', 5000);
+        showToast('nuke-manual-detected-toast', '后台列表等待重试', 'API 请求超时，已保留本地隐藏和队列；稍后自动重试', 5000);
         return;
     }
     showToast('nuke-manual-detected-toast', '手动执行失败', error?.message || String(error), 5000);

@@ -512,6 +512,18 @@ test('manual detected nuke task status shows hidden expected api and blocked cou
     assert.match(html, /已拉黑数量: 1 \/ 2（待处理 1）/);
 });
 
+test('paused manual capture describes background retry without disabling manual action', () => {
+    const { getManualDetectedNukeTaskTitle, shouldDisableManualDetectedNukeButton } = loadHelpers([
+        'getManualDetectedNukeTaskTitle',
+        'shouldDisableManualDetectedNukeButton'
+    ]);
+    const source = fs.readFileSync(sourcePath, 'utf8');
+
+    assert.equal(getManualDetectedNukeTaskTitle('paused'), '后台列表等待重试');
+    assert.equal(shouldDisableManualDetectedNukeButton(false, 2), false);
+    assert.doesNotMatch(source, /手动执行已暂停/);
+});
+
 test('manual detected task stats stay linked after the global block log is trimmed', () => {
     const { getManualDetectedNukeTaskStats } = loadHelpers([
         'normalizeNukeTaskIds',
