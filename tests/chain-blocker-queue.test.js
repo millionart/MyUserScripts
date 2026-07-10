@@ -481,6 +481,21 @@ test('manual detected button is disabled only during capture or when no targets 
     assert.equal(shouldDisableManualDetectedNukeButton(false, 2), false);
 });
 
+test('panel toggle follows the manual button and exposes collapse state', () => {
+    const { getUnifiedToastPanelToggleLabel } = loadHelpers([
+        'getUnifiedToastPanelToggleLabel'
+    ]);
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const toggleSource = extractFunction(source, 'ensureUnifiedToastPanelToggleButton');
+
+    assert.equal(getUnifiedToastPanelToggleLabel(false), '收起队列面板');
+    assert.equal(getUnifiedToastPanelToggleLabel(true), '展开队列面板');
+    assert.match(source, /#nuke-toast-panel-toggle-button\{bottom:213px\}/);
+    assert.match(source, /#nuke-toast-panel\.nuke-toast-panel-collapsed\{display:none!important\}/);
+    assert.match(toggleSource, /nuke-manual-detected-nuke-button/);
+    assert.match(toggleSource, /aria-controls/);
+});
+
 test('manual detected nuke task status shows hidden expected api and blocked counts', () => {
     const { formatManualDetectedNukeTaskStatus } = loadHelpers([
         'normalizeNukeTaskIds',
