@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.65
+// @version      2.15.66
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.65';
+const SPAM_SCANNER_BUILD = '2.15.66';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1503,7 +1503,7 @@ async function showConfigPanel() {
     } finally { setTimeout(() => { isConfigPanelBusy = false; }, 200); }
 }
 function escapeHtml(text) {
-    return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 const SPAM_ZERO_WIDTH_RE = /[\u200b-\u200d\u2060\ufeff\u00ad]/g;
 const SPAM_CJK_PUNCT_RE = /[·•・|，,。.!！?？:：;；\-—_~～*＊/\\[\]【】()（）「」『』《》〈〉"'‘’“”\s]/g;
@@ -3010,7 +3010,7 @@ function showManualDetectedNukeTaskToast(task, userData, duration = null) {
         complete: '手动执行完成',
         failed: '手动执行失败'
     };
-    showToast('nuke-manual-detected-toast', titleByStatus[task.status] || '手动九族进度', formatManualDetectedNukeTaskStatus(task, userData), duration);
+    showToast('nuke-manual-detected-toast', titleByStatus[task.status] || '手动九族进度', trustedToastHtml(formatManualDetectedNukeTaskStatus(task, userData)), duration);
 }
 function showManualDetectedNukeProgressToast(userData, duration = null) {
     const summary = getManualDetectedNukeTaskSummary(userData);
@@ -4327,11 +4327,13 @@ async function renderListsInPanel() {
         filteredList.slice().reverse().forEach(entry => {
             const el = document.createElement('div');
             el.className = 'nuke-list-entry';
-            const userName = entry.userNameText || entry.screenName || String(entry.userId);
-            const screenNameHandle = entry.screenName ? `@${entry.screenName}` : '';
-            const userLinkHTML = entry.screenName ? `<a href="https://x.com/${entry.screenName}" target="_blank" rel="noopener noreferrer" title="在新标签页中打开"><span class="nuke-list-user-name">${userName}</span></a>` : `<span class="nuke-list-user-name">${userName}</span>`;
+            const rawScreenName = String(entry.screenName || '');
+            const userName = escapeHtml(entry.userNameText || rawScreenName || String(entry.userId));
+            const screenNameHandle = escapeHtml(rawScreenName ? `@${rawScreenName}` : '');
+            const profileUrl = rawScreenName ? `https://x.com/${encodeURIComponent(rawScreenName)}` : '';
+            const userLinkHTML = profileUrl ? `<a href="${profileUrl}" target="_blank" rel="noopener noreferrer" title="在新标签页中打开"><span class="nuke-list-user-name">${userName}</span></a>` : `<span class="nuke-list-user-name">${userName}</span>`;
             if (type === 'log') {
-                const timestamp = entry.blockTimestamp ? new Date(entry.blockTimestamp).toLocaleString() : '未知时间';
+                const timestamp = escapeHtml(entry.blockTimestamp ? new Date(entry.blockTimestamp).toLocaleString() : '未知时间');
                 const blockReasonHTML = entry.blockNote ? `<span class="nuke-list-block-reason">${escapeHtml(entry.blockNote)}</span>` : '';
                 el.innerHTML = `<div class="nuke-list-user-info">${userLinkHTML}<span class="nuke-list-user-handle" title="移至白名单并取消拉黑">${screenNameHandle}</span>${blockReasonHTML}</div><span class="nuke-list-actions" title="从记录中移除">${timestamp}</span>`;
                 if (entry.screenName) {
@@ -4346,7 +4348,7 @@ async function renderListsInPanel() {
                 }
                 el.querySelector('.nuke-list-actions')?.addEventListener('click', () => moveUser(entry, 'removeFromLog'));
             } else if (type === 'promo') {
-                const timestamp = entry.addedAt ? new Date(entry.addedAt).toLocaleString() : '未知时间';
+                const timestamp = escapeHtml(entry.addedAt ? new Date(entry.addedAt).toLocaleString() : '未知时间');
                 const noteHTML = entry.sourceNote ? `<span class="nuke-list-block-reason">${escapeHtml(entry.sourceNote)}</span>` : '';
                 el.innerHTML = `<div class="nuke-list-user-info">${userLinkHTML}<span class="nuke-list-user-handle">${screenNameHandle}</span>${noteHTML}</div><span class="nuke-list-actions" title="从引流目标列表移除">移除</span>`;
                 el.querySelector('.nuke-list-actions')?.addEventListener('click', async () => {
@@ -5109,6 +5111,15 @@ function dismissToast(id) {
     toast.remove();
     layoutToasts();
 }
+function trustedToastHtml(html) {
+    return { __nukeTrustedToastHtml: String(html ?? '') };
+}
+function getToastContent(content) {
+    if (content && typeof content === 'object' && typeof content.__nukeTrustedToastHtml === 'string') {
+        return { html: content.__nukeTrustedToastHtml, text: '' };
+    }
+    return { html: null, text: String(content ?? '') };
+}
 function showToast(id, title, status, duration = null) {
     const list = getUnifiedToastList();
     let toast = Array.from(list.children).find((item) => item.id === id);
@@ -5121,7 +5132,15 @@ function showToast(id, title, status, duration = null) {
     if (toast._nukeToastTimer) clearTimeout(toast._nukeToastTimer);
     if (toast._nukeToastRemoveTimer) clearTimeout(toast._nukeToastRemoveTimer);
     toast.classList.remove('fading-out');
-    toast.innerHTML = `<div class="nuke-toast-title">${title}</div><div class="nuke-toast-status">${status}</div>`;
+    const titleEl = document.createElement('div');
+    titleEl.className = 'nuke-toast-title';
+    titleEl.textContent = String(title ?? '');
+    const statusEl = document.createElement('div');
+    statusEl.className = 'nuke-toast-status';
+    const toastContent = getToastContent(status);
+    if (toastContent.html === null) statusEl.textContent = toastContent.text;
+    else statusEl.innerHTML = toastContent.html;
+    toast.replaceChildren(titleEl, statusEl);
     list.prepend(toast);
     layoutToasts();
     if (duration) {
@@ -5135,9 +5154,7 @@ function showToast(id, title, status, duration = null) {
     }
 }
 function stripToastHtml(status) {
-    const div = document.createElement('div');
-    div.innerHTML = String(status || '');
-    return div.textContent?.replace(/\s+/g, ' ').trim() || '';
+    return String(status ?? '').replace(/\s+/g, ' ').trim();
 }
 function showAggregatedToast(id, title, status, duration = 4000) {
     const now = Date.now();
@@ -5152,7 +5169,7 @@ function showAggregatedToast(id, title, status, duration = 4000) {
     if (line) state.lines = [line, ...state.lines.filter((item) => item !== line)].slice(0, 5);
     aggregatedToastState.set(id, state);
     const linesHtml = state.lines.map((item) => `<div class="nuke-aggregated-toast-line">${escapeHtml(item)}</div>`).join('');
-    showToast(id, title, `<div class="nuke-aggregated-toast-summary">本轮 ${state.count} 条操作</div>${linesHtml}`, duration);
+    showToast(id, title, trustedToastHtml(`<div class="nuke-aggregated-toast-summary">本轮 ${state.count} 条操作</div>${linesHtml}`), duration);
 }
 async function updateStatusToast() {
     const userData = await loadUserData();
@@ -5161,7 +5178,7 @@ async function updateStatusToast() {
         if (toast) { toast.classList.add('fading-out'); setTimeout(() => toast.remove(), 500); }
         return;
     }
-    showToast('nuke-status-toast', `🚀 九族拉黑队列(@${currentUserScreenName||'...'})`, `<b>待处理:</b> ${userData.queue.length}<br><b>已拉黑:</b> ${userData.blockedLog.length || 0}`);
+    showToast('nuke-status-toast', `🚀 九族拉黑队列(@${currentUserScreenName||'...'})`, trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}<br><b>已拉黑:</b> ${userData.blockedLog.length || 0}`));
 }
 function hideElement(element) {
     if (!element) return;

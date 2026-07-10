@@ -985,6 +985,31 @@ test('unified toast panel placement follows right sidebar width and edge', () =>
     assert.equal(placement.width, 350);
 });
 
+test('panel and toast dynamic values are escaped by default', () => {
+    const { escapeHtml, trustedToastHtml, getToastContent } = loadHelpers([
+        'escapeHtml',
+        'trustedToastHtml',
+        'getToastContent'
+    ]);
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const listRendererSource = extractFunction(source, 'renderListsInPanel');
+    const showToastSource = extractFunction(source, 'showToast');
+    const malicious = `<img src=x onerror='alert(1)'>"&`;
+
+    assert.equal(escapeHtml(malicious), '&lt;img src=x onerror=&#39;alert(1)&#39;&gt;&quot;&amp;');
+    const plain = getToastContent(malicious);
+    assert.equal(plain.html, null);
+    assert.equal(plain.text, malicious);
+    const trusted = getToastContent(trustedToastHtml('<b>2</b>'));
+    assert.equal(trusted.html, '<b>2</b>');
+    assert.equal(trusted.text, '');
+    assert.match(listRendererSource, /const userName = escapeHtml\(/);
+    assert.match(listRendererSource, /encodeURIComponent\(rawScreenName\)/);
+    assert.match(showToastSource, /titleEl\.textContent/);
+    assert.match(showToastSource, /statusEl\.textContent/);
+    assert.doesNotMatch(showToastSource, /toast\.innerHTML/);
+});
+
 test('tweet detail user extraction unwraps visibility result tweets', () => {
     const { getUserResultFromTweetResults } = loadHelpers([
         'normalizeTimelineUserResult',
