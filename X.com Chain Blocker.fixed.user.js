@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.61
+// @version      2.15.62
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.61';
+const SPAM_SCANNER_BUILD = '2.15.62';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2822,9 +2822,26 @@ function recordManualDetectedNukeQueueOutcome(userData, entry, outcome) {
     for (const task of userData?.manualDetectedNukeTasks || []) {
         if (!taskIds.has(String(task?.taskId || ''))) continue;
         task.queuedUserIds = mergeNukeTaskIds(task.queuedUserIds, userId);
+        const removeOutcome = (field) => {
+            task[field] = normalizeNukeTaskIds(task[field]).filter((id) => id !== userId);
+        };
+        if (outcome === 'queued') {
+            removeOutcome('failedUserIds');
+            removeOutcome('skippedUserIds');
+        }
         if (outcome === 'blocked') task.blockedUserIds = mergeNukeTaskIds(task.blockedUserIds, userId);
-        if (outcome === 'failed') task.failedUserIds = mergeNukeTaskIds(task.failedUserIds, userId);
-        if (outcome === 'skipped') task.skippedUserIds = mergeNukeTaskIds(task.skippedUserIds, userId);
+        if (outcome === 'blocked') {
+            removeOutcome('failedUserIds');
+            removeOutcome('skippedUserIds');
+        }
+        if (outcome === 'failed') {
+            removeOutcome('skippedUserIds');
+            task.failedUserIds = mergeNukeTaskIds(task.failedUserIds, userId);
+        }
+        if (outcome === 'skipped') {
+            removeOutcome('failedUserIds');
+            task.skippedUserIds = mergeNukeTaskIds(task.skippedUserIds, userId);
+        }
         task.updatedAt = Date.now();
         updated += 1;
     }
@@ -2896,9 +2913,15 @@ function getManualDetectedNukeTaskStats(task, userData) {
     const queuedIds = getEntryUserIds(userData.queue);
     const blockedIds = new Set(mergeNukeTaskIds(task?.blockedUserIds));
     getEntryUserIds(userData.blockedLog).forEach((userId) => blockedIds.add(userId));
-    const failedIds = new Set(mergeNukeTaskIds(task?.failedUserIds));
     const skippedIds = new Set(mergeNukeTaskIds(task?.skippedUserIds));
+    const failedIds = new Set(mergeNukeTaskIds(task?.failedUserIds));
     const workflowIds = new Set(mergeNukeTaskIds(task?.queuedUserIds, Array.from(queuedIds), Array.from(blockedIds), Array.from(failedIds), Array.from(skippedIds)));
+    blockedIds.forEach((userId) => queuedIds.delete(userId));
+    blockedIds.forEach((userId) => skippedIds.delete(userId));
+    queuedIds.forEach((userId) => skippedIds.delete(userId));
+    blockedIds.forEach((userId) => failedIds.delete(userId));
+    queuedIds.forEach((userId) => failedIds.delete(userId));
+    skippedIds.forEach((userId) => failedIds.delete(userId));
     const hiddenTargets = Number(task?.hiddenTargets);
     const expectedBlockCount = Number(task?.expectedBlockCount);
     const apiCollectedCount = Number(task?.apiCollectedCount);

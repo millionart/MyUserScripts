@@ -480,6 +480,35 @@ test('manual detected task stats stay linked after the global block log is trimm
     assert.equal(stats.failedCount, 1);
 });
 
+test('manual detected task terminal counts exclude users that were requeued', () => {
+    const { getManualDetectedNukeTaskStats } = loadHelpers([
+        'normalizeNukeTaskIds',
+        'getEntryNukeTaskIds',
+        'getManualDetectedNukeTaskTweetIds',
+        'getManualDetectedNukeTaskStats'
+    ]);
+    const workflowIds = Array.from({ length: 8 }, (_, index) => `user-${index + 1}`);
+    const task = {
+        taskId: 'task-a',
+        hiddenTargets: 0,
+        expectedBlockCount: 0,
+        apiCollectedCount: 0,
+        queuedUserIds: workflowIds,
+        failedUserIds: workflowIds
+    };
+    const userData = {
+        queue: workflowIds.slice(0, 6).map((userId) => ({ userId, nukeTaskIds: ['task-a'] })),
+        blockedLog: []
+    };
+
+    const stats = getManualDetectedNukeTaskStats(task, userData);
+
+    assert.equal(stats.workflowCount, 8);
+    assert.equal(stats.queuedCount, 6);
+    assert.equal(stats.failedCount, 2);
+    assert.equal(stats.blockedCount + stats.queuedCount + stats.failedCount + stats.skippedCount, stats.workflowCount);
+});
+
 test('queue outcomes update every linked manual detected task', () => {
     const { recordManualDetectedNukeQueueOutcome } = loadHelpers([
         'normalizeNukeTaskIds',
@@ -488,7 +517,7 @@ test('queue outcomes update every linked manual detected task', () => {
     ]);
     const userData = {
         manualDetectedNukeTasks: [
-            { taskId: 'task-a' },
+            { taskId: 'task-a', failedUserIds: ['user-1'] },
             { taskId: 'task-b', queuedUserIds: ['existing'] },
             { taskId: 'task-c' }
         ]
@@ -499,6 +528,7 @@ test('queue outcomes update every linked manual detected task', () => {
     assert.equal(recordManualDetectedNukeQueueOutcome(userData, entry, 'blocked'), 2);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].queuedUserIds), ['user-1']);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].blockedUserIds), ['user-1']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].failedUserIds), []);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].queuedUserIds), ['existing', 'user-1']);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].blockedUserIds), ['user-1']);
     assert.equal(userData.manualDetectedNukeTasks[2].queuedUserIds, undefined);
