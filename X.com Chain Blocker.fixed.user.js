@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.68
+// @version      2.15.69
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.68';
+const SPAM_SCANNER_BUILD = '2.15.69';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -3001,13 +3001,13 @@ function formatManualDetectedNukeTaskStatus(task, userData) {
         stats.failedCount ? `失败 ${stats.failedCount}` : '',
         stats.skippedCount ? `跳过 ${stats.skippedCount}` : ''
     ].filter(Boolean).join('，');
-    return [
-        `已隐藏 ${stats.hiddenTargets} 个目标`,
-        `网页预期关联数（回复数+转推数）: ${stats.expectedBlockCount}`,
-        `API 已发现关联数: ${stats.apiCollectedCount}`,
-        `已进入拉黑流程: ${stats.workflowCount}`,
-        `已拉黑数量: ${stats.blockedCount} / ${stats.workflowCount}（待处理 ${stats.queuedCount}${terminal ? `，${terminal}` : ''}）`
-    ].map((line) => `<div>${line}</div>`).join('');
+    const lines = [
+        `已隐藏: ${stats.hiddenTargets}`,
+        `关联用户: 网页预计 ${stats.expectedBlockCount} / API 发现 ${stats.apiCollectedCount}`,
+        `拉黑进度: ${stats.blockedCount} / ${stats.workflowCount}`
+    ];
+    if (terminal) lines.push(`异常结果: ${terminal}`);
+    return lines.map((line) => `<div>${line}</div>`).join('');
 }
 function getManualDetectedNukeTaskTitle(status) {
     const titleByStatus = {
@@ -5190,7 +5190,7 @@ async function updateStatusToast() {
         if (toast) { toast.classList.add('fading-out'); setTimeout(() => toast.remove(), 500); }
         return;
     }
-    showToast('nuke-status-toast', `🚀 九族拉黑队列(@${currentUserScreenName||'...'})`, trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}<br><b>已拉黑:</b> ${userData.blockedLog.length || 0}`));
+    showToast('nuke-status-toast', '🚀 九族拉黑队列', trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}`));
 }
 function hideElement(element) {
     if (!element) return;

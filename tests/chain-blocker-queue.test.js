@@ -505,11 +505,10 @@ test('manual detected nuke task status shows hidden expected api and blocked cou
 
     const html = formatManualDetectedNukeTaskStatus(task, userData);
 
-    assert.match(html, /已隐藏 2 个目标/);
-    assert.match(html, /网页预期关联数（回复数\+转推数）: 7/);
-    assert.match(html, /API 已发现关联数: 5/);
-    assert.match(html, /已进入拉黑流程: 2/);
-    assert.match(html, /已拉黑数量: 1 \/ 2（待处理 1）/);
+    assert.match(html, /已隐藏: 2/);
+    assert.match(html, /关联用户: 网页预计 7 \/ API 发现 5/);
+    assert.match(html, /拉黑进度: 1 \/ 2/);
+    assert.doesNotMatch(html, /待处理/);
 });
 
 test('paused manual capture describes background retry without disabling manual action', () => {
@@ -709,10 +708,10 @@ test('manual detected nuke status aggregates multiple active tasks', () => {
     assert.equal(summary.hiddenTargets, 12);
     assert.equal(summary.expectedBlockCount, 196);
     assert.equal(summary.apiCollectedCount, 2);
-    assert.match(html, /已隐藏 12 个目标/);
-    assert.match(html, /网页预期关联数（回复数\+转推数）: 196/);
-    assert.match(html, /API 已发现关联数: 2/);
-    assert.match(html, /已拉黑数量: 1 \/ 2（待处理 1）/);
+    assert.match(html, /已隐藏: 12/);
+    assert.match(html, /关联用户: 网页预计 196 \/ API 发现 2/);
+    assert.match(html, /拉黑进度: 1 \/ 2/);
+    assert.doesNotMatch(html, /待处理/);
 });
 
 test('manual detected nuke runner selects pending task instead of latest queued task', () => {
