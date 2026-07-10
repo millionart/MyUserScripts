@@ -561,13 +561,13 @@ test('queue root protection does not skip detected source authors', () => {
     }), false);
 });
 
-test('debug config trigger does not disable the block queue processor', () => {
-    const { shouldStartQueueProcessor } = loadHelpers([
-        'shouldStartQueueProcessor'
+test('api operation spacing uses the newest local or shared start time', () => {
+    const { getApiOperationWaitMs } = loadHelpers([
+        'getApiOperationWaitMs'
     ]);
 
-    assert.equal(shouldStartQueueProcessor(true), true);
-    assert.equal(shouldStartQueueProcessor(false), true);
+    assert.equal(getApiOperationWaitMs(10_000, 12_000, 13_000, 5_000), 4_000);
+    assert.equal(getApiOperationWaitMs(14_000, 12_000, 20_000, 5_000), 0);
 });
 
 test('unified toast entries update by id inside one panel list', () => {

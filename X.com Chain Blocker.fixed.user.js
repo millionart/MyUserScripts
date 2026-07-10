@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.50
+// @version      2.15.51
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -48,6 +48,9 @@ const NUKE_ICON_PATH = "M19.5,12c0,2.9-1.6,5.5-4,6.8V21h-7v-2.2c-2.4-1.3-4-3.9-4
 const STORAGE_KEY = 'CHAIN_BLOCKER_DATA';
 const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const API_RATE_LIMIT_STATE_KEY = 'CHAIN_BLOCKER_API_RATE_LIMIT_STATE';
+const API_LAST_OPERATION_STARTED_KEY = 'CHAIN_BLOCKER_API_LAST_OPERATION_STARTED';
+const API_CROSS_TAB_LOCK_NAME = 'chain-blocker-api-operation';
+const BACKGROUND_WORKER_LOCK_PREFIX = 'chain-blocker-background-worker';
 const BLOCK_INTERVAL_MS = 60 * 1000;
 const API_OPERATION_INTERVAL_MS = 5 * 1000;
 const API_REQUEST_TIMEOUT_MS = 12000;
@@ -87,7 +90,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.50';
+const SPAM_SCANNER_BUILD = '2.15.51';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1006,6 +1009,7 @@ let currentUserId = null, currentUserScreenName = null, activeTweetArticle = nul
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
 let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, manualDetectedNukeResumeTimeoutId = null;
+let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false, unifiedToastPanelPlacementBound = false;
 let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
 const aggregatedToastState = new Map();
@@ -1066,9 +1070,6 @@ function shouldShowDebugConfigTrigger() {
     const href = String(window.location.href || '');
     const hash = String(window.location.hash || '');
     return /(?:[?&#])cb_spam_debug=1(?:[&#]|$)/.test(href) || /(?:^|[#&])cb-spam-debug(?:=1)?(?:[&#]|$)/.test(hash);
-}
-function shouldStartQueueProcessor(debugConfigTriggerEnabled) {
-    return true;
 }
 function onInternalConfigShortcut(event) {
     if (!shouldShowDebugConfigTrigger()) return;
@@ -2850,7 +2851,7 @@ async function updateManualDetectedNukeTaskToast(userData = null) {
     showManualDetectedNukeProgressToast(data);
 }
 function scheduleManualDetectedNukeResume(delay = 1500) {
-    if (manualDetectedNukeResumeTimeoutId) return;
+    if (!backgroundWorkerLeader || manualDetectedNukeResumeTimeoutId) return;
     manualDetectedNukeResumeTimeoutId = window.setTimeout(() => {
         manualDetectedNukeResumeTimeoutId = null;
         void resumeManualDetectedNukeTasks();
@@ -2941,7 +2942,7 @@ function getManualDetectedPostCollectStatus(stoppedByApiFailure, chainCollection
     return stoppedByApiFailure || chainCollectionIncomplete ? 'paused' : 'queued';
 }
 async function processManualDetectedNukeBackground(taskId) {
-    if (manualDetectedNukeTaskRunning) return;
+    if (!backgroundWorkerLeader || manualDetectedNukeTaskRunning) return;
     manualDetectedNukeTaskRunning = true;
     try {
         const userData = await loadUserData();
@@ -3078,6 +3079,7 @@ async function processManualDetectedNukeBackground(taskId) {
     }
 }
 async function resumeManualDetectedNukeTasks() {
+    if (!backgroundWorkerLeader) return;
     const userData = await loadUserData();
     if (!userData) return;
     const completedTask = completeFinishedManualDetectedNukeTasks(userData);
@@ -4041,14 +4043,28 @@ async function throwIfApiRateLimited() {
 function waitForMs(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
+function getApiOperationWaitMs(localStartedAt, sharedStartedAt, now = Date.now(), intervalMs = API_OPERATION_INTERVAL_MS) {
+    const lastStartedAt = Math.max(Number(localStartedAt) || 0, Number(sharedStartedAt) || 0);
+    return Math.max(0, lastStartedAt + intervalMs - now);
+}
+function withCrossTabLock(name, operation) {
+    if (navigator.locks?.request) {
+        return navigator.locks.request(name, { mode: 'exclusive' }, operation);
+    }
+    return operation();
+}
 function enqueueApiOperation(operation) {
     const run = async () => {
-        await throwIfApiRateLimited();
-        const waitMs = Math.max(0, apiLastOperationStartedAt + API_OPERATION_INTERVAL_MS - Date.now());
-        if (waitMs > 0) await waitForMs(waitMs);
-        await throwIfApiRateLimited();
-        apiLastOperationStartedAt = Date.now();
-        return operation();
+        return withCrossTabLock(API_CROSS_TAB_LOCK_NAME, async () => {
+            await throwIfApiRateLimited();
+            const sharedStartedAt = await GM_getValue(API_LAST_OPERATION_STARTED_KEY, 0);
+            const waitMs = getApiOperationWaitMs(apiLastOperationStartedAt, sharedStartedAt);
+            if (waitMs > 0) await waitForMs(waitMs);
+            await throwIfApiRateLimited();
+            apiLastOperationStartedAt = Date.now();
+            await GM_setValue(API_LAST_OPERATION_STARTED_KEY, apiLastOperationStartedAt);
+            return operation();
+        });
     };
     const scheduled = apiOperationTail.then(run, run);
     apiOperationTail = scheduled.catch(() => {});
@@ -4780,9 +4796,79 @@ function isQueueEntryProtectedRootAuthor(entry) {
     return !!(sourceRootAuthorHandle && entryHandle === sourceRootAuthorHandle);
 }
 
+function setBackgroundWorkerProbe(state) {
+    try {
+        document.documentElement.dataset.cbBackgroundWorker = state;
+    } catch {
+        /* probe only */
+    }
+}
+function stopBackgroundWorkerRunners() {
+    if (processIntervalId) clearInterval(processIntervalId);
+    if (manualDetectedNukeResumeTimeoutId) clearTimeout(manualDetectedNukeResumeTimeoutId);
+    processIntervalId = null;
+    manualDetectedNukeResumeTimeoutId = null;
+}
+async function runBackgroundWorkerTick() {
+    if (!backgroundWorkerLeader || backgroundWorkerTickRunning) return;
+    backgroundWorkerTickRunning = true;
+    try {
+        await resumeManualDetectedNukeTasks();
+        await processQueue();
+    } finally {
+        backgroundWorkerTickRunning = false;
+    }
+}
+function startBackgroundWorkerRunners() {
+    stopBackgroundWorkerRunners();
+    processIntervalId = setInterval(() => { void runBackgroundWorkerTick(); }, PROCESS_CHECK_INTERVAL_MS);
+    window.setTimeout(() => { void runBackgroundWorkerTick(); }, 1000);
+}
+function scheduleBackgroundWorkerLeadershipRetry(delay = PROCESS_CHECK_INTERVAL_MS) {
+    if (backgroundWorkerRetryTimeoutId || backgroundWorkerLeader) return;
+    backgroundWorkerRetryTimeoutId = window.setTimeout(() => {
+        backgroundWorkerRetryTimeoutId = null;
+        void requestBackgroundWorkerLeadership();
+    }, delay);
+}
+async function requestBackgroundWorkerLeadership() {
+    if (!currentUserId || backgroundWorkerLeader || backgroundWorkerLeadershipPending) return;
+    if (!navigator.locks?.request) {
+        backgroundWorkerLeader = true;
+        setBackgroundWorkerProbe('leader-fallback');
+        startBackgroundWorkerRunners();
+        return;
+    }
+    backgroundWorkerLeadershipPending = true;
+    setBackgroundWorkerProbe('standby');
+    try {
+        await navigator.locks.request(`${BACKGROUND_WORKER_LOCK_PREFIX}:${currentUserId}`, { mode: 'exclusive', ifAvailable: true }, async (lock) => {
+            if (!lock) return;
+            backgroundWorkerLeader = true;
+            setBackgroundWorkerProbe('leader');
+            startBackgroundWorkerRunners();
+            await new Promise((resolve) => { backgroundWorkerRelease = resolve; });
+            backgroundWorkerRelease = null;
+            stopBackgroundWorkerRunners();
+            backgroundWorkerLeader = false;
+            setBackgroundWorkerProbe('standby');
+        });
+    } catch (error) {
+        console.warn('[CB] 后台执行者选举失败，稍后重试', error);
+    } finally {
+        backgroundWorkerLeadershipPending = false;
+        if (!backgroundWorkerLeader) scheduleBackgroundWorkerLeadershipRetry();
+    }
+}
+function releaseBackgroundWorkerLeadership() {
+    if (backgroundWorkerRetryTimeoutId) clearTimeout(backgroundWorkerRetryTimeoutId);
+    backgroundWorkerRetryTimeoutId = null;
+    backgroundWorkerRelease?.();
+}
+
 // --- CORE LOGIC ---
 async function processQueue() {
-    if (isProcessingQueue || manualDetectedNukeRunning || !currentUserId) return;
+    if (!backgroundWorkerLeader || isProcessingQueue || manualDetectedNukeRunning || !currentUserId) return;
     if (await getActiveApiRateLimitState()) return;
     const userData = await loadUserData();
     if (!userData || userData.queue.length === 0 || (Date.now() - userData.lastBlockTimestamp < BLOCK_INTERVAL_MS)) return;
@@ -5410,7 +5496,6 @@ async function initialize() {
         currentUserScreenName = user.legacy.screen_name;
         console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
         await updateStatusToast();
-        scheduleManualDetectedNukeResume(5000);
         ensureManualDetectedNukeButton();
         const debugConfigTriggerEnabled = shouldShowDebugConfigTrigger();
         if (debugConfigTriggerEnabled) {
@@ -5418,11 +5503,7 @@ async function initialize() {
         } else {
             delete document.documentElement.dataset.cbSpamDebugMode;
         }
-        if (shouldStartQueueProcessor(debugConfigTriggerEnabled)) {
-            if (processIntervalId) clearInterval(processIntervalId);
-            processIntervalId = setInterval(processQueue, PROCESS_CHECK_INTERVAL_MS);
-            setTimeout(processQueue, 1000);
-        }
+        void requestBackgroundWorkerLeadership();
     } catch (error) {
         if (isApiRateLimitError(error)) {
             console.warn(`[CB] API rate limit hit. Retrying in ${API_RETRY_DELAY_MS / 60000} minutes.`);
@@ -5470,6 +5551,7 @@ document.addEventListener('click', e => {
     if (expandControl && isSpamSectionExpandControl(expandControl)) scheduleSpamRescan();
 }, true);
 observer.observe(document.body, { childList: true, subtree: true });
+window.addEventListener('pagehide', releaseBackgroundWorkerLeadership, { once: true });
 setInterval(() => {
     if (!shouldRunArticleDetectionScans()) {
         ensureManualDetectedNukeButton();
