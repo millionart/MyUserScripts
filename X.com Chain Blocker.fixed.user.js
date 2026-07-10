@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.57
+// @version      2.15.58
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -63,6 +63,7 @@ const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 1000;
 const BLOCK_CONTEXT_TEXT_MAX = 120;
 const DEFAULT_SPAM_IDENTIFY_MIN_SCORE = 3;
 const AVATAR_OCR_CACHE_MS = 30 * 60 * 1000;
+const AVATAR_OCR_CACHE_LIMIT = 400;
 const AVATAR_OCR_MAX_FAILS = 4;
 const AVATAR_OCR_STALE_PENDING_MS = 5 * 60 * 1000;
 const AVATAR_IMAGE_FETCH_TIMEOUT_MS = 20000;
@@ -70,6 +71,8 @@ const AVATAR_OCR_JOB_TIMEOUT_MS = 45000;
 const PADDLE_OCR_VARIANT_TIMEOUT_MS = 6000;
 const AVATAR_OCR_PUMP_STALL_GRACE_MS = 10000;
 const AVATAR_OCR_VISIBLE_REQUEUE_MS = 8000;
+const AVATAR_OCR_VIEWPORT_MARGIN = 500;
+const AVATAR_OCR_USER_IDLE_MS = 800;
 const PROFILE_BIO_SCAN_TIMEOUT_MS = 6500;
 const PROFILE_BIO_STALE_PENDING_MS = 30000;
 const PENDING_HIDDEN_USERS_LIMIT = 2000;
@@ -78,7 +81,10 @@ const NUKE_CAPTURE_LOG_LIMIT = 300;
 const MANUAL_DETECTED_NUKE_TASK_LIMIT = 20;
 const MANUAL_DETECTED_NUKE_STALE_RUNNING_MS = 2 * 60 * 1000;
 const avatarOcrCache = new Map();
+const avatarOcrPendingByKey = new Map();
 const avatarOcrQueue = [];
+const deferredAvatarOcrArticles = new Set();
+const deferredAvatarOcrUrls = new WeakMap();
 const profileBioCache = new Map();
 const profileBioFetchPending = new Map();
 const profileBioQueue = [];
@@ -86,6 +92,9 @@ let avatarOcrPumpRunning = false;
 let avatarOcrPumpRunId = 0;
 let avatarOcrActiveStartedAt = 0;
 let avatarOcrActiveArticle = null;
+let avatarOcrVisibilityObserver = null;
+let avatarOcrResumeTimeoutId = null;
+let avatarOcrLastUserActivityAt = 0;
 let profileBioPumpRunning = false;
 let profileBioActiveArticle = null;
 let avatarOcrTesseractFailed = false;
@@ -94,7 +103,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.57';
+const SPAM_SCANNER_BUILD = '2.15.58';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -375,7 +384,13 @@ async function ensureTesseractWorkerOptions(onProgress) {
     return opts;
 }
 function resetAvatarOcrWorker() {
+    const workerPromise = avatarOcrWorkerPromise;
     avatarOcrWorkerPromise = null;
+    if (workerPromise) {
+        void Promise.resolve(workerPromise)
+            .then((worker) => worker?.terminate?.())
+            .catch(() => { /* ignore */ });
+    }
     resetTesseractCoreBlobs();
 }
 function resetPaddleUserscriptState() {
@@ -400,6 +415,15 @@ function resetPaddleUserscriptState() {
     }
 }
 function resetAvatarOcrRuntime() {
+    avatarOcrPumpRunId += 1;
+    avatarOcrPumpRunning = false;
+    avatarOcrActiveStartedAt = 0;
+    avatarOcrActiveArticle = null;
+    avatarOcrQueue.splice(0, avatarOcrQueue.length);
+    avatarOcrPendingByKey.clear();
+    if (avatarOcrResumeTimeoutId) window.clearTimeout(avatarOcrResumeTimeoutId);
+    avatarOcrResumeTimeoutId = null;
+    clearDeferredAvatarOcrArticles();
     avatarOcrTesseractFailed = false;
     avatarOcrPaddleFailed = false;
     avatarOcrTesseractReady = false;
@@ -407,6 +431,18 @@ function resetAvatarOcrRuntime() {
     avatarOcrEngineUiToken += 1;
     resetAvatarOcrWorker();
     resetPaddleUserscriptState();
+}
+function resetAvatarOcrArticleMarkers() {
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+        clearDeferredAvatarOcrArticle(article);
+        removeAvatarOcrJobsForArticle(article);
+        delete article.dataset.spamScanned;
+        delete article.dataset.avatarOcrQueued;
+        delete article.dataset.avatarOcrPending;
+        delete article.dataset.avatarOcrQueuedAt;
+        delete article.dataset.avatarOcrFailCount;
+        delete article.dataset.avatarOcrDeferred;
+    });
 }
 function prepareAvatarOcrEngineUiLoad(engine) {
     avatarOcrEngineUiToken += 1;
@@ -1002,10 +1038,6 @@ function shouldSkipSpamIdentifyForArticle(article, detection = null) {
     if (!isStatusRootTweetArticle(article)) return false;
     return !isRootTweetAllowedSpamDetection(detection);
 }
-function extractTwitterProfileImageId(url) {
-    const match = String(url || '').match(/profile_images\/(\d+)\//);
-    return match ? match[1] : '';
-}
 const FOLLOWER_COUNT_CACHE_MS = 10 * 60 * 1000;
 const DETECTION_SAFETY_INTERVAL_MS = 15000;
 const DETECTION_SCAN_DELAY_MS = 160;
@@ -1390,17 +1422,21 @@ async function showConfigPanel() {
             config.spamIdentifyEnabled = panel.querySelector('#nuke-spam-identify-toggle').checked;
             const nextEngine = normalizeAvatarOcrEngine(panel.querySelector('#nuke-spam-avatar-ocr-engine').value);
             const engineChanged = normalizeAvatarOcrEngine(config.spamAvatarOcrEngine) !== nextEngine;
-            if (engineChanged) {
+            const nextAvatarKeywords = panel.querySelector('#nuke-spam-avatar-keywords-textarea').value.split('\n').map((kw) => kw.trim()).filter(Boolean);
+            const avatarKeywordsChanged = JSON.stringify(config.spamAvatarKeywords || []) !== JSON.stringify(nextAvatarKeywords);
+            if (engineChanged || avatarKeywordsChanged) {
                 avatarOcrCache.clear();
                 resetAvatarOcrRuntime();
+                resetAvatarOcrArticleMarkers();
             }
             config.spamAvatarOcrEngine = nextEngine;
             delete config.spamAvatarOcrEnabled;
             delete config.longNameFollowerExemptThreshold;
             config.spamAutoExpandHidden = panel.querySelector('#nuke-spam-auto-expand-toggle').checked;
-            config.spamAvatarKeywords = panel.querySelector('#nuke-spam-avatar-keywords-textarea').value.split('\n').map((kw) => kw.trim()).filter(Boolean);
+            config.spamAvatarKeywords = nextAvatarKeywords;
             config.spamIdentifyMinScore = Math.max(1, parseInt(panel.querySelector('#nuke-spam-identify-score-input').value, 10) || DEFAULT_SPAM_IDENTIFY_MIN_SCORE);
             await saveConfig(config);
+            if (engineChanged || avatarKeywordsChanged) scheduleDetectionScan(true, 0);
             ensureManualDetectedNukeButton();
             if (nextEngine !== AVATAR_OCR_ENGINE_OFF) {
                 void preloadAvatarOcrEngineForUi(nextEngine);
@@ -1946,13 +1982,12 @@ function matchesAvatarOcrKeywords(ocrText, patterns = []) {
     }
     return { match: false, hit: '' };
 }
-function detectPromoAvatarSignature(imageUrl, ocrText, patterns) {
-    const imageId = extractTwitterProfileImageId(imageUrl);
+function detectPromoAvatarSignature(ocrText, patterns) {
     const keywordHit = matchesAvatarOcrKeywords(ocrText, patterns);
     if (keywordHit.match) {
-        return { match: true, hit: keywordHit.hit, source: 'ocr', imageId };
+        return { match: true, hit: keywordHit.hit, source: 'ocr' };
     }
-    return { match: false, hit: '', source: 'none', imageId };
+    return { match: false, hit: '', source: 'none' };
 }
 function fetchImageArrayBuffer(url) {
     return new Promise((resolve, reject) => {
@@ -2187,7 +2222,9 @@ function warmUpAvatarOcr() {
         })
         .catch(() => { /* noted in getAvatarOcrWorker */ });
 }
-const AVATAR_OCR_IMAGE_SCALE = 2.25;
+const AVATAR_OCR_IMAGE_SCALE = 1.5;
+const AVATAR_OCR_IMAGE_MIN_SIZE = 384;
+const AVATAR_OCR_IMAGE_MAX_SIZE = 576;
 const PADDLE_OCR_IMAGE_MAX_SIZE = 400;
 const PADDLE_OCR_IMAGE_MIN_SIZE = 192;
 async function canvasToBlob(canvas, type = 'image/png', quality) {
@@ -2280,7 +2317,7 @@ async function createAvatarOcrImageBlobsFromImageSource(imageSource) {
     const sourceWidth = imageSource.naturalWidth || imageSource.videoWidth || imageSource.width || 0;
     const sourceHeight = imageSource.naturalHeight || imageSource.videoHeight || imageSource.height || 0;
     const sourceSize = Math.max(sourceWidth, sourceHeight);
-    const size = Math.max(576, Math.round(sourceSize * AVATAR_OCR_IMAGE_SCALE));
+    const size = Math.min(AVATAR_OCR_IMAGE_MAX_SIZE, Math.max(AVATAR_OCR_IMAGE_MIN_SIZE, Math.round(sourceSize * AVATAR_OCR_IMAGE_SCALE)));
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
@@ -2409,15 +2446,6 @@ async function recognizeAvatarWithTesseract(arrayBuffer, patterns = [], imageUrl
 async function recognizeAvatarWithPaddleBrowser(arrayBuffer, patterns = [], imageUrl = '') {
     const texts = [];
     let lastError = null;
-    if (patterns?.length) {
-        try {
-            const tesseractGuardText = await recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
-            if (matchesAvatarOcrKeywords(tesseractGuardText, patterns).match) return tesseractGuardText;
-            if (tesseractGuardText) texts.push(tesseractGuardText);
-        } catch (error) {
-            lastError = error;
-        }
-    }
     const blobs = await createAvatarPaddleOcrImageBlobs(arrayBuffer, imageUrl);
     const paddle = await ensurePaddleUserscriptReady();
     for (const blob of blobs) {
@@ -2434,14 +2462,6 @@ async function recognizeAvatarWithPaddleBrowser(arrayBuffer, patterns = [], imag
         }
     }
     const paddleText = texts.join('\n');
-    if (patterns?.length) {
-        try {
-            const fallbackText = await recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
-            return [paddleText, fallbackText].filter(Boolean).join('\n');
-        } catch (error) {
-            if (!paddleText) lastError = error;
-        }
-    }
     if (!paddleText && lastError) throw lastError;
     return paddleText;
 }
@@ -2450,26 +2470,45 @@ async function recognizeAvatarTextWithOcr(arrayBuffer, patterns = [], imageUrl =
     return recognizeAvatarWithTesseract(arrayBuffer, patterns, imageUrl);
 }
 async function analyzeAvatarImageBuffer(arrayBuffer, patterns, imageUrl = '') {
-    const imageId = extractTwitterProfileImageId(imageUrl);
     if (isAvatarOcrEngineFailed()) {
-        return { match: false, hit: '', source: 'none', imageId, ocrOk: false, ocrText: '' };
+        return { match: false, hit: '', source: 'none', ocrOk: false, ocrText: '' };
     }
     try {
         const ocrText = await recognizeAvatarTextWithOcr(arrayBuffer, patterns, imageUrl);
-        const signature = detectPromoAvatarSignature(imageUrl, ocrText, patterns);
+        const signature = detectPromoAvatarSignature(ocrText, patterns);
         return { ...signature, ocrOk: true, ocrText };
     } catch (error) {
         noteAvatarOcrError(error);
-        return { match: false, hit: '', source: 'none', imageId, ocrOk: false, ocrText: '' };
+        return { match: false, hit: '', source: 'none', ocrOk: false, ocrText: '' };
+    }
+}
+function getAvatarOcrCacheKey(imageUrl, patterns = [], engine = getAvatarOcrEngine()) {
+    const patternKey = [...new Set((patterns || []).map(String).filter(Boolean))].sort().join('\u001f');
+    return `${normalizeAvatarOcrEngine(engine)}\u001e${patternKey}\u001e${String(imageUrl || '')}`;
+}
+function isReusableAvatarOcrCacheEntry(entry, now = Date.now(), cacheMs = AVATAR_OCR_CACHE_MS) {
+    return !!(entry?.result?.ocrOk && Number(entry.at) > 0 && now - Number(entry.at) < cacheMs);
+}
+function rememberAvatarOcrResult(cacheKey, result, now = Date.now()) {
+    if (!cacheKey || !result?.ocrOk) return;
+    avatarOcrCache.set(cacheKey, { result, at: now });
+    while (avatarOcrCache.size > AVATAR_OCR_CACHE_LIMIT) {
+        avatarOcrCache.delete(avatarOcrCache.keys().next().value);
     }
 }
 async function analyzeAvatarImageUrl(imageUrl, patterns) {
-    const cached = avatarOcrCache.get(imageUrl);
-    if (cached?.result?.match && Date.now() - cached.at < AVATAR_OCR_CACHE_MS) return cached.result;
-    const buffer = await fetchAvatarImageArrayBuffer(imageUrl);
-    const result = await analyzeAvatarImageBuffer(buffer, patterns, imageUrl);
-    if (result.match) avatarOcrCache.set(imageUrl, { result, at: Date.now() });
-    return result;
+    const cacheKey = getAvatarOcrCacheKey(imageUrl, patterns);
+    const cached = avatarOcrCache.get(cacheKey);
+    if (isReusableAvatarOcrCacheEntry(cached)) return cached.result;
+    if (avatarOcrPendingByKey.has(cacheKey)) return avatarOcrPendingByKey.get(cacheKey);
+    const pending = (async () => {
+        const buffer = await fetchAvatarImageArrayBuffer(imageUrl);
+        const result = await analyzeAvatarImageBuffer(buffer, patterns, imageUrl);
+        rememberAvatarOcrResult(cacheKey, result);
+        return result;
+    })().finally(() => avatarOcrPendingByKey.delete(cacheKey));
+    avatarOcrPendingByKey.set(cacheKey, pending);
+    return pending;
 }
 function ensureSpamBadge(article, detection, kind = 'text') {
     article.classList.add('nuke-spam-identified');
@@ -3292,6 +3331,73 @@ function removeAvatarOcrJobsForArticle(article) {
         if (avatarOcrQueue[i]?.article === article) avatarOcrQueue.splice(i, 1);
     }
 }
+function isArticleNearOcrViewport(article, viewportHeight = (typeof window !== 'undefined' ? window.innerHeight : 0), margin = AVATAR_OCR_VIEWPORT_MARGIN) {
+    if (!article?.isConnected || typeof article.getBoundingClientRect !== 'function') return false;
+    const rect = article.getBoundingClientRect();
+    return rect.bottom > -margin && rect.top < viewportHeight + margin;
+}
+function clearDeferredAvatarOcrArticle(article) {
+    if (!article) return;
+    deferredAvatarOcrArticles.delete(article);
+    deferredAvatarOcrUrls.delete(article);
+    delete article.dataset.avatarOcrDeferred;
+    avatarOcrVisibilityObserver?.unobserve(article);
+}
+function activateDeferredAvatarOcrArticle(article) {
+    if (!article?.isConnected || document.hidden || !isArticleNearOcrViewport(article)) return false;
+    const imageUrl = getAvatarImageUrlFromArticle(article) || deferredAvatarOcrUrls.get(article);
+    clearDeferredAvatarOcrArticle(article);
+    if (!imageUrl || !isAvatarOcrEnabled()) return false;
+    delete article.dataset.spamScanned;
+    enqueueAvatarOcr(article, imageUrl);
+    return true;
+}
+function ensureAvatarOcrVisibilityObserver() {
+    if (avatarOcrVisibilityObserver || typeof IntersectionObserver !== 'function') return avatarOcrVisibilityObserver;
+    avatarOcrVisibilityObserver = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+            if (entry.isIntersecting) activateDeferredAvatarOcrArticle(entry.target);
+        });
+    }, { root: null, rootMargin: `${AVATAR_OCR_VIEWPORT_MARGIN}px 0px` });
+    return avatarOcrVisibilityObserver;
+}
+function deferAvatarOcrUntilNearViewport(article, imageUrl) {
+    if (!article?.isConnected || !imageUrl) return false;
+    finalizeSpamArticleScan(article);
+    article.dataset.avatarOcrDeferred = 'true';
+    deferredAvatarOcrArticles.add(article);
+    deferredAvatarOcrUrls.set(article, imageUrl);
+    ensureAvatarOcrVisibilityObserver()?.observe(article);
+    updateAvatarOcrPumpProbe('deferred-offscreen');
+    return true;
+}
+function scheduleAvatarOcrForArticle(article, imageUrl) {
+    if (!article?.isConnected || !imageUrl) return false;
+    if (document.hidden || !isArticleNearOcrViewport(article)) {
+        return deferAvatarOcrUntilNearViewport(article, imageUrl);
+    }
+    clearDeferredAvatarOcrArticle(article);
+    enqueueAvatarOcr(article, imageUrl);
+    return true;
+}
+function resumeDeferredAvatarOcrArticles() {
+    for (const article of Array.from(deferredAvatarOcrArticles)) {
+        if (!article?.isConnected) {
+            clearDeferredAvatarOcrArticle(article);
+            continue;
+        }
+        activateDeferredAvatarOcrArticle(article);
+    }
+}
+function clearDeferredAvatarOcrArticles() {
+    avatarOcrVisibilityObserver?.disconnect();
+    avatarOcrVisibilityObserver = null;
+    deferredAvatarOcrArticles.forEach((article) => {
+        deferredAvatarOcrUrls.delete(article);
+        if (article?.dataset) delete article.dataset.avatarOcrDeferred;
+    });
+    deferredAvatarOcrArticles.clear();
+}
 function isAvatarOcrJobQueuedForArticle(article) {
     return !!article && avatarOcrQueue.some((job) => job?.article === article);
 }
@@ -3306,6 +3412,7 @@ function getAvatarOcrJobPriority(article) {
     return priority;
 }
 function enqueueAvatarOcr(article, imageUrl) {
+    clearDeferredAvatarOcrArticle(article);
     const visible = isArticleInViewport(article);
     if ((article.dataset.avatarOcrPending === 'true' || article.dataset.avatarOcrQueued === 'true') && !visible) return;
     if (isAvatarOcrJobActiveForArticle(article)) return;
@@ -3331,13 +3438,11 @@ function shouldPromoteVisibleAvatarOcrPending(article) {
     return !queuedAt || Date.now() - queuedAt > AVATAR_OCR_VISIBLE_REQUEUE_MS;
 }
 function isArticleInViewport(article) {
-    if (!article?.isConnected) return false;
-    const rect = article.getBoundingClientRect();
-    return rect.bottom > 0 && rect.top < window.innerHeight;
+    return isArticleNearOcrViewport(article, window.innerHeight, 0);
 }
 function avatarOcrJobScore(job) {
     if (!job?.article?.isConnected) return -Infinity;
-    return (isArticleInViewport(job.article) ? 1000 : 0) + (Number(job.priority) || 0);
+    return (isArticleInViewport(job.article) ? 2000 : isArticleNearOcrViewport(job.article) ? 1000 : 0) + (Number(job.priority) || 0);
 }
 function takeNextAvatarOcrJob() {
     let bestIndex = -1;
@@ -3353,9 +3458,32 @@ function takeNextAvatarOcrJob() {
     return avatarOcrQueue.shift();
 }
 function shouldDeferAvatarOcrJob(job) {
-    return !isArticleInViewport(job?.article)
-        && !hasVisibleAvatarOcrJobWaiting()
-        && shouldDeferBackgroundAvatarOcr();
+    if (document.hidden) return true;
+    if (!isArticleNearOcrViewport(job?.article)) return true;
+    if (Date.now() - avatarOcrLastUserActivityAt < AVATAR_OCR_USER_IDLE_MS) return true;
+    return shouldDeferBackgroundAvatarOcr();
+}
+function scheduleAvatarOcrPumpResume(delay = AVATAR_OCR_USER_IDLE_MS) {
+    if (avatarOcrResumeTimeoutId) return;
+    avatarOcrResumeTimeoutId = window.setTimeout(() => {
+        avatarOcrResumeTimeoutId = null;
+        resumeDeferredAvatarOcrArticles();
+        if (avatarOcrQueue.length && !avatarOcrPumpRunning) void pumpAvatarOcrQueue();
+    }, Math.max(0, delay));
+}
+function waitForAvatarOcrIdleOpportunity() {
+    if (document.hidden) return Promise.resolve();
+    return new Promise((resolve) => {
+        if (typeof window.requestIdleCallback === 'function') {
+            window.requestIdleCallback(() => resolve(), { timeout: 1200 });
+        } else {
+            window.setTimeout(resolve, 80);
+        }
+    });
+}
+function noteAvatarOcrUserActivity() {
+    avatarOcrLastUserActivityAt = Date.now();
+    scheduleAvatarOcrPumpResume();
 }
 function hasVisibleAvatarOcrJobWaiting() {
     return avatarOcrQueue.some((job) => isArticleInViewport(job?.article));
@@ -3365,6 +3493,8 @@ function updateAvatarOcrPumpProbe(state = '') {
         document.documentElement.dataset.cbSpamOcrPumpRunning = avatarOcrPumpRunning ? '1' : '0';
         document.documentElement.dataset.cbSpamOcrPumpState = state;
         document.documentElement.dataset.cbSpamOcrActiveAge = avatarOcrActiveStartedAt ? String(Date.now() - avatarOcrActiveStartedAt) : '0';
+        document.documentElement.dataset.cbSpamOcrDeferred = String(deferredAvatarOcrArticles.size);
+        document.documentElement.dataset.cbSpamOcrCacheSize = String(avatarOcrCache.size);
     } catch {
         /* probe only */
     }
@@ -3404,7 +3534,7 @@ function continueSpamScanAfterProfileBio(article) {
     delete article.dataset.profileBioQueuedAt;
     const avatarUrl = getAvatarImageUrlFromArticle(article);
     if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
-        enqueueAvatarOcr(article, avatarUrl);
+        scheduleAvatarOcrForArticle(article, avatarUrl);
         return;
     }
     finalizeSpamArticleScan(article);
@@ -3525,20 +3655,24 @@ async function pumpProfileBioQueue() {
 }
 async function pumpAvatarOcrQueue() {
     if (avatarOcrPumpRunning) return;
-    if (await getActiveApiRateLimitState()) return;
     avatarOcrPumpRunning = true;
     const pumpRunId = ++avatarOcrPumpRunId;
     updateAvatarOcrPumpProbe('running');
     const patterns = resolveAvatarKeywordPatterns();
     try {
         while (avatarOcrQueue.length && pumpRunId === avatarOcrPumpRunId) {
+            await waitForAvatarOcrIdleOpportunity();
             const job = takeNextAvatarOcrJob();
             if (!job?.article?.isConnected) continue;
             if (shouldDeferAvatarOcrJob(job)) {
+                if (!document.hidden && !isArticleNearOcrViewport(job.article)) {
+                    deferAvatarOcrUntilNearViewport(job.article, job.imageUrl);
+                    continue;
+                }
                 avatarOcrQueue.unshift(job);
-                updateAvatarOcrPumpProbe('deferred');
-                await new Promise((resolve) => window.setTimeout(resolve, 400));
-                continue;
+                updateAvatarOcrPumpProbe('paused');
+                scheduleAvatarOcrPumpResume();
+                break;
             }
             let matched = false;
             let deferredForApiLimit = false;
@@ -3599,7 +3733,7 @@ async function pumpAvatarOcrQueue() {
             }
             if (deferredForApiLimit) break;
             if (job.article?.isConnected) finalizeSpamArticleScan(job.article);
-            await new Promise((resolve) => window.setTimeout(resolve, 100));
+            await new Promise((resolve) => window.setTimeout(resolve, 180));
         }
     } finally {
         if (pumpRunId === avatarOcrPumpRunId) {
@@ -3608,7 +3742,7 @@ async function pumpAvatarOcrQueue() {
             avatarOcrActiveArticle = null;
             updateAvatarOcrPumpProbe('stopped');
             if (avatarOcrQueue.length) {
-                void pumpAvatarOcrQueue();
+                scheduleAvatarOcrPumpResume();
             }
         }
     }
@@ -3659,7 +3793,7 @@ async function processSpamArticle(article) {
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
     if (avatarUrl && !shouldSkipAvatarOcrForArticle(article) && isAvatarOcrEnabled()) {
-        enqueueAvatarOcr(article, avatarUrl);
+        scheduleAvatarOcrForArticle(article, avatarUrl);
         return;
     }
     finalizeSpamArticleScan(article);
@@ -3759,6 +3893,7 @@ async function runDetectionScanBatch() {
         resetSpamScanMarkersForBuildUpgrade();
         markStatusRootTweetArticles();
         tryExpandHiddenSpamReplies();
+        resumeDeferredAvatarOcrArticles();
         recoverStalledAvatarOcrPump();
         if (articles.length) {
             await scanAndProcessContent(articles);
@@ -5724,9 +5859,15 @@ function onCbSpamProbeRequest(event) {
         return;
     }
     if (detail.action === 'saveEngine' && detail.engine) {
-        scriptConfig.spamAvatarOcrEngine = normalizeAvatarOcrEngine(detail.engine);
+        const engine = normalizeAvatarOcrEngine(detail.engine);
+        if (getAvatarOcrEngine() !== engine) {
+            avatarOcrCache.clear();
+            resetAvatarOcrRuntime();
+            resetAvatarOcrArticleMarkers();
+        }
+        scriptConfig.spamAvatarOcrEngine = engine;
         delete scriptConfig.spamAvatarOcrEnabled;
-        void saveConfig(scriptConfig);
+        void saveConfig(scriptConfig).then(() => scheduleDetectionScan(true, 0));
         return;
     }
     if (detail.action === 'manualNukeDetected') {
@@ -5829,6 +5970,17 @@ document.addEventListener('click', e => {
     const expandControl = e.target.closest('[role="button"], button, a, div[tabindex="0"]');
     if (expandControl && isSpamSectionExpandControl(expandControl)) scheduleSpamRescan();
 }, true);
+document.addEventListener('pointerdown', noteAvatarOcrUserActivity, { capture: true, passive: true });
+document.addEventListener('keydown', noteAvatarOcrUserActivity, true);
+window.addEventListener('scroll', noteAvatarOcrUserActivity, { capture: true, passive: true });
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        noteAvatarOcrUserActivity();
+        return;
+    }
+    resumeDeferredAvatarOcrArticles();
+    scheduleAvatarOcrPumpResume(100);
+});
 observer.observe(document.body, { childList: true, subtree: true });
 window.addEventListener('pagehide', releaseBackgroundWorkerLeadership, { once: true });
 setInterval(() => {

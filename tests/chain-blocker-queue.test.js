@@ -31,6 +31,9 @@ function loadHelpers(names) {
         BLOCK_RETRY_BASE_MS: 30000,
         BLOCK_RETRY_MAX_MS: 300000,
         BLOCK_RETRY_MAX_ATTEMPTS: 4,
+        AVATAR_OCR_ENGINE_OFF: 'off',
+        AVATAR_OCR_ENGINE_PADDLE: 'paddle',
+        AVATAR_OCR_ENGINE_TESSERACT: 'tesseract',
         buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
     };
     const baseNames = ['normalizeNukeTaskIds', 'mergeNukeTaskIds', 'getEntryNukeTaskIds'];
@@ -205,6 +208,46 @@ test('detection safety scan no longer runs every two seconds', () => {
     const interval = Number(source.match(/const DETECTION_SAFETY_INTERVAL_MS = (\d+)\s*\*?\s*(\d+)?/)?.[1]);
 
     assert.ok(interval >= 10000);
+});
+
+test('avatar OCR cache separates engines and keyword sets', () => {
+    const { getAvatarOcrCacheKey } = loadHelpers(['normalizeAvatarOcrEngine', 'getAvatarOcrCacheKey']);
+
+    assert.notEqual(
+        getAvatarOcrCacheKey('https://pbs.twimg.com/a.jpg', ['全国安排'], 'tesseract'),
+        getAvatarOcrCacheKey('https://pbs.twimg.com/a.jpg', ['全国安排'], 'paddle')
+    );
+    assert.notEqual(
+        getAvatarOcrCacheKey('https://pbs.twimg.com/a.jpg', ['全国安排'], 'tesseract'),
+        getAvatarOcrCacheKey('https://pbs.twimg.com/a.jpg', ['点击主页'], 'tesseract')
+    );
+});
+
+test('successful negative avatar OCR results are reusable', () => {
+    const { isReusableAvatarOcrCacheEntry } = loadHelpers(['isReusableAvatarOcrCacheEntry']);
+    const now = 100000;
+
+    assert.equal(isReusableAvatarOcrCacheEntry({ at: now - 1000, result: { match: false, ocrOk: true } }, now, 30000), true);
+    assert.equal(isReusableAvatarOcrCacheEntry({ at: now - 1000, result: { match: false, ocrOk: false } }, now, 30000), false);
+    assert.equal(isReusableAvatarOcrCacheEntry({ at: now - 40000, result: { match: true, ocrOk: true } }, now, 30000), false);
+});
+
+test('automatic avatar OCR is limited to articles near the viewport', () => {
+    const { isArticleNearOcrViewport } = loadHelpers(['isArticleNearOcrViewport']);
+    const article = (top, bottom, isConnected = true) => ({ isConnected, getBoundingClientRect: () => ({ top, bottom }) });
+
+    assert.equal(isArticleNearOcrViewport(article(100, 300), 800, 400), true);
+    assert.equal(isArticleNearOcrViewport(article(1000, 1200), 800, 100), false);
+    assert.equal(isArticleNearOcrViewport(article(-500, -300), 800, 100), false);
+    assert.equal(isArticleNearOcrViewport(article(100, 300, false), 800, 400), false);
+});
+
+test('Paddle OCR does not secretly run Tesseract and image IDs are absent', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const paddleSource = extractFunction(source, 'recognizeAvatarWithPaddleBrowser');
+
+    assert.doesNotMatch(paddleSource, /recognizeAvatarWithTesseract/);
+    assert.doesNotMatch(source, /function extractTwitterProfileImageId/);
 });
 
 test('manual detected author resolution puts zero-engagement targets first', () => {
