@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.73
+// @version      2.15.74
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.73';
+const SPAM_SCANNER_BUILD = '2.15.74';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -5277,7 +5277,7 @@ function getNextQueueActionAt(userData, apiRateLimitState = null, now = Date.now
 }
 function formatQueueCountdown(nextActionAt, now = Date.now()) {
     const seconds = Math.max(0, Math.ceil((Number(nextActionAt) - now) / 1000));
-    if (seconds <= 0) return '即将执行';
+    if (seconds <= 0) return '00:00';
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const remainingSeconds = seconds % 60;
@@ -5294,7 +5294,7 @@ function renderQueueStatusCountdown(nextActionAt) {
         clearQueueStatusCountdown();
         return;
     }
-    countdown.textContent = ` · ${formatQueueCountdown(nextActionAt)}`;
+    countdown.textContent = ` · 下次 ${formatQueueCountdown(nextActionAt)}`;
 }
 function startQueueStatusCountdown(nextActionAt) {
     clearQueueStatusCountdown();
