@@ -292,6 +292,16 @@ test('TweetDetail uses the live X operation and GraphQL errors are not empty tim
     assert.equal(getGraphqlErrorMessage({ data: {} }), '');
 });
 
+test('UserByScreenName uses the live X profile operation', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const userLookupSource = extractFunction(source, 'getUserDataByScreenName');
+
+    assert.match(source, /UserByScreenName:\s*\{ hash: '2qvSHpkWTMS9i0zJAwDNiA'/);
+    assert.match(source, /UserByScreenName:[^\n]+"withAuxiliaryUserLabels":true/);
+    assert.match(userLookupSource, /withGrokTranslatedBio:true/);
+    assert.doesNotMatch(userLookupSource, /withSafetyModeUserFields/);
+});
+
 test('profile bio lookup waits for its real request instead of leaking it after a local timeout', () => {
     const source = fs.readFileSync(sourcePath, 'utf8');
     const cachedLookupSource = extractFunction(source, 'getCachedProfileBioUserData');
