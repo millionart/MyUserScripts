@@ -177,6 +177,36 @@ test('chain list collection is skipped when visible engagement count is zero', (
     assert.equal(shouldCollectChainSourceFromCounts({ replies: null, retweets: null, likes: null }, 'reply'), true);
 });
 
+test('completed articles are not requeued by unrelated page mutations', () => {
+    const { shouldQueueArticleForDetection } = loadHelpers(['shouldQueueArticleForDetection']);
+
+    assert.equal(shouldQueueArticleForDetection({ isConnected: true, dataset: { autoblockChecked: 'complete', spamScanned: 'complete' } }), false);
+    assert.equal(shouldQueueArticleForDetection({ isConnected: true, dataset: { autoblockChecked: 'complete', avatarOcrPending: 'true' } }), false);
+    assert.equal(shouldQueueArticleForDetection({ isConnected: true, dataset: {} }), true);
+    assert.equal(shouldQueueArticleForDetection({ isConnected: false, dataset: {} }), false);
+});
+
+test('incremental detection batches deduplicate and ignore detached articles', () => {
+    const { selectDetectionScanArticles } = loadHelpers([
+        'shouldQueueArticleForDetection',
+        'selectDetectionScanArticles'
+    ]);
+    const pending = { id: 'pending', isConnected: true, dataset: {} };
+    const complete = { id: 'complete', isConnected: true, dataset: { autoblockChecked: 'complete', spamScanned: 'complete' } };
+    const detached = { id: 'detached', isConnected: false, dataset: {} };
+    const extra = { id: 'extra', isConnected: true, dataset: {} };
+
+    assert.deepEqual(Array.from(selectDetectionScanArticles([pending, pending, complete, detached], [], false), (item) => item.id), ['pending']);
+    assert.deepEqual(Array.from(selectDetectionScanArticles([pending], [complete, extra, pending], true), (item) => item.id), ['extra', 'pending']);
+});
+
+test('detection safety scan no longer runs every two seconds', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const interval = Number(source.match(/const DETECTION_SAFETY_INTERVAL_MS = (\d+)\s*\*?\s*(\d+)?/)?.[1]);
+
+    assert.ok(interval >= 10000);
+});
+
 test('manual detected author resolution puts zero-engagement targets first', () => {
     const { sortManualDetectedCapturesForAuthorResolution } = loadHelpers([
         'isZeroEngagementNukeTarget',

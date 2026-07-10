@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.54
+// @version      2.15.57
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -94,7 +94,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.54';
+const SPAM_SCANNER_BUILD = '2.15.57';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1007,7 +1007,8 @@ function extractTwitterProfileImageId(url) {
     return match ? match[1] : '';
 }
 const FOLLOWER_COUNT_CACHE_MS = 10 * 60 * 1000;
-const AUTO_SCAN_INTERVAL_MS = 2000;
+const DETECTION_SAFETY_INTERVAL_MS = 15000;
+const DETECTION_SCAN_DELAY_MS = 160;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
 let isProcessingQueue = false, processIntervalId = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
@@ -1016,6 +1017,9 @@ let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, ma
 let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
 let scriptConfig = {}, isConfigPanelBusy = false, internalConfigTriggerInstalled = false, unifiedToastPanelPlacementBound = false;
 let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
+const pendingDetectionArticles = new Set();
+let detectionScanTimeoutId = null, detectionScanIdleId = null, detectionScanRunning = false, detectionFullScanPending = false;
+let detectionScanRerunRequested = false, detectionScanRunCount = 0, detectionScanArticleCount = 0, detectionScanPath = '';
 const aggregatedToastState = new Map();
 const followerCountCache = new Map();
 
@@ -3193,8 +3197,8 @@ async function resumeManualDetectedNukeTasks() {
 }
 async function executeManualNukeForDetectedTargets() {
     if (manualDetectedNukeRunning || isAutoNukeEnabled()) return;
-    scanSpamIdentifyContent();
-    scanAndProcessContent();
+    detectionFullScanPending = true;
+    await runDetectionScanBatch();
     await new Promise((resolve) => window.setTimeout(resolve, 250));
     const articles = getDetectedNukeTargetArticles();
     if (!articles.length) {
@@ -3610,6 +3614,7 @@ async function pumpAvatarOcrQueue() {
     }
 }
 async function processSpamArticle(article) {
+    if (shouldSkipSpamArticleScan(article)) return;
     const tweetText = getTweetTextFromArticle(article);
     const textDetection = tweetText ? detectSpamReply(tweetText) : null;
     if (shouldSkipSpamIdentifyForArticle(article, textDetection)) {
@@ -3617,7 +3622,6 @@ async function processSpamArticle(article) {
         finalizeSpamArticleScan(article);
         return;
     }
-    if (shouldSkipSpamArticleScan(article)) return;
     if (tweetText) {
         const detection = textDetection || detectSpamReply(tweetText);
         article.dataset.spamTextScannedBuild = SPAM_SCANNER_BUILD;
@@ -3675,7 +3679,105 @@ function tryExpandHiddenSpamReplies() {
     expandButton.click();
     scheduleSpamRescan([400, 1000, 2000, 3500]);
 }
-let spamScanDebounceId = null;
+function shouldQueueArticleForDetection(article) {
+    if (!article?.isConnected) return false;
+    if (article.dataset?.avatarOcrPending === 'true' || article.dataset?.profileBioPending === 'true') return false;
+    const autoComplete = ['complete', 'true'].includes(article.dataset?.autoblockChecked);
+    const spamComplete = article.dataset?.spamScanned === 'complete';
+    return !autoComplete || !spamComplete;
+}
+function selectDetectionScanArticles(pendingArticles, fullArticles, fullScan = false) {
+    const source = fullScan ? (fullArticles || []) : (pendingArticles || []);
+    return [...new Set(source)].filter(shouldQueueArticleForDetection);
+}
+function queueDetectionArticle(article) {
+    if (!shouldQueueArticleForDetection(article)) return false;
+    pendingDetectionArticles.add(article);
+    return true;
+}
+function queueDetectionArticlesFromNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return 0;
+    const articles = new Set();
+    if (node.matches?.('article[data-testid="tweet"]')) articles.add(node);
+    const closest = node.closest?.('article[data-testid="tweet"]');
+    if (closest) articles.add(closest);
+    node.querySelectorAll?.('article[data-testid="tweet"]').forEach((article) => articles.add(article));
+    let queued = 0;
+    articles.forEach((article) => {
+        if (queueDetectionArticle(article)) queued += 1;
+    });
+    return queued;
+}
+function updateDetectionScanProbe(lastDurationMs = 0, lastArticleCount = 0) {
+    try {
+        document.documentElement.dataset.cbDetectionScanRuns = String(detectionScanRunCount);
+        document.documentElement.dataset.cbDetectionScanArticles = String(detectionScanArticleCount);
+        document.documentElement.dataset.cbDetectionScanLastArticles = String(lastArticleCount);
+        document.documentElement.dataset.cbDetectionScanLastMs = String(Math.max(0, Math.round(lastDurationMs)));
+        document.documentElement.dataset.cbDetectionScanPending = String(pendingDetectionArticles.size);
+        document.documentElement.dataset.cbDetectionScanRunning = detectionScanRunning ? '1' : '0';
+    } catch {
+        /* probe only */
+    }
+}
+function scheduleDetectionScan(fullScan = false, delay = DETECTION_SCAN_DELAY_MS) {
+    if (fullScan) detectionFullScanPending = true;
+    if (detectionScanTimeoutId || detectionScanIdleId) return;
+    detectionScanTimeoutId = window.setTimeout(() => {
+        detectionScanTimeoutId = null;
+        const run = () => {
+            detectionScanIdleId = null;
+            void runDetectionScanBatch().catch((error) => console.error('[CB] 增量检测批次失败:', error));
+        };
+        if (typeof window.requestIdleCallback === 'function') {
+            detectionScanIdleId = window.requestIdleCallback(run, { timeout: 700 });
+        } else {
+            run();
+        }
+    }, Math.max(0, delay));
+}
+async function runDetectionScanBatch() {
+    if (detectionScanRunning) {
+        detectionScanRerunRequested = true;
+        return;
+    }
+    if (!shouldRunArticleDetectionScans() || !currentUserId) {
+        if (shouldRunArticleDetectionScans()) detectionFullScanPending = true;
+        ensureManualDetectedNukeButton();
+        return;
+    }
+    detectionScanRunning = true;
+    const startedAt = Date.now();
+    const currentPath = window.location.pathname;
+    const fullScan = detectionFullScanPending || detectionScanPath !== currentPath;
+    detectionFullScanPending = false;
+    detectionScanPath = currentPath;
+    const fullArticles = fullScan ? Array.from(document.querySelectorAll('article[data-testid="tweet"]')) : [];
+    const articles = selectDetectionScanArticles(Array.from(pendingDetectionArticles), fullArticles, fullScan);
+    pendingDetectionArticles.clear();
+    try {
+        resetSpamScanMarkersForBuildUpgrade();
+        markStatusRootTweetArticles();
+        tryExpandHiddenSpamReplies();
+        recoverStalledAvatarOcrPump();
+        if (articles.length) {
+            await scanAndProcessContent(articles);
+            await scanSpamIdentifyContent(articles);
+        } else {
+            ensureManualDetectedNukeButton();
+        }
+        recoverStalledAvatarOcrPump();
+        detectionScanRunCount += 1;
+        detectionScanArticleCount += articles.length;
+    } finally {
+        detectionScanRunning = false;
+        updateDetectionScanProbe(Date.now() - startedAt, articles.length);
+        if (detectionScanRerunRequested || pendingDetectionArticles.size || detectionFullScanPending) {
+            detectionScanRerunRequested = false;
+            scheduleDetectionScan(false, 80);
+        }
+    }
+}
 function articleHasAvatarSpamBadge(article) {
     const badge = article?.querySelector('.nuke-spam-badge');
     return !!(badge && /头像|全国安排/.test(badge.textContent || ''));
@@ -3706,15 +3808,6 @@ function shouldSkipSpamArticleScan(article) {
     if (articleHasAvatarSpamBadge(article)) return true;
     const textBadge = article.querySelector('.nuke-spam-badge');
     if (textBadge && !/头像|全国安排/.test(textBadge.textContent || '')) return true;
-    if (isAvatarOcrEnabled() && getAvatarImageUrlFromArticle(article) && !shouldSkipAvatarOcrForArticle(article)) {
-        const failCount = parseInt(article.dataset.avatarOcrFailCount, 10) || 0;
-        if (failCount < AVATAR_OCR_MAX_FAILS) {
-            delete article.dataset.spamScanned;
-            delete article.dataset.avatarOcrQueued;
-            delete article.dataset.avatarOcrPending;
-            return false;
-        }
-    }
     return true;
 }
 function isSpamSectionExpandControl(element) {
@@ -3724,52 +3817,36 @@ function isSpamSectionExpandControl(element) {
     return SPAM_EXPAND_LABEL_RE.test(text);
 }
 function scheduleSpamRescan(extraDelaysMs = [300, 900, 1800]) {
-    scheduleSpamRescanDebounced();
+    scheduleDetectionScan(true);
     extraDelaysMs.forEach((ms) => {
-        window.setTimeout(scanSpamIdentifyContent, ms);
-        window.setTimeout(scanAndProcessContent, ms);
+        window.setTimeout(() => scheduleDetectionScan(true, 0), ms);
     });
 }
 function scheduleSpamRescanDebounced() {
-    if (spamScanDebounceId) clearTimeout(spamScanDebounceId);
-    spamScanDebounceId = window.setTimeout(() => {
-        spamScanDebounceId = null;
-        scanSpamIdentifyContent();
-        scanAndProcessContent();
-    }, 120);
+    scheduleDetectionScan(false);
 }
-function scanSpamIdentifyContent() {
+async function scanSpamIdentifyContent(articles = []) {
     if (!shouldRunArticleDetectionScans() || !currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
-    void (async () => {
-        if (await getActiveApiRateLimitState()) return;
-        if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
-        recoverStalledAvatarOcrPump();
-        resetSpamScanMarkersForBuildUpgrade();
-        markStatusRootTweetArticles();
-        tryExpandHiddenSpamReplies();
-        document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
-            void processSpamArticle(article);
+    if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
+    await Promise.allSettled((articles || []).filter((article) => article?.isConnected).map((article) => processSpamArticle(article)));
+    try {
+        const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
+        let avatarHits = 0;
+        avatarBadges.forEach((node) => {
+            if (/头像|全国安排/.test(node.textContent || '')) avatarHits += 1;
         });
-        recoverStalledAvatarOcrPump();
-        try {
-            const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
-            let avatarHits = 0;
-            avatarBadges.forEach((node) => {
-                if (/头像|全国安排/.test(node.textContent || '')) avatarHits += 1;
-            });
-            document.documentElement.dataset.cbSpamScannerBuild = SPAM_SCANNER_BUILD;
-            document.documentElement.dataset.cbSpamAvatarBadgeCount = String(avatarHits);
-            document.documentElement.dataset.cbSpamOcrEngine = getAvatarOcrEngine();
-            document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
-            document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
-            document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
-            document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
-            document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
-            ensureManualDetectedNukeButton();
-        } catch {
-            /* probe only */
-        }
-    })();
+        document.documentElement.dataset.cbSpamScannerBuild = SPAM_SCANNER_BUILD;
+        document.documentElement.dataset.cbSpamAvatarBadgeCount = String(avatarHits);
+        document.documentElement.dataset.cbSpamOcrEngine = getAvatarOcrEngine();
+        document.documentElement.dataset.cbSpamOcrInitFailed = isAvatarOcrEngineFailed() ? '1' : '0';
+        document.documentElement.dataset.cbSpamOcrQueueLen = String(avatarOcrQueue.length);
+        document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
+        document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
+        document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
+        ensureManualDetectedNukeButton();
+    } catch {
+        /* probe only */
+    }
 }
 async function inspectTweetArticleForSpam(article) {
     const userLink = article.querySelector('div[data-testid="User-Name"] a[role="link"]');
@@ -5117,10 +5194,11 @@ function getArticleAuthorHandle(article) {
 function getPendingHiddenHandleSet(userData) {
     return new Set((userData?.pendingHiddenUsers || []).map((entry) => normalizePromoHandle(entry.screenName)).filter(Boolean));
 }
-function hideArticlesByHandles(handles) {
+function hideArticlesByHandles(handles, articles = null) {
     if (!handles?.size) return 0;
     let hiddenCount = 0;
-    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+    const targets = articles || document.querySelectorAll('article[data-testid="tweet"]');
+    Array.from(targets).forEach((article) => {
         const handle = getArticleAuthorHandle(article);
         if (!handle || !handles.has(handle)) return;
         article.dataset.cbPendingHiddenUser = handle;
@@ -5129,8 +5207,8 @@ function hideArticlesByHandles(handles) {
     });
     return hiddenCount;
 }
-function applyPendingHiddenUsersToPage(userData) {
-    return hideArticlesByHandles(getPendingHiddenHandleSet(userData));
+function applyPendingHiddenUsersToPage(userData, articles = null) {
+    return hideArticlesByHandles(getPendingHiddenHandleSet(userData), articles);
 }
 async function refreshPendingHiddenUsersOnPage() {
     const userData = await loadUserData();
@@ -5519,35 +5597,33 @@ async function processAutoBlockArticle(article, userData) {
         article.dataset.autoblockChecked = 'complete';
     }
 }
-function scanAndProcessContent() {
+async function scanAndProcessContent(articles = []) {
     if (!shouldRunArticleDetectionScans()) {
         ensureManualDetectedNukeButton();
         return;
     }
-    document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
     if (!currentUserId) return;
-    void (async () => {
-        if (await getActiveApiRateLimitState()) return;
-        markStatusRootTweetArticles();
-        const userData = await loadUserData();
-        if (!userData) return;
-        applyPendingHiddenUsersToPage(userData);
-        document.querySelectorAll('article[data-testid="tweet"]:not([data-autoblock-checked])').forEach((article) => {
-            void processAutoBlockArticle(article, userData);
-        });
-        if (!isAutoNukeEnabled()) {
-            ensureManualDetectedNukeButton();
-            return;
-        }
-        document.querySelectorAll('div[data-testid="UserCell"]:not([data-autoblock-checked])').forEach(cell => {
-            cell.dataset.autoblockChecked = 'true';
-            const userLink = cell.querySelector('a[role="link"]');
-            const userNameText = getDisplayNameFromUserLink(userLink);
-            const screenName = getScreenNameFromProfileHref(userLink?.href) || cell.querySelector('a[role="link"] span')?.textContent.trim() || '';
-            void maybeAutoBlockTarget(cell.closest('div[data-testid="cellInnerDiv"]'), userNameText, screenName);
-        });
+    const connectedArticles = (articles || []).filter((article) => article?.isConnected);
+    const userData = await loadUserData();
+    if (!userData) return;
+    applyPendingHiddenUsersToPage(userData, connectedArticles);
+    await Promise.allSettled(connectedArticles
+        .filter((article) => !article.dataset.autoblockChecked)
+        .map((article) => processAutoBlockArticle(article, userData)));
+    if (!isAutoNukeEnabled()) {
         ensureManualDetectedNukeButton();
-    })();
+        return;
+    }
+    document.querySelectorAll('div[data-testid="cellInnerDiv"]:not([style*="display: none"]) button[data-testid$="-unblock"]').forEach(btn => btn.closest('div[data-testid="cellInnerDiv"]').style.display = 'none');
+    const userCells = Array.from(document.querySelectorAll('div[data-testid="UserCell"]:not([data-autoblock-checked])'));
+    await Promise.allSettled(userCells.map(async (cell) => {
+        cell.dataset.autoblockChecked = 'true';
+        const userLink = cell.querySelector('a[role="link"]');
+        const userNameText = getDisplayNameFromUserLink(userLink);
+        const screenName = getScreenNameFromProfileHref(userLink?.href) || cell.querySelector('a[role="link"] span')?.textContent.trim() || '';
+        await maybeAutoBlockTarget(cell.closest('div[data-testid="cellInnerDiv"]'), userNameText, screenName);
+    }));
+    ensureManualDetectedNukeButton();
 }
 function addNukeButton(menuNode) {
     if (menuNode.querySelector('.nuke-button')) return;
@@ -5719,6 +5795,7 @@ async function initialize() {
         } else {
             delete document.documentElement.dataset.cbSpamDebugMode;
         }
+        scheduleDetectionScan(true, 0);
         void requestBackgroundWorkerLeadership();
     } catch (error) {
         if (isApiRateLimitError(error)) {
@@ -5728,8 +5805,7 @@ async function initialize() {
     }
 }
 const observer = new MutationObserver(mutations => {
-    const canRunArticleScans = shouldRunArticleDetectionScans();
-    let shouldScanSpam = false;
+    let queuedArticles = 0;
     for (const mutation of mutations) {
         if (mutation.addedNodes.length) {
             mutation.addedNodes.forEach(node => {
@@ -5740,26 +5816,13 @@ const observer = new MutationObserver(mutations => {
                         addVerificationButton(menu);
                         addSpamInspectButton(menu);
                     }
-                    if (canRunArticleScans && (node.matches?.('article[data-testid="tweet"]') || node.querySelector?.('article[data-testid="tweet"]'))) {
-                        shouldScanSpam = true;
-                    }
+                    if (shouldRunArticleDetectionScans()) queuedArticles += queueDetectionArticlesFromNode(node);
                 }
             });
         }
     }
-    if (shouldScanSpam) {
-        scheduleSpamRescanDebounced();
-        scheduleAutoBlockRescanDebounced();
-    }
+    if (queuedArticles > 0) scheduleSpamRescanDebounced();
 });
-let autoBlockScanDebounceId = null;
-function scheduleAutoBlockRescanDebounced() {
-    if (autoBlockScanDebounceId) clearTimeout(autoBlockScanDebounceId);
-    autoBlockScanDebounceId = window.setTimeout(() => {
-        autoBlockScanDebounceId = null;
-        scanAndProcessContent();
-    }, 120);
-}
 document.addEventListener('click', e => {
     const optionsButton = e.target.closest('button[data-testid="caret"]');
     if (optionsButton) activeTweetArticle = optionsButton.closest('article[data-testid="tweet"]');
@@ -5773,8 +5836,10 @@ setInterval(() => {
         ensureManualDetectedNukeButton();
         return;
     }
-    scanAndProcessContent();
-    scanSpamIdentifyContent();
-}, AUTO_SCAN_INTERVAL_MS);
+    const currentPath = window.location.pathname;
+    const pathChanged = detectionScanPath !== currentPath;
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => queueDetectionArticle(article));
+    if (pathChanged || pendingDetectionArticles.size) scheduleDetectionScan(pathChanged, 0);
+}, DETECTION_SAFETY_INTERVAL_MS);
 initialize();
 })();
