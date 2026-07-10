@@ -626,6 +626,37 @@ test('queue outcomes update every linked manual detected task', () => {
     assert.equal(userData.manualDetectedNukeTasks[2].queuedUserIds, undefined);
 });
 
+test('terminal block failures are discarded from active task stats but stay locally hidden', () => {
+    const { discardTerminalManualDetectedNukeFailures } = loadHelpers([
+        'discardTerminalManualDetectedNukeFailures'
+    ]);
+    const userData = {
+        queue: [{ userId: 'retrying' }],
+        blockedLog: [{ userId: 'blocked' }],
+        pendingHiddenUsers: [{ userId: 'terminal' }],
+        manualDetectedNukeTasks: [{
+            taskId: 'task-a',
+            queuedUserIds: ['terminal', 'retrying', 'blocked'],
+            failedUserIds: ['terminal', 'retrying', 'blocked']
+        }]
+    };
+
+    assert.equal(discardTerminalManualDetectedNukeFailures(userData), 1);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].queuedUserIds), ['retrying', 'blocked']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].failedUserIds), ['retrying', 'blocked']);
+    assert.deepEqual(Array.from(userData.pendingHiddenUsers, (entry) => entry.userId), ['terminal']);
+});
+
+test('API failures retain structured X error details', () => {
+    const { getApiResponseErrorMessage } = loadHelpers(['getApiResponseErrorMessage']);
+
+    assert.equal(
+        getApiResponseErrorMessage(404, JSON.stringify({ errors: [{ code: 50, message: 'User not found.' }] })),
+        'API请求失败: 404 - User not found. (50)'
+    );
+    assert.equal(getApiResponseErrorMessage(403, '<html>nope</html>'), 'API请求失败: 403');
+});
+
 test('merged queue entries retain all manual task links', () => {
     const { mergeQueueEntries } = loadHelpers([
         'mergeQueueEntries'

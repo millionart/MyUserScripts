@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.71
+// @version      2.15.72
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.71';
+const SPAM_SCANNER_BUILD = '2.15.72';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2871,10 +2871,10 @@ function recordManualDetectedNukeQueueOutcome(userData, entry, outcome) {
     let updated = 0;
     for (const task of userData?.manualDetectedNukeTasks || []) {
         if (!taskIds.has(String(task?.taskId || ''))) continue;
-        task.queuedUserIds = mergeNukeTaskIds(task.queuedUserIds, userId);
         const removeOutcome = (field) => {
             task[field] = normalizeNukeTaskIds(task[field]).filter((id) => id !== userId);
         };
+        if (outcome !== 'discarded') task.queuedUserIds = mergeNukeTaskIds(task.queuedUserIds, userId);
         if (outcome === 'queued') {
             removeOutcome('failedUserIds');
             removeOutcome('skippedUserIds');
@@ -2892,10 +2892,30 @@ function recordManualDetectedNukeQueueOutcome(userData, entry, outcome) {
             removeOutcome('failedUserIds');
             task.skippedUserIds = mergeNukeTaskIds(task.skippedUserIds, userId);
         }
+        if (outcome === 'discarded') {
+            removeOutcome('queuedUserIds');
+            removeOutcome('failedUserIds');
+            removeOutcome('skippedUserIds');
+        }
         task.updatedAt = Date.now();
         updated += 1;
     }
     return updated;
+}
+function discardTerminalManualDetectedNukeFailures(userData) {
+    if (!userData || !Array.isArray(userData.manualDetectedNukeTasks)) return 0;
+    const queuedIds = new Set((userData.queue || []).map((entry) => String(entry?.userId || '')).filter(Boolean));
+    const blockedIds = new Set((userData.blockedLog || []).map((entry) => String(entry?.userId || '')).filter(Boolean));
+    let discarded = 0;
+    for (const task of userData.manualDetectedNukeTasks) {
+        const terminalIds = new Set(normalizeNukeTaskIds(task?.failedUserIds).filter((userId) => !queuedIds.has(userId) && !blockedIds.has(userId)));
+        if (!terminalIds.size) continue;
+        task.failedUserIds = normalizeNukeTaskIds(task.failedUserIds).filter((userId) => !terminalIds.has(userId));
+        task.queuedUserIds = normalizeNukeTaskIds(task.queuedUserIds).filter((userId) => !terminalIds.has(userId));
+        task.updatedAt = Date.now();
+        discarded += terminalIds.size;
+    }
+    return discarded;
 }
 function getActiveManualDetectedNukeTasks(userData) {
     return (userData?.manualDetectedNukeTasks || [])
@@ -4574,6 +4594,21 @@ function getGraphqlErrorMessage(responseData) {
         .join('; ')
         .slice(0, 300);
 }
+function getApiResponseErrorMessage(status, responseText) {
+    let detail = '';
+    try {
+        const parsed = responseText ? JSON.parse(responseText) : null;
+        const errors = Array.isArray(parsed?.errors) ? parsed.errors : [];
+        detail = errors.map((error) => {
+            const message = String(error?.message || '').trim();
+            const code = Number.isFinite(Number(error?.code)) ? ` (${Number(error.code)})` : '';
+            return message ? `${message}${code}` : '';
+        }).filter(Boolean).join('; ').slice(0, 300);
+    } catch {
+        detail = '';
+    }
+    return `API请求失败: ${status}${detail ? ` - ${detail}` : ''}`;
+}
 async function makeApiRequest(url, method = "GET", data = null) {
     return enqueueApiOperation(() => new Promise((resolve, reject) => GM_xmlhttpRequest({
         method,
@@ -4607,7 +4642,7 @@ async function makeApiRequest(url, method = "GET", data = null) {
                 })();
                 return;
             }
-            reject({ message: `API请求失败: ${r.status}`, status: r.status });
+            reject({ message: getApiResponseErrorMessage(r.status, r.responseText), status: r.status });
         },
         onerror: e => reject({ message: "Network or script error", error: e }),
         ontimeout: () => reject({ message: "API请求超时", status: 0 })
@@ -5071,12 +5106,13 @@ async function loadUserData() {
     if (!Number.isFinite(Number(userData.lastBlockTimestamp))) userData.lastBlockTimestamp = 0;
     const releasedHiddenUsers = applyHiddenUserReleaseQueue(userData);
     const normalizedManualTasks = normalizeManualDetectedNukeTasks(userData);
+    const discardedTerminalFailures = discardTerminalManualDetectedNukeFailures(userData);
     const backfilledRootProtection = backfillQueueRootAuthorProtection(userData);
     if (userData.spamIdentifyLog) {
         delete userData.spamIdentifyLog;
         allData[currentUserId] = userData;
         await GM_setValue(STORAGE_KEY, allData);
-    } else if (releasedHiddenUsers > 0 || normalizedManualTasks > 0 || backfilledRootProtection > 0) {
+    } else if (releasedHiddenUsers > 0 || normalizedManualTasks > 0 || discardedTerminalFailures > 0 || backfilledRootProtection > 0) {
         allData[currentUserId] = userData;
         await GM_setValue(STORAGE_KEY, allData);
     }
@@ -5597,7 +5633,7 @@ async function processQueue() {
             showToast('nuke-status-toast', '拉黑任务稍后重试', `@${userToBlock.screenName || userToBlock.userId} 将在后台重试`, 4000);
         } else {
             console.error(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 失败，移除.`, error);
-            recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'failed');
+            recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'discarded');
             userData.queue.splice(queueIndex, 1);
         }
     } finally {
