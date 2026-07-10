@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.53
+// @version      2.15.54
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -55,6 +55,9 @@ const BLOCK_INTERVAL_MS = 60 * 1000;
 const API_OPERATION_INTERVAL_MS = 5 * 1000;
 const API_REQUEST_TIMEOUT_MS = 12000;
 const PROCESS_CHECK_INTERVAL_MS = 5 * 1000;
+const BLOCK_RETRY_BASE_MS = 30 * 1000;
+const BLOCK_RETRY_MAX_MS = 5 * 60 * 1000;
+const BLOCK_RETRY_MAX_ATTEMPTS = 4;
 const USERNAME_LENGTH_THRESHOLD = 25;
 const DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD = 1000;
 const BLOCK_CONTEXT_TEXT_MAX = 120;
@@ -91,7 +94,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.53';
+const SPAM_SCANNER_BUILD = '2.15.54';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2580,12 +2583,14 @@ function isZeroEngagementNukeTarget(resolvedTarget) {
     const counts = resolvedTarget?.engagementCounts;
     return !!counts && counts.replies === 0 && counts.retweets === 0 && counts.likes === 0;
 }
-function sortResolvedNukeTargetsForAuthorQueue(resolvedTargets) {
-    return resolvedTargets.slice().sort((left, right) => {
-        const zeroPriority = Number(isZeroEngagementNukeTarget(right)) - Number(isZeroEngagementNukeTarget(left));
-        if (zeroPriority) return zeroPriority;
-        return (left.manualOrder ?? 0) - (right.manualOrder ?? 0);
-    });
+function sortManualDetectedCapturesForAuthorResolution(captures) {
+    return (captures || [])
+        .map((capture, index) => ({ capture, index }))
+        .sort((left, right) => {
+            const zeroPriority = Number(isZeroEngagementNukeTarget(right.capture)) - Number(isZeroEngagementNukeTarget(left.capture));
+            return zeroPriority || left.index - right.index;
+        })
+        .map((item) => item.capture);
 }
 function buildManualDetectedNukeTrigger(article) {
     const badge = article?.querySelector?.('.nuke-spam-badge');
@@ -3056,48 +3061,17 @@ async function processManualDetectedNukeBackground(taskId) {
             task.updatedAt = Date.now();
             showManualDetectedNukeProgressToast(userData);
         };
-        for (const collectTarget of getManualDetectedChainCollectTargets(task)) {
-            const tweetId = collectTarget.tweetContext?.tweetId;
-            try {
-                const apiUserCountBefore = apiUserIds.size;
-                const queuedUsersForTweet = await collectChainUsersForResolvedTarget(collectTarget, userData, whitelistIds, chainExemptHandles, onCollectProgress, showManualDetectedChainCollectPausedToast, onApiUsersPage);
-                queuedChainUsers += queuedUsersForTweet;
-                if (shouldMarkManualDetectedTweetCollected(collectTarget, queuedUsersForTweet, apiUserCountBefore, apiUserIds.size)) {
-                    task.collectedTweetIds = [...new Set([...(task.collectedTweetIds || []), tweetId])];
-                } else {
-                    task.status = 'paused';
-                    task.retryAfter = Date.now() + API_RETRY_DELAY_MS;
-                    chainCollectionIncomplete = true;
-                    showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '可见回复/转推不为 0，但 API 本轮返回 0 个用户，稍后重试', 5000);
-                    break;
-                }
-                task.updatedAt = Date.now();
-                await saveUserData(userData);
-                showManualDetectedNukeProgressToast(userData);
-            } catch (error) {
-                if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
-                    showManualDetectedApiStopToast(error);
-                    task.status = 'paused';
-                    task.retryAfter = error.retryAt || Date.now() + API_RETRY_DELAY_MS;
-                    task.updatedAt = Date.now();
-                    stoppedByApiFailure = true;
-                    break;
-                }
-                throw error;
-            }
-            updateManualDetectedNukeButton();
-            await waitForMs(250);
-        }
-        task.queuedChainUserCount = (Number(task.queuedChainUserCount) || 0) + queuedChainUsers;
-        task.updatedAt = Date.now();
-        await saveUserData(userData);
-        showManualDetectedNukeProgressToast(userData);
-        const resolvedTargets = [];
+        let queuedAuthors = 0;
+        const handledAuthorIds = new Set();
         if (shouldContinueManualDetectedAuthorQueue(stoppedByApiFailure)) {
-            for (const [index, capture] of captures.entries()) {
+            for (const capture of sortManualDetectedCapturesForAuthorResolution(captures)) {
                 try {
                     const resolvedTarget = await resolveManualDetectedNukeCapture(capture);
-                    resolvedTargets.push({ ...resolvedTarget, nukeTaskIds: mergeNukeTaskIds(resolvedTarget.nukeTaskIds, task.taskId), manualOrder: index });
+                    const queuedTarget = { ...resolvedTarget, nukeTaskIds: mergeNukeTaskIds(resolvedTarget.nukeTaskIds, task.taskId) };
+                    if (queuedTarget.authorId && !handledAuthorIds.has(queuedTarget.authorId)) {
+                        handledAuthorIds.add(queuedTarget.authorId);
+                        if (queueResolvedNukeAuthor(queuedTarget, userData, whitelistIds, [])) queuedAuthors += 1;
+                    }
                     task.updatedAt = Date.now();
                     showManualDetectedNukeProgressToast(userData);
                     await saveUserData(userData);
@@ -3120,21 +3094,48 @@ async function processManualDetectedNukeBackground(taskId) {
                 await waitForMs(250);
             }
         }
-        const queuedAuthorTargets = sortResolvedNukeTargetsForAuthorQueue(resolvedTargets);
-        showManualDetectedNukeProgressToast(userData);
-        let queuedAuthors = 0;
-        const handledAuthorIds = new Set();
-        for (const resolvedTarget of queuedAuthorTargets) {
-            if (!resolvedTarget.authorId) continue;
-            if (resolvedTarget.authorId && handledAuthorIds.has(resolvedTarget.authorId)) continue;
-            if (resolvedTarget.authorId) handledAuthorIds.add(resolvedTarget.authorId);
-            if (queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, [])) queuedAuthors += 1;
-            updateManualDetectedNukeButton();
-        }
         task.queuedAuthorCount = (Number(task.queuedAuthorCount) || 0) + queuedAuthors;
         task.updatedAt = Date.now();
         await saveUserData(userData);
         await updateStatusToast();
+        showManualDetectedNukeProgressToast(userData);
+        if (shouldContinueManualDetectedAuthorQueue(stoppedByApiFailure)) {
+            for (const collectTarget of getManualDetectedChainCollectTargets(task)) {
+                const tweetId = collectTarget.tweetContext?.tweetId;
+                try {
+                    const apiUserCountBefore = apiUserIds.size;
+                    const queuedUsersForTweet = await collectChainUsersForResolvedTarget(collectTarget, userData, whitelistIds, chainExemptHandles, onCollectProgress, showManualDetectedChainCollectPausedToast, onApiUsersPage);
+                    queuedChainUsers += queuedUsersForTweet;
+                    if (shouldMarkManualDetectedTweetCollected(collectTarget, queuedUsersForTweet, apiUserCountBefore, apiUserIds.size)) {
+                        task.collectedTweetIds = [...new Set([...(task.collectedTweetIds || []), tweetId])];
+                    } else {
+                        task.status = 'paused';
+                        task.retryAfter = Date.now() + API_RETRY_DELAY_MS;
+                        chainCollectionIncomplete = true;
+                        showToast('nuke-manual-detected-toast', '九族列表收集已暂停', '可见回复/转推不为 0，但 API 本轮返回 0 个用户，稍后重试', 5000);
+                        break;
+                    }
+                    task.updatedAt = Date.now();
+                    await saveUserData(userData);
+                    showManualDetectedNukeProgressToast(userData);
+                } catch (error) {
+                    if (isApiRateLimitError(error) || isApiTimeoutError(error)) {
+                        showManualDetectedApiStopToast(error);
+                        task.status = 'paused';
+                        task.retryAfter = error.retryAt || Date.now() + API_RETRY_DELAY_MS;
+                        task.updatedAt = Date.now();
+                        stoppedByApiFailure = true;
+                        break;
+                    }
+                    throw error;
+                }
+                updateManualDetectedNukeButton();
+                await waitForMs(250);
+            }
+        }
+        task.queuedChainUserCount = (Number(task.queuedChainUserCount) || 0) + queuedChainUsers;
+        task.updatedAt = Date.now();
+        await saveUserData(userData);
         showManualDetectedNukeProgressToast(userData);
         if (getManualDetectedPostCollectStatus(stoppedByApiFailure, chainCollectionIncomplete) === 'queued') {
             task.status = 'queued';
@@ -3930,6 +3931,7 @@ function createPendingHiddenUserEntry(entry, context = {}) {
 function createAuthorQueueEntry(resolvedTarget) {
     const { authorId, authorHandle, authorUserNameText, trigger, tweetContext } = resolvedTarget;
     const meta = buildAuthorBlockNote(trigger, tweetContext);
+    const nukeTaskIds = mergeNukeTaskIds(getEntryNukeTaskIds(resolvedTarget), getEntryNukeTaskIds(tweetContext));
     return {
         userId: authorId,
         screenName: authorHandle,
@@ -3940,7 +3942,8 @@ function createAuthorQueueEntry(resolvedTarget) {
         sourceAuthorHandle: tweetContext.authorHandle || authorHandle,
         sourceRootAuthorHandle: tweetContext.rootAuthorHandle || '',
         sourceRootAuthorId: tweetContext.rootAuthorId || null,
-        nukeTaskIds: mergeNukeTaskIds(getEntryNukeTaskIds(resolvedTarget), getEntryNukeTaskIds(tweetContext)),
+        nukeTaskIds,
+        queuePriority: nukeTaskIds.length ? (isZeroEngagementNukeTarget(resolvedTarget) ? 0 : 1) : 5,
         ...meta
     };
 }
@@ -4624,11 +4627,12 @@ async function loadUserData() {
     if (!Number.isFinite(Number(userData.lastBlockTimestamp))) userData.lastBlockTimestamp = 0;
     const releasedHiddenUsers = applyHiddenUserReleaseQueue(userData);
     const normalizedManualTasks = normalizeManualDetectedNukeTasks(userData);
+    const backfilledRootProtection = backfillQueueRootAuthorProtection(userData);
     if (userData.spamIdentifyLog) {
         delete userData.spamIdentifyLog;
         allData[currentUserId] = userData;
         await GM_setValue(STORAGE_KEY, allData);
-    } else if (releasedHiddenUsers > 0 || normalizedManualTasks > 0) {
+    } else if (releasedHiddenUsers > 0 || normalizedManualTasks > 0 || backfilledRootProtection > 0) {
         allData[currentUserId] = userData;
         await GM_setValue(STORAGE_KEY, allData);
     }
@@ -4893,6 +4897,85 @@ function isQueueEntryProtectedRootAuthor(entry) {
     const sourceRootAuthorHandle = normalizePromoHandle(entry.sourceRootAuthorHandle);
     return !!(sourceRootAuthorHandle && entryHandle === sourceRootAuthorHandle);
 }
+function backfillQueueRootAuthorProtection(userData) {
+    if (!userData || !Array.isArray(userData.queue)) return 0;
+    const contextByTweetId = new Map();
+    const addContext = (context) => {
+        const tweetId = context?.tweetId ? String(context.tweetId) : '';
+        if (!tweetId || (!context.rootAuthorId && !context.rootAuthorHandle)) return;
+        const previous = contextByTweetId.get(tweetId) || {};
+        contextByTweetId.set(tweetId, {
+            ...previous,
+            ...context,
+            rootAuthorId: context.rootAuthorId || previous.rootAuthorId || null,
+            rootAuthorHandle: context.rootAuthorHandle || previous.rootAuthorHandle || ''
+        });
+    };
+    (userData.nukeCaptures || []).forEach((capture) => addContext(capture?.tweetContext));
+    (userData.manualDetectedNukeTasks || []).forEach((task) => {
+        (task?.captures || []).forEach((capture) => addContext({
+            ...(capture?.tweetContext || {}),
+            rootAuthorId: capture?.rootAuthorId || capture?.tweetContext?.rootAuthorId || null
+        }));
+    });
+    let changed = 0;
+    for (const entry of userData.queue) {
+        if (isDirectManualRootQueueEntry(entry)) continue;
+        const context = contextByTweetId.get(String(entry?.sourceTweetId || ''));
+        if (!context) continue;
+        let entryChanged = false;
+        if (!entry.sourceRootAuthorId && context.rootAuthorId) {
+            entry.sourceRootAuthorId = String(context.rootAuthorId);
+            entryChanged = true;
+        }
+        if (!entry.sourceRootAuthorHandle && context.rootAuthorHandle) {
+            entry.sourceRootAuthorHandle = normalizePromoHandle(context.rootAuthorHandle);
+            entryChanged = true;
+        }
+        if (entryChanged) changed += 1;
+    }
+    return changed;
+}
+function getNukeQueueEntryPriority(entry) {
+    const priority = Number(entry?.queuePriority);
+    return Number.isFinite(priority) ? priority : 10;
+}
+function insertNukeQueueEntryByPriority(userData, entry, now = Date.now()) {
+    if (!userData || !entry) return -1;
+    if (!Array.isArray(userData.queue)) userData.queue = [];
+    if (!Number.isFinite(Number(entry.queuedAt))) entry.queuedAt = now;
+    const priority = getNukeQueueEntryPriority(entry);
+    const index = userData.queue.findIndex((queued) => getNukeQueueEntryPriority(queued) > priority);
+    if (index < 0) {
+        userData.queue.push(entry);
+        return userData.queue.length - 1;
+    }
+    userData.queue.splice(index, 0, entry);
+    return index;
+}
+function getNextRunnableQueueEntryIndex(queue, now = Date.now()) {
+    return (queue || []).findIndex((entry) => !entry?.retryAfter || Number(entry.retryAfter) <= now);
+}
+function isRetryableBlockError(error) {
+    const status = Number(error?.status);
+    if (isApiRateLimitError(error)) return false;
+    if (isApiTimeoutError(error)) return true;
+    if (!Number.isFinite(status) || status === 0) return true;
+    return status >= 500;
+}
+function getBlockRetryDelayMs(attempt) {
+    const exponent = Math.max(0, (Number(attempt) || 1) - 1);
+    return Math.min(BLOCK_RETRY_MAX_MS, BLOCK_RETRY_BASE_MS * (2 ** exponent));
+}
+function scheduleBlockQueueRetry(entry, error, now = Date.now()) {
+    if (!entry || !isRetryableBlockError(error)) return false;
+    const nextAttempt = (Number(entry.blockAttempts) || 0) + 1;
+    if (nextAttempt >= BLOCK_RETRY_MAX_ATTEMPTS) return false;
+    entry.blockAttempts = nextAttempt;
+    entry.retryAfter = now + getBlockRetryDelayMs(nextAttempt);
+    entry.lastBlockError = String(error?.message || `HTTP ${error?.status || 'error'}`).slice(0, 160);
+    return true;
+}
 
 function setBackgroundWorkerProbe(state) {
     try {
@@ -4970,8 +5053,10 @@ async function processQueue() {
     if (await getActiveApiRateLimitState()) return;
     const userData = await loadUserData();
     if (!userData || userData.queue.length === 0 || (Date.now() - userData.lastBlockTimestamp < BLOCK_INTERVAL_MS)) return;
+    const queueIndex = getNextRunnableQueueEntryIndex(userData.queue);
+    if (queueIndex < 0) return;
     isProcessingQueue = true;
-    let userToBlock = userData.queue[0];
+    const userToBlock = userData.queue[queueIndex];
     try {
         if (!userToBlock.screenName || !userToBlock.userNameText) {
             try {
@@ -4987,11 +5072,13 @@ async function processQueue() {
             recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'skipped');
             queueHiddenUserRelease(userData, userToBlock);
             applyHiddenUserReleaseQueue(userData);
-            userData.queue.shift();
+            userData.queue.splice(queueIndex, 1);
             return;
         }
         await blockUserById(userToBlock.userId);
-        userData.queue.shift();
+        userData.queue.splice(queueIndex, 1);
+        delete userToBlock.retryAfter;
+        delete userToBlock.lastBlockError;
         recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'blocked');
         userData.blockedLog.push({ ...userToBlock, blockTimestamp: Date.now(), blockNote: userToBlock.blockNote || '', blockReason: userToBlock.blockReason || '' });
         queueHiddenUserRelease(userData, userToBlock);
@@ -5003,10 +5090,13 @@ async function processQueue() {
         if (isApiRateLimitError(error)) {
             console.warn(`[Chain Blocker] API 已达上限，暂停队列拉黑 @${userToBlock.screenName || userToBlock.userId}.`, error);
             showApiLimitRetryToast(error);
+        } else if (scheduleBlockQueueRetry(userToBlock, error)) {
+            console.warn(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 暂时失败，将重试.`, error);
+            showToast('nuke-status-toast', '拉黑任务稍后重试', `@${userToBlock.screenName || userToBlock.userId} 将在后台重试`, 4000);
         } else {
-        console.error(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 失败，移除.`, error);
-        recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'failed');
-        userData.queue.shift();
+            console.error(`[Chain Blocker] 拉黑 @${userToBlock.screenName || userToBlock.userId} 失败，移除.`, error);
+            recordManualDetectedNukeQueueOutcome(userData, userToBlock, 'failed');
+            userData.queue.splice(queueIndex, 1);
         }
     } finally {
         const completedTask = completeFinishedManualDetectedNukeTasks(userData);
@@ -5216,7 +5306,7 @@ function queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptH
         return false;
     }
     if (authorId === currentUserId) return false;
-    userData.queue.push(entry);
+    insertNukeQueueEntryByPriority(userData, entry);
     recordManualDetectedNukeQueueOutcome(userData, entry, 'queued');
     addPendingHiddenUsers(userData, [createPendingHiddenUserEntry(entry, resolvedTarget.tweetContext)]);
     applyPendingHiddenUsersToPage(userData);
@@ -5276,7 +5366,7 @@ function addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandle
     }
     const newUsersToQueue = selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds);
     if (newUsersToQueue.length > 0) {
-        userData.queue.push(...newUsersToQueue);
+        newUsersToQueue.forEach((entry) => insertNukeQueueEntryByPriority(userData, entry));
         newUsersToQueue.forEach((entry) => recordManualDetectedNukeQueueOutcome(userData, entry, 'queued'));
         addPendingHiddenUsers(userData, newUsersToQueue.map((entry) => createPendingHiddenUserEntry(entry)));
         applyPendingHiddenUsersToPage(userData);

@@ -28,6 +28,9 @@ function loadHelpers(names) {
     const sandbox = {
         module: { exports: {} },
         MANUAL_DETECTED_NUKE_STALE_RUNNING_MS: 120000,
+        BLOCK_RETRY_BASE_MS: 30000,
+        BLOCK_RETRY_MAX_MS: 300000,
+        BLOCK_RETRY_MAX_ATTEMPTS: 4,
         buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
     };
     const baseNames = ['normalizeNukeTaskIds', 'mergeNukeTaskIds', 'getEntryNukeTaskIds'];
@@ -172,6 +175,59 @@ test('chain list collection is skipped when visible engagement count is zero', (
     assert.equal(shouldCollectChainSourceFromCounts(counts, 'retweet'), false);
     assert.equal(shouldCollectChainSourceFromCounts(counts, 'like'), false);
     assert.equal(shouldCollectChainSourceFromCounts({ replies: null, retweets: null, likes: null }, 'reply'), true);
+});
+
+test('manual detected author resolution puts zero-engagement targets first', () => {
+    const { sortManualDetectedCapturesForAuthorResolution } = loadHelpers([
+        'isZeroEngagementNukeTarget',
+        'sortManualDetectedCapturesForAuthorResolution'
+    ]);
+    const captures = [
+        { authorHandle: 'busy-first', engagementCounts: { replies: 2, retweets: 1, likes: 4 } },
+        { authorHandle: 'zero-first', engagementCounts: { replies: 0, retweets: 0, likes: 0 } },
+        { authorHandle: 'zero-second', engagementCounts: { replies: 0, retweets: 0, likes: 0 } },
+        { authorHandle: 'busy-second', engagementCounts: { replies: 1, retweets: 0, likes: 0 } }
+    ];
+
+    const ordered = sortManualDetectedCapturesForAuthorResolution(captures);
+
+    assert.deepEqual(Array.from(ordered, (capture) => capture.authorHandle), ['zero-first', 'zero-second', 'busy-first', 'busy-second']);
+});
+
+test('priority queue keeps detected authors ahead of collected chain users', () => {
+    const { insertNukeQueueEntryByPriority } = loadHelpers([
+        'getNukeQueueEntryPriority',
+        'insertNukeQueueEntryByPriority'
+    ]);
+    const userData = {
+        queue: [
+            { userId: 'chain-old', queuePriority: 10, queuedAt: 1 },
+            { userId: 'chain-new', queuePriority: 10, queuedAt: 2 }
+        ]
+    };
+
+    insertNukeQueueEntryByPriority(userData, { userId: 'author-normal', queuePriority: 1 }, 20);
+    insertNukeQueueEntryByPriority(userData, { userId: 'author-zero', queuePriority: 0 }, 30);
+
+    assert.deepEqual(Array.from(userData.queue, (entry) => entry.userId), ['author-zero', 'author-normal', 'chain-old', 'chain-new']);
+});
+
+test('queue retries transient block failures without stalling runnable users', () => {
+    const { scheduleBlockQueueRetry, getNextRunnableQueueEntryIndex } = loadHelpers([
+        'isApiRateLimitError',
+        'isApiTimeoutError',
+        'isRetryableBlockError',
+        'getBlockRetryDelayMs',
+        'scheduleBlockQueueRetry',
+        'getNextRunnableQueueEntryIndex'
+    ]);
+    const delayed = { userId: 'retry-me', blockAttempts: 0 };
+
+    assert.equal(scheduleBlockQueueRetry(delayed, { status: 503 }, 1000), true);
+    assert.equal(delayed.blockAttempts, 1);
+    assert.ok(delayed.retryAfter > 1000);
+    assert.equal(getNextRunnableQueueEntryIndex([delayed, { userId: 'ready' }], 1001), 1);
+    assert.equal(scheduleBlockQueueRetry({ userId: 'bad-request' }, { status: 400 }, 1000), false);
 });
 
 test('visible follower count text parser handles compact Chinese and English counts', () => {
@@ -665,6 +721,28 @@ test('queue root protection does not skip detected source authors', () => {
         sourceRootAuthorHandle: 'root_user',
         blockReason: 'manual_author'
     }), false);
+});
+
+test('old queue entries recover root-author protection from stored captures', () => {
+    const { backfillQueueRootAuthorProtection, isQueueEntryProtectedRootAuthor } = loadHelpers([
+        'backfillQueueRootAuthorProtection',
+        'isDirectManualRootQueueEntry',
+        'isQueueEntryProtectedRootAuthor'
+    ]);
+    const userData = {
+        queue: [
+            { userId: 'root-id', screenName: 'root_user', sourceTweetId: 'tweet-1', blockReason: 'chain_reply' },
+            { userId: 'reply-id', screenName: 'reply_user', sourceTweetId: 'tweet-1', blockReason: 'chain_reply' }
+        ],
+        nukeCaptures: [
+            { tweetContext: { tweetId: 'tweet-1', rootAuthorId: 'root-id', rootAuthorHandle: 'root_user' } }
+        ],
+        manualDetectedNukeTasks: []
+    };
+
+    assert.equal(backfillQueueRootAuthorProtection(userData), 2);
+    assert.equal(isQueueEntryProtectedRootAuthor(userData.queue[0]), true);
+    assert.equal(isQueueEntryProtectedRootAuthor(userData.queue[1]), false);
 });
 
 test('api operation spacing uses the newest local or shared start time', () => {
