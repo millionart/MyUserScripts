@@ -336,6 +336,7 @@ test('manual detected author resolution puts zero-engagement targets first', () 
     const captures = [
         { authorHandle: 'busy-first', engagementCounts: { replies: 2, retweets: 1, likes: 4 } },
         { authorHandle: 'zero-first', engagementCounts: { replies: 0, retweets: 0, likes: 0 } },
+        { authorHandle: 'chain-only', status: 'chain_only', engagementCounts: { replies: 0, retweets: 0, likes: 0 } },
         { authorHandle: 'zero-second', engagementCounts: { replies: 0, retweets: 0, likes: 0 } },
         { authorHandle: 'busy-second', engagementCounts: { replies: 1, retweets: 0, likes: 0 } }
     ];
