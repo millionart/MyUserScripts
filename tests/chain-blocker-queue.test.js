@@ -25,7 +25,7 @@ function extractFunction(source, name) {
 
 function loadHelpers(names) {
     const source = fs.readFileSync(sourcePath, 'utf8');
-    const sandbox = { module: { exports: {} } };
+    const sandbox = { module: { exports: {} }, MANUAL_DETECTED_NUKE_STALE_RUNNING_MS: 120000 };
     const code = [
         extractFunction(source, 'normalizePromoHandle'),
         ...names.map((name) => extractFunction(source, name)),
@@ -358,7 +358,7 @@ test('manual detected nuke task is paused until shared api limit resets', () => 
     assert.ok(getManualDetectedNukeRetryDelay(userData) > 0);
 });
 
-test('manual detected nuke migration reruns queued tasks that never collected api users', () => {
+test('manual detected nuke migration leaves queued tasks with zero api users alone', () => {
     const { normalizeManualDetectedNukeTasks, getNextRunnableManualDetectedNukeTask } = loadHelpers([
         'getActiveManualDetectedNukeTasks',
         'shouldRetryQueuedManualDetectedNukeTask',
@@ -390,16 +390,15 @@ test('manual detected nuke migration reruns queued tasks that never collected ap
         ]
     };
 
-    assert.equal(normalizeManualDetectedNukeTasks(userData), 2);
-    assert.equal(userData.manualDetectedNukeTasks[0].status, 'pending');
-    assert.equal(userData.manualDetectedNukeTasks[0].retryAfter, 0);
+    assert.equal(normalizeManualDetectedNukeTasks(userData), 0);
+    assert.equal(userData.manualDetectedNukeTasks[0].status, 'queued');
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].collectedTweetIds), []);
-    assert.equal(userData.manualDetectedNukeTasks[1].status, 'pending');
-    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].collectedTweetIds), []);
-    assert.equal(getNextRunnableManualDetectedNukeTask(userData)?.taskId, 'stale-queued');
+    assert.equal(userData.manualDetectedNukeTasks[1].status, 'queued');
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[1].collectedTweetIds), ['tweet-2']);
+    assert.equal(getNextRunnableManualDetectedNukeTask(userData), null);
 });
 
-test('manual detected nuke migration reruns queued tasks with missing collected marker', () => {
+test('manual detected nuke migration removes completed tasks', () => {
     const { normalizeManualDetectedNukeTasks } = loadHelpers([
         'getActiveManualDetectedNukeTasks',
         'shouldRetryQueuedManualDetectedNukeTask',
@@ -408,18 +407,19 @@ test('manual detected nuke migration reruns queued tasks with missing collected 
     const userData = {
         manualDetectedNukeTasks: [
             {
-                taskId: 'missing-marker',
-                status: 'queued',
-                expectedBlockCount: 8,
-                apiCollectedCount: 0,
-                targetTweetIds: ['tweet-1']
+                taskId: 'complete-task',
+                status: 'complete'
+            },
+            {
+                taskId: 'queued-task',
+                status: 'queued'
             }
         ]
     };
 
-    normalizeManualDetectedNukeTasks(userData);
+    assert.equal(normalizeManualDetectedNukeTasks(userData), 1);
 
-    assert.equal(userData.manualDetectedNukeTasks[0].status, 'pending');
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks, (task) => task.taskId), ['queued-task']);
 });
 
 test('manual detected nuke migration reruns stale running tasks with zero api users', () => {
@@ -446,6 +446,28 @@ test('manual detected nuke migration reruns stale running tasks with zero api us
 
     assert.equal(userData.manualDetectedNukeTasks[0].status, 'pending');
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].collectedTweetIds), []);
+});
+
+test('manual detected nuke completion removes terminal tasks from storage', () => {
+    const { completeFinishedManualDetectedNukeTasks } = loadHelpers([
+        'getManualDetectedNukeTaskTweetIds',
+        'sumManualDetectedExpectedBlockCount',
+        'getManualDetectedNukeTaskStats',
+        'completeFinishedManualDetectedNukeTasks'
+    ]);
+    const userData = {
+        manualDetectedNukeTasks: [
+            { taskId: 'finished', status: 'queued', targetTweetIds: ['tweet-1'], hiddenTargets: 1, expectedBlockCount: 0, apiCollectedCount: 0 }
+        ],
+        queue: [],
+        blockedLog: []
+    };
+
+    const completed = completeFinishedManualDetectedNukeTasks(userData);
+
+    assert.equal(completed.taskId, 'finished');
+    assert.equal(completed.status, 'complete');
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks), []);
 });
 
 test('manual detected chain collection can continue without resolved author id', () => {

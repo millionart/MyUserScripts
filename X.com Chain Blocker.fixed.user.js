@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.51
+// @version      2.15.52
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -73,6 +73,7 @@ const PENDING_HIDDEN_USERS_LIMIT = 2000;
 const HIDDEN_RELEASE_QUEUE_LIMIT = 2000;
 const NUKE_CAPTURE_LOG_LIMIT = 300;
 const MANUAL_DETECTED_NUKE_TASK_LIMIT = 20;
+const MANUAL_DETECTED_NUKE_STALE_RUNNING_MS = 2 * 60 * 1000;
 const avatarOcrCache = new Map();
 const avatarOcrQueue = [];
 const profileBioCache = new Map();
@@ -90,7 +91,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.51';
+const SPAM_SCANNER_BUILD = '2.15.52';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2704,20 +2705,17 @@ function getActiveManualDetectedNukeTasks(userData) {
     return (userData?.manualDetectedNukeTasks || [])
         .filter((task) => task && !['complete', 'failed'].includes(task.status));
 }
-function shouldRetryQueuedManualDetectedNukeTask(task) {
-    if (!task || !['queued', 'running'].includes(task.status)) return false;
+function shouldRetryQueuedManualDetectedNukeTask(task, now = Date.now()) {
+    if (!task || task.status !== 'running') return false;
     if (task.status === 'running' && typeof manualDetectedNukeTaskRunning !== 'undefined' && manualDetectedNukeTaskRunning) return false;
-    const expectedBlockCount = Number(task.expectedBlockCount) || 0;
-    const apiCollectedCount = Number(task.apiCollectedCount) || 0;
-    const apiUserCount = Array.isArray(task.apiUserIds) ? task.apiUserIds.length : 0;
-    const collectedTweetIds = Array.isArray(task.collectedTweetIds) ? task.collectedTweetIds : null;
-    if (expectedBlockCount <= 0 || apiCollectedCount > 0 || apiUserCount > 0) return false;
-    if (task.status === 'running') return true;
-    return !collectedTweetIds || collectedTweetIds.length === 0 || expectedBlockCount > 0;
+    const updatedAt = Number(task.updatedAt || task.createdAt) || 0;
+    return !updatedAt || now - updatedAt >= MANUAL_DETECTED_NUKE_STALE_RUNNING_MS;
 }
 function normalizeManualDetectedNukeTasks(userData) {
     if (!userData || !Array.isArray(userData.manualDetectedNukeTasks)) return 0;
-    let changed = 0;
+    const retainedTasks = userData.manualDetectedNukeTasks.filter((task) => task?.status !== 'complete');
+    let changed = userData.manualDetectedNukeTasks.length - retainedTasks.length;
+    userData.manualDetectedNukeTasks = retainedTasks;
     for (const task of userData.manualDetectedNukeTasks) {
         if (!shouldRetryQueuedManualDetectedNukeTask(task)) continue;
         task.status = 'pending';
@@ -2832,17 +2830,25 @@ function showManualDetectedNukeTaskToast(task, userData, duration = null) {
 function showManualDetectedNukeProgressToast(userData, duration = null) {
     const summary = getManualDetectedNukeTaskSummary(userData);
     if (summary) showManualDetectedNukeTaskToast(summary, userData, duration);
+    else dismissToast('nuke-manual-detected-toast');
 }
 function completeFinishedManualDetectedNukeTasks(userData) {
     let completedTask = null;
+    const retainedTasks = [];
     for (const task of userData?.manualDetectedNukeTasks || []) {
-        if (task?.status !== 'queued') continue;
-        const stats = getManualDetectedNukeTaskStats(task, userData);
-        if (stats.queuedCount > 0) continue;
-        task.status = 'complete';
-        task.updatedAt = Date.now();
-        completedTask = task;
+        if (task?.status === 'complete') continue;
+        if (task?.status === 'queued') {
+            const stats = getManualDetectedNukeTaskStats(task, userData);
+            if (stats.queuedCount === 0) {
+                task.status = 'complete';
+                task.updatedAt = Date.now();
+                completedTask = task;
+                continue;
+            }
+        }
+        retainedTasks.push(task);
     }
+    if (userData) userData.manualDetectedNukeTasks = retainedTasks;
     return completedTask;
 }
 async function updateManualDetectedNukeTaskToast(userData = null) {
@@ -3088,6 +3094,7 @@ async function resumeManualDetectedNukeTasks() {
     const activeSummary = getManualDetectedNukeTaskSummary(userData);
     if (!activeSummary) {
         if (completedTask) showManualDetectedNukeTaskToast(completedTask, userData, 4500);
+        else dismissToast('nuke-manual-detected-toast');
         return;
     }
     showManualDetectedNukeTaskToast(activeSummary, userData);
@@ -4616,6 +4623,14 @@ function layoutToasts() {
     syncUnifiedToastPanelPlacement(panel);
     const hasVisibleToast = !!panel.querySelector('.nuke-toast:not(.fading-out)');
     panel.classList.toggle('nuke-toast-panel-empty', !hasVisibleToast);
+}
+function dismissToast(id) {
+    const toast = document.getElementById(id);
+    if (!toast) return;
+    if (toast._nukeToastTimer) clearTimeout(toast._nukeToastTimer);
+    if (toast._nukeToastRemoveTimer) clearTimeout(toast._nukeToastRemoveTimer);
+    toast.remove();
+    layoutToasts();
 }
 function showToast(id, title, status, duration = null) {
     const list = getUnifiedToastList();
