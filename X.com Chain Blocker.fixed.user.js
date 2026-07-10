@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.74
+// @version      2.15.75
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.74';
+const SPAM_SCANNER_BUILD = '2.15.75';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -2855,6 +2855,7 @@ function createManualDetectedNukeTask(capturedTargets, now = Date.now()) {
         blockedUserIds: [],
         failedUserIds: [],
         skippedUserIds: [],
+        discardedUserIds: [],
         targetTweetIds,
         captures
     };
@@ -2898,6 +2899,7 @@ function recordManualDetectedNukeQueueOutcome(userData, entry, outcome) {
             removeOutcome('queuedUserIds');
             removeOutcome('failedUserIds');
             removeOutcome('skippedUserIds');
+            task.discardedUserIds = mergeNukeTaskIds(task.discardedUserIds, userId);
         }
         task.updatedAt = Date.now();
         updated += 1;
@@ -2914,6 +2916,7 @@ function discardTerminalManualDetectedNukeFailures(userData) {
         if (!terminalIds.size) continue;
         task.failedUserIds = normalizeNukeTaskIds(task.failedUserIds).filter((userId) => !terminalIds.has(userId));
         task.queuedUserIds = normalizeNukeTaskIds(task.queuedUserIds).filter((userId) => !terminalIds.has(userId));
+        task.discardedUserIds = mergeNukeTaskIds(task.discardedUserIds, Array.from(terminalIds));
         task.updatedAt = Date.now();
         discarded += terminalIds.size;
     }
@@ -4611,8 +4614,10 @@ function getApiResponseErrorMessage(status, responseText) {
     }
     return `API请求失败: ${status}${detail ? ` - ${detail}` : ''}`;
 }
-async function makeApiRequest(url, method = "GET", data = null) {
-    return enqueueApiOperation(() => new Promise((resolve, reject) => GM_xmlhttpRequest({
+async function makeApiRequest(url, method = "GET", data = null, onStart = null) {
+    return enqueueApiOperation(() => {
+        onStart?.();
+        return new Promise((resolve, reject) => GM_xmlhttpRequest({
         method,
         url,
         data,
@@ -4648,7 +4653,8 @@ async function makeApiRequest(url, method = "GET", data = null) {
         },
         onerror: e => reject({ message: "Network or script error", error: e }),
         ontimeout: () => reject({ message: "API请求超时", status: 0 })
-    })));
+        }));
+    });
 }
 function isApiRateLimitError(error) {
     return error?.status === 429 || error?.sharedRateLimit === true;
@@ -5088,7 +5094,12 @@ async function getRepliersData(tweetId, onProgress, onUsersPage) {
     } while (cursor);
     return Array.from(users.values());
 }
-async function blockUserById(userId) { return makeApiRequest("https://x.com/i/api/1.1/blocks/create.json", "POST", `user_id=${userId}`); }
+function markBlockAttemptStarted(userData, now = Date.now()) {
+    if (!userData) return 0;
+    userData.lastBlockTimestamp = now;
+    return now;
+}
+async function blockUserById(userId, onStart = null) { return makeApiRequest("https://x.com/i/api/1.1/blocks/create.json", "POST", `user_id=${userId}`, onStart); }
 async function unblockUserById(userId) { return makeApiRequest("https://x.com/i/api/1.1/blocks/destroy.json", "POST", `user_id=${userId}`); }
 
 // --- DATA & QUEUE MANAGEMENT ---
@@ -5616,7 +5627,7 @@ async function processQueue() {
             userData.queue.splice(queueIndex, 1);
             return;
         }
-        await blockUserById(userToBlock.userId);
+        await blockUserById(userToBlock.userId, () => markBlockAttemptStarted(userData));
         userData.queue.splice(queueIndex, 1);
         delete userToBlock.retryAfter;
         delete userToBlock.lastBlockError;
@@ -5626,7 +5637,6 @@ async function processQueue() {
         applyHiddenUserReleaseQueue(userData);
         const limit = scriptConfig.blockLogLimit || 500;
         if (limit > 0) { while (userData.blockedLog.length > limit) userData.blockedLog.shift(); }
-        userData.lastBlockTimestamp = Date.now();
     } catch (error) {
         if (isApiRateLimitError(error)) {
             console.warn(`[Chain Blocker] API 已达上限，暂停队列拉黑 @${userToBlock.screenName || userToBlock.userId}.`, error);
@@ -5835,6 +5845,7 @@ function queueResolvedNukeAuthor(resolvedTarget, userData, whitelistIds, exemptH
         return false;
     }
     const entry = createAuthorQueueEntry(resolvedTarget);
+    if (isQueueEntryDiscardedForLinkedTask(userData, entry)) return false;
     const existingQueueEntry = userData.queue.find((item) => item.userId === authorId);
     if (existingQueueEntry) {
         attachNukeTaskIdsToEntry(existingQueueEntry, getEntryNukeTaskIds(entry));
@@ -5888,10 +5899,20 @@ async function collectChainUsersForResolvedTarget(resolvedTarget, userData, whit
     await collect('点赞列表', 'like', getFavoritersData);
     return totalQueued;
 }
+function isQueueEntryDiscardedForLinkedTask(userData, entry) {
+    const userId = String(entry?.userId || '');
+    const taskIds = getEntryNukeTaskIds(entry);
+    if (!userId || !taskIds.length) return false;
+    const tasksById = new Map((userData?.manualDetectedNukeTasks || []).map((task) => [String(task?.taskId || ''), task]));
+    return taskIds.every((taskId) => {
+        const task = tasksById.get(taskId);
+        return task && normalizeNukeTaskIds(task.discardedUserIds).includes(userId);
+    });
+}
 function selectNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
     const existingUserIds = new Set([...userData.queue.map(u => u.userId), ...userData.blockedLog.map(u => u.userId), ...whitelistIds, ...skipUserIds]);
     const exemptHandleSet = new Set((exemptHandles || []).map(normalizePromoHandle).filter(Boolean));
-    return Array.from(queueById.values()).filter(u => u.userId && u.userId !== currentUserId && !existingUserIds.has(u.userId) && !exemptHandleSet.has(normalizePromoHandle(u.screenName)));
+    return Array.from(queueById.values()).filter(u => u.userId && u.userId !== currentUserId && !existingUserIds.has(u.userId) && !exemptHandleSet.has(normalizePromoHandle(u.screenName)) && !isQueueEntryDiscardedForLinkedTask(userData, u));
 }
 function addNewChainQueueEntries(userData, queueById, whitelistIds, exemptHandles, skipUserIds = new Set()) {
     for (const incomingEntry of queueById.values()) {

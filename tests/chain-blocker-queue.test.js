@@ -35,6 +35,7 @@ function loadHelpers(names) {
         AVATAR_OCR_ENGINE_OFF: 'off',
         AVATAR_OCR_ENGINE_PADDLE: 'paddle',
         AVATAR_OCR_ENGINE_TESSERACT: 'tesseract',
+        currentUserId: 'self',
         buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
     };
     const baseNames = ['normalizeNukeTaskIds', 'mergeNukeTaskIds', 'getEntryNukeTaskIds'];
@@ -646,7 +647,30 @@ test('terminal block failures are discarded from active task stats but stay loca
     assert.equal(discardTerminalManualDetectedNukeFailures(userData), 1);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].queuedUserIds), ['retrying', 'blocked']);
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].failedUserIds), ['retrying', 'blocked']);
+    assert.deepEqual(Array.from(userData.manualDetectedNukeTasks[0].discardedUserIds), ['terminal']);
     assert.deepEqual(Array.from(userData.pendingHiddenUsers, (entry) => entry.userId), ['terminal']);
+});
+
+test('terminal failures cannot re-enter the same nuke task but a new task may retry them', () => {
+    const { isQueueEntryDiscardedForLinkedTask, selectNewChainQueueEntries } = loadHelpers([
+        'isQueueEntryDiscardedForLinkedTask',
+        'selectNewChainQueueEntries'
+    ]);
+    const userData = {
+        queue: [],
+        blockedLog: [],
+        manualDetectedNukeTasks: [
+            { taskId: 'old-task', discardedUserIds: ['terminal'] },
+            { taskId: 'new-task', discardedUserIds: [] }
+        ]
+    };
+    const oldEntry = { userId: 'terminal', screenName: 'retry_me', nukeTaskIds: ['old-task'] };
+    const newEntry = { ...oldEntry, nukeTaskIds: ['new-task'] };
+
+    assert.equal(isQueueEntryDiscardedForLinkedTask(userData, oldEntry), true);
+    assert.equal(isQueueEntryDiscardedForLinkedTask(userData, newEntry), false);
+    assert.deepEqual(Array.from(selectNewChainQueueEntries(userData, new Map([['terminal', oldEntry]]), new Set(), [])), []);
+    assert.deepEqual(Array.from(selectNewChainQueueEntries(userData, new Map([['terminal', newEntry]]), new Set(), []), (entry) => entry.userId), ['terminal']);
 });
 
 test('API failures retain structured X error details', () => {
@@ -1099,6 +1123,20 @@ test('queue countdown uses block pacing api limits and entry retries', () => {
     assert.equal(getNextQueueActionAt({ queue: [{ retryAfter: 80_000 }, { retryAfter: 95_000 }], lastBlockTimestamp: 0 }, null, now, 60_000), 80_000);
     assert.equal(formatQueueCountdown(85_000, now), '01:05');
     assert.equal(formatQueueCountdown(now, now), '00:00');
+});
+
+test('every real block attempt starts the pacing countdown, including failed requests', () => {
+    const { markBlockAttemptStarted } = loadHelpers(['markBlockAttemptStarted']);
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const processQueueSource = extractFunction(source, 'processQueue');
+    const makeApiRequestSource = extractFunction(source, 'makeApiRequest');
+    const userData = { lastBlockTimestamp: 10 };
+
+    assert.equal(markBlockAttemptStarted(userData, 1234), 1234);
+    assert.equal(userData.lastBlockTimestamp, 1234);
+    assert.match(processQueueSource, /blockUserById\(userToBlock\.userId, \(\) => markBlockAttemptStarted\(userData\)\)/);
+    assert.doesNotMatch(processQueueSource, /userData\.lastBlockTimestamp = Date\.now\(\)/);
+    assert.match(makeApiRequestSource, /onStart\?\.\(\)/);
 });
 
 test('panel and toast dynamic values are escaped by default', () => {
