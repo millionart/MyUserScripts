@@ -250,6 +250,54 @@ test('Paddle OCR does not secretly run Tesseract and image IDs are absent', () =
     assert.doesNotMatch(source, /function extractTwitterProfileImageId/);
 });
 
+test('current X user id is parsed from the twid cookie', () => {
+    const { parseTwidUserId } = loadHelpers(['parseTwidUserId']);
+
+    assert.equal(parseTwidUserId('ct0=abc; twid=u%3D15331808; lang=zh-cn'), '15331808');
+    assert.equal(parseTwidUserId('twid="u=42"'), '42');
+    assert.equal(parseTwidUserId('ct0=abc'), '');
+});
+
+test('GraphQL user wrappers normalize ids and core screen names', () => {
+    const { getNormalizedUserIdentity } = loadHelpers([
+        'normalizeTimelineUserResult',
+        'getTimelineUserRestId',
+        'getUserScreenNameFromResult',
+        'getNormalizedUserIdentity'
+    ]);
+    const identity = getNormalizedUserIdentity({
+        result: {
+            user: {
+                rest_id: '99',
+                core: { screen_name: 'CoreName' },
+                legacy: { name: 'Display Name' }
+            }
+        }
+    });
+
+    assert.equal(identity.userId, '99');
+    assert.equal(identity.screenName, 'corename');
+});
+
+test('profile bio lookup waits for its real request instead of leaking it after a local timeout', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const cachedLookupSource = extractFunction(source, 'getCachedProfileBioUserData');
+
+    assert.doesNotMatch(cachedLookupSource, /withProfileBioTimeout/);
+    assert.doesNotMatch(source, /function withProfileBioTimeout/);
+});
+
+test('automatic profile bio scans defer articles outside the nearby viewport', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const scheduleSource = extractFunction(source, 'scheduleProfileBioScanForArticle');
+    const processSource = extractFunction(source, 'processSpamArticle');
+
+    assert.match(scheduleSource, /document\.hidden \|\| !isArticleNearOcrViewport\(article\)/);
+    assert.match(scheduleSource, /deferProfileBioUntilNearViewport/);
+    assert.match(processSource, /scheduleProfileBioScanForArticle/);
+    assert.doesNotMatch(processSource, /enqueueProfileBioScan\(article/);
+});
+
 test('manual detected author resolution puts zero-engagement targets first', () => {
     const { sortManualDetectedCapturesForAuthorResolution } = loadHelpers([
         'isZeroEngagementNukeTarget',

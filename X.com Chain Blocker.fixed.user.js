@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.58
+// @version      2.15.59
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -73,7 +73,6 @@ const AVATAR_OCR_PUMP_STALL_GRACE_MS = 10000;
 const AVATAR_OCR_VISIBLE_REQUEUE_MS = 8000;
 const AVATAR_OCR_VIEWPORT_MARGIN = 500;
 const AVATAR_OCR_USER_IDLE_MS = 800;
-const PROFILE_BIO_SCAN_TIMEOUT_MS = 6500;
 const PROFILE_BIO_STALE_PENDING_MS = 30000;
 const PENDING_HIDDEN_USERS_LIMIT = 2000;
 const HIDDEN_RELEASE_QUEUE_LIMIT = 2000;
@@ -88,6 +87,8 @@ const deferredAvatarOcrUrls = new WeakMap();
 const profileBioCache = new Map();
 const profileBioFetchPending = new Map();
 const profileBioQueue = [];
+const deferredProfileBioArticles = new Set();
+const deferredProfileBioScreenNames = new WeakMap();
 let avatarOcrPumpRunning = false;
 let avatarOcrPumpRunId = 0;
 let avatarOcrActiveStartedAt = 0;
@@ -97,13 +98,14 @@ let avatarOcrResumeTimeoutId = null;
 let avatarOcrLastUserActivityAt = 0;
 let profileBioPumpRunning = false;
 let profileBioActiveArticle = null;
+let profileBioVisibilityObserver = null;
 let avatarOcrTesseractFailed = false;
 let avatarOcrPaddleFailed = false;
 let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.58';
+const SPAM_SCANNER_BUILD = '2.15.59';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -948,6 +950,7 @@ function resetSpamScanMarkersForBuildUpgrade() {
     window.__cbSpamScannerBuild = SPAM_SCANNER_BUILD;
     avatarOcrCache.clear();
     resetAvatarOcrRuntime();
+    clearDeferredProfileBioArticles();
     document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
         delete article.dataset.spamScanned;
         delete article.dataset.avatarOcrQueued;
@@ -3273,6 +3276,7 @@ async function executeManualNukeForDetectedTargets() {
 }
 function finalizeSpamArticleScan(article) {
     if (!article) return;
+    clearDeferredProfileBioArticle(article);
     delete article.dataset.profileBioPending;
     delete article.dataset.profileBioQueued;
     delete article.dataset.profileBioQueuedAt;
@@ -3283,6 +3287,7 @@ function finalizeSpamArticleScan(article) {
 }
 function releaseProfileBioForRetry(article) {
     if (!article) return;
+    clearDeferredProfileBioArticle(article);
     removeProfileBioJobsForArticle(article);
     delete article.dataset.profileBioPending;
     delete article.dataset.profileBioQueued;
@@ -3300,6 +3305,7 @@ function isProfileBioJobActiveForArticle(article) {
 }
 function enqueueProfileBioScan(article, screenName) {
     if (!article || !screenName) return;
+    clearDeferredProfileBioArticle(article);
     const visible = isArticleInViewport(article);
     if ((article.dataset.profileBioPending === 'true' || article.dataset.profileBioQueued === 'true') && !visible) return;
     if (isProfileBioJobActiveForArticle(article)) return;
@@ -3335,6 +3341,67 @@ function isArticleNearOcrViewport(article, viewportHeight = (typeof window !== '
     if (!article?.isConnected || typeof article.getBoundingClientRect !== 'function') return false;
     const rect = article.getBoundingClientRect();
     return rect.bottom > -margin && rect.top < viewportHeight + margin;
+}
+function clearDeferredProfileBioArticle(article) {
+    if (!article) return;
+    deferredProfileBioArticles.delete(article);
+    deferredProfileBioScreenNames.delete(article);
+    delete article.dataset.profileBioDeferred;
+    profileBioVisibilityObserver?.unobserve(article);
+}
+function activateDeferredProfileBioArticle(article) {
+    if (!article?.isConnected || document.hidden || !isArticleNearOcrViewport(article)) return false;
+    const screenName = getArticleAuthorScreenName(article) || deferredProfileBioScreenNames.get(article);
+    clearDeferredProfileBioArticle(article);
+    if (!screenName || scriptConfig.spamIdentifyEnabled === false) return false;
+    delete article.dataset.spamScanned;
+    enqueueProfileBioScan(article, screenName);
+    return true;
+}
+function ensureProfileBioVisibilityObserver() {
+    if (profileBioVisibilityObserver || typeof IntersectionObserver !== 'function') return profileBioVisibilityObserver;
+    profileBioVisibilityObserver = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+            if (entry.isIntersecting) activateDeferredProfileBioArticle(entry.target);
+        });
+    }, { root: null, rootMargin: `${AVATAR_OCR_VIEWPORT_MARGIN}px 0px` });
+    return profileBioVisibilityObserver;
+}
+function deferProfileBioUntilNearViewport(article, screenName) {
+    if (!article?.isConnected || !screenName) return false;
+    finalizeSpamArticleScan(article);
+    article.dataset.profileBioDeferred = 'true';
+    deferredProfileBioArticles.add(article);
+    deferredProfileBioScreenNames.set(article, screenName);
+    ensureProfileBioVisibilityObserver()?.observe(article);
+    return true;
+}
+function scheduleProfileBioScanForArticle(article, screenName) {
+    if (!article?.isConnected || !screenName) return false;
+    if (document.hidden || !isArticleNearOcrViewport(article)) {
+        return deferProfileBioUntilNearViewport(article, screenName);
+    }
+    clearDeferredProfileBioArticle(article);
+    enqueueProfileBioScan(article, screenName);
+    return true;
+}
+function resumeDeferredProfileBioArticles() {
+    for (const article of Array.from(deferredProfileBioArticles)) {
+        if (!article?.isConnected) {
+            clearDeferredProfileBioArticle(article);
+            continue;
+        }
+        activateDeferredProfileBioArticle(article);
+    }
+}
+function clearDeferredProfileBioArticles() {
+    profileBioVisibilityObserver?.disconnect();
+    profileBioVisibilityObserver = null;
+    deferredProfileBioArticles.forEach((article) => {
+        deferredProfileBioScreenNames.delete(article);
+        if (article?.dataset) delete article.dataset.profileBioDeferred;
+    });
+    deferredProfileBioArticles.clear();
 }
 function clearDeferredAvatarOcrArticle(article) {
     if (!article) return;
@@ -3544,7 +3611,7 @@ async function getCachedProfileBioUserData(screenName) {
     const key = screenName.toLowerCase();
     const cached = profileBioCache.get(key);
     if (cached && Date.now() - cached.at < FOLLOWER_COUNT_CACHE_MS) return cached.userResult;
-    if (profileBioFetchPending.has(key)) return withProfileBioTimeout(profileBioFetchPending.get(key));
+    if (profileBioFetchPending.has(key)) return profileBioFetchPending.get(key);
     const pending = (async () => {
         try {
             const userResult = await getUserDataByScreenName(screenName);
@@ -3561,13 +3628,7 @@ async function getCachedProfileBioUserData(screenName) {
         }
     })();
     profileBioFetchPending.set(key, pending);
-    return withProfileBioTimeout(pending);
-}
-function withProfileBioTimeout(promise) {
-    return Promise.race([
-        promise,
-        new Promise((resolve) => window.setTimeout(() => resolve(null), PROFILE_BIO_SCAN_TIMEOUT_MS))
-    ]);
+    return pending;
 }
 function getUserDescriptionFromUserResult(userResult) {
     return String(userResult?.legacy?.description || userResult?.core?.description || userResult?.description || '').trim();
@@ -3597,6 +3658,10 @@ async function pumpProfileBioQueue() {
         while (profileBioQueue.length) {
             const job = takeNextProfileBioJob();
             if (!job?.article?.isConnected) continue;
+            if (document.hidden || !isArticleNearOcrViewport(job.article)) {
+                deferProfileBioUntilNearViewport(job.article, job.screenName);
+                continue;
+            }
             profileBioActiveArticle = job.article;
             let matched = false;
             let deferredForApiLimit = false;
@@ -3788,7 +3853,7 @@ async function processSpamArticle(article) {
         }
     }
     if (shouldCheckProfileBioForArticle(article, tweetText)) {
-        enqueueProfileBioScan(article, getArticleAuthorScreenName(article));
+        scheduleProfileBioScanForArticle(article, getArticleAuthorScreenName(article));
         return;
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
@@ -3893,6 +3958,7 @@ async function runDetectionScanBatch() {
         resetSpamScanMarkersForBuildUpgrade();
         markStatusRootTweetArticles();
         tryExpandHiddenSpamReplies();
+        resumeDeferredProfileBioArticles();
         resumeDeferredAvatarOcrArticles();
         recoverStalledAvatarOcrPump();
         if (articles.length) {
@@ -3978,6 +4044,7 @@ async function scanSpamIdentifyContent(articles = []) {
         document.documentElement.dataset.cbSpamOcrPending = String(document.querySelectorAll('article[data-avatar-ocr-pending="true"]').length);
         document.documentElement.dataset.cbSpamProfileBioQueueLen = String(profileBioQueue.length);
         document.documentElement.dataset.cbSpamProfileBioPending = String(document.querySelectorAll('article[data-profile-bio-pending="true"]').length);
+        document.documentElement.dataset.cbSpamProfileBioDeferred = String(deferredProfileBioArticles.size);
         ensureManualDetectedNukeButton();
     } catch {
         /* probe only */
@@ -4510,19 +4577,32 @@ function skipFailedChainList(label, onCollectFailure) {
     };
 }
 function getCsrfToken() { const e = document.cookie.split("; ").find(e => e.startsWith("ct0=")); return e ? e.split("=")[1] : null; }
+function parseTwidUserId(cookieText = document.cookie) {
+    const cookie = String(cookieText || '').split(/;\s*/).find((part) => part.startsWith('twid='));
+    if (!cookie) return '';
+    let value = cookie.slice(cookie.indexOf('=') + 1).replace(/^"|"$/g, '');
+    try {
+        value = decodeURIComponent(value);
+    } catch {
+        /* use the raw cookie value */
+    }
+    return value.match(/(?:^|&)u=(\d+)/)?.[1] || '';
+}
 function getAuthToken() { return "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"; }
 async function getUserDataByScreenName(screenName) {
     const endpoint = API_ENDPOINTS.UserByScreenName;
     const url = buildGraphqlUrl(endpoint, 'UserByScreenName', {screen_name:screenName,withSafetyModeUserFields:true});
     const data = await makeApiRequest(url);
-    if (data?.data?.user?.result) return data.data.user.result;
+    const identity = getNormalizedUserIdentity(data?.data?.user?.result);
+    if (identity) return identity.user;
     throw new Error(`无法找到用户 @${screenName} 的数据`);
 }
 async function getUserDataById(userId) {
     const endpoint = API_ENDPOINTS.UserByRestId;
     const url = buildGraphqlUrl(endpoint, 'UserByRestId', {userId,withSafetyModeUserFields:true});
     const data = await makeApiRequest(url);
-    if (data?.data?.user?.result) return data.data.user.result;
+    const identity = getNormalizedUserIdentity(data?.data?.user?.result);
+    if (identity) return identity.user;
     throw new Error(`无法找到用户 ID: ${userId} 的数据`);
 }
 function getFollowersCountFromUserResult(userResult) {
@@ -4709,6 +4789,20 @@ function getTimelineUserRestId(userResult) {
     const user = normalizeTimelineUserResult(userResult);
     const id = user?.rest_id || user?.id_str || user?.legacy?.id_str || user?.id;
     return id ? String(id) : '';
+}
+function getUserScreenNameFromResult(userResult) {
+    const user = normalizeTimelineUserResult(userResult);
+    return normalizePromoHandle(user?.core?.screen_name || user?.legacy?.screen_name || user?.screen_name);
+}
+function getNormalizedUserIdentity(userResult) {
+    const user = normalizeTimelineUserResult(userResult);
+    const userId = getTimelineUserRestId(user);
+    if (!user || !userId) return null;
+    return {
+        user: user.rest_id ? user : { ...user, rest_id: userId },
+        userId,
+        screenName: getUserScreenNameFromResult(user)
+    };
 }
 function addTimelineUserResult(users, pageUsers, userResult) {
     const normalizedUser = normalizeTimelineUserResult(userResult);
@@ -5920,13 +6014,25 @@ async function initialize() {
     const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
     if (!profileLink) { setTimeout(initialize, 500); return; }
     try {
-        const screenName = profileLink.href.split('/').pop();
-        const user = await getUserDataByScreenName(screenName);
+        const profileScreenName = normalizePromoHandle(getScreenNameFromProfileHref(profileLink.href));
+        let identity = {
+            userId: parseTwidUserId(),
+            screenName: profileScreenName
+        };
+        if (!identity.userId || !identity.screenName) {
+            const user = await getUserDataByScreenName(profileScreenName);
+            const apiIdentity = getNormalizedUserIdentity(user);
+            identity = {
+                userId: identity.userId || apiIdentity?.userId || '',
+                screenName: identity.screenName || apiIdentity?.screenName || ''
+            };
+        }
+        if (!identity.userId) throw new Error('无法确定当前登录用户 ID');
         clearApiLimitTimers();
         await clearExpiredApiRateLimitState();
         document.getElementById('nuke-api-limit-toast')?.remove();
-        currentUserId = user.rest_id;
-        currentUserScreenName = user.legacy.screen_name;
+        currentUserId = identity.userId;
+        currentUserScreenName = identity.screenName || profileScreenName || 'unknown';
         console.log(`[Chain Blocker] Initialized for @${currentUserScreenName}(ID: ${currentUserId}).`);
         await updateStatusToast();
         ensureManualDetectedNukeButton();
@@ -5978,6 +6084,7 @@ document.addEventListener('visibilitychange', () => {
         noteAvatarOcrUserActivity();
         return;
     }
+    resumeDeferredProfileBioArticles();
     resumeDeferredAvatarOcrArticles();
     scheduleAvatarOcrPumpResume(100);
 });
