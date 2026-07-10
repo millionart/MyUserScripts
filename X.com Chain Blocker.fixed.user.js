@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.66
+// @version      2.15.67
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.66';
+const SPAM_SCANNER_BUILD = '2.15.67';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1554,6 +1554,12 @@ function isPetRoleInviteCompact(compact) {
     if (text.length > 18) return false;
     return /^(?:小狗|狗狗|修狗|小猫|猫猫)(?:求|找|想要).{0,4}(?:主人|主|哥哥|姐姐).{0,4}(?:抱抱|摸摸|收留|带走|领养)[a-z0-9]{0,3}$/i.test(text);
 }
+function isAdultEndorsementContextCompact(compact) {
+    const text = String(compact || '');
+    const subject = '(?:她|他|女大|女高|老师|御姐|人妻|少妇|熟女|妹|姐)';
+    const endorsement = '(?:极品|够劲|带劲|炸裂)';
+    return new RegExp(`${subject}.{0,20}${endorsement}|${endorsement}.{0,20}${subject}`).test(text);
+}
 function isIncidentClipFunnelCompact(compact) {
     const text = String(compact || '').toLowerCase();
     const platform = '(?:快手|抖音|小红书|视频号|微博|b站|bilibili)';
@@ -1606,12 +1612,13 @@ const SPAM_SIGNAL_DEFS = [
     { id: 'adult_persona', label: '成人人设暗语', weight: 1, test: (compact) => /福利[鸡姬]/.test(compact) },
     { id: 'age_tag', label: '年龄标签(30+等)', weight: 1, test: (compact, raw) => /(?:^|[^\d])(?:1[89]|[2-5]\d|60)\+/.test(compact + raw) || /(?:20|30|40|五十|四十|三十|二十)多/.test(compact) || /三十加|四十加|二十加/.test(compact) },
     { id: 'persona_role', label: '职业/人设套词', weight: 1, test: (compact) => /体制内|女老师|老师|护士|御姐|人妻|空姐|校花|女大|熟女|少妇|萝莉|模特|舞蹈生|考研生|女高|单亲|宝妈/.test(compact) },
-    { id: 'explore_tease', label: '探路/花样暗示', weight: 1, test: (compact) => /已探路|探过路|探路|花样多|花样不少|玩法多|会玩|懂玩|经验丰富|去过都说|真会玩/.test(compact) },
+    { id: 'explore_tease', label: '探路/花样暗示', weight: 1, test: (compact) => /已探路|探过路|探路|花样多|花样不少|玩法多|会玩|懂玩|玩(?:得|的)?开|放得开|经验丰富|去过都说|真会玩/.test(compact) },
     { id: 'contrast_tease', label: '反差/返差暗示', weight: 1, test: (compact) => /反差|返差/.test(compact) },
     { id: 'offline_lewd_claim', label: '线下色情经历', weight: 1, test: (compact) => /线下/.test(compact) && /日过|曰过|睡过|约过/.test(compact) },
     { id: 'lewd_reaction', label: '色情反应话术', weight: 1, test: (compact) => /太涩|好涩|真涩|很涩|涩的很|涩了|色了|太色|好色|很色|色的很|顶不住|受不了|扛不住|绷不住|把持不住|定力不够|真顶|顶不住/.test(compact) },
     { id: 'lewd_slang', label: '骚/谐音sao', weight: 1, test: (compact) => /骚货|骚的很|很骚|太骚|真骚|骚死|骚批|比.*?骚/.test(compact) || /[这那][4么麼]?么?骚/.test(compact) || /sao货|sao的很|sao死|sao批|很sao|真sao|太sao|巨sao|sao女|sao姐|sao哥/.test(compact) || /比她sao|比他还sao|没人比.{0,8}?sao|比.*sao/.test(compact) || /第一(?:骚|sao)|第1(?:骚|sao)|最(?:骚|sao)|巨(?:骚|sao)/.test(compact) },
     { id: 'mention_promo', label: '@导流', weight: 1, test: (compact, raw) => /@[a-z0-9_]{2,}/i.test(raw) || /就.{0,8}?@|去@|看@|戳@|关注@/.test(compact) },
+    { id: 'external_link', label: '外部链接', weight: 1, test: (compact, raw) => /https?:\/\/[^\s]+|(?:^|[^a-z0-9])www\.[a-z0-9]/i.test(raw) },
     { id: 'dating_hook', label: '交友/同城套词', weight: 1, test: (compact) => /同城|附近|搭子|固炮|真人|线下|见面|私聊|约会|少妇|姐姐|妹妹/.test(compact) || hasStandaloneDd(compact) },
     { id: 'adult_experience_claim', label: '线下体验暗示', weight: 1, test: (compact) => /线下|真人|真实/.test(compact) && /宝宝|妹妹|姐姐|身材|福利/.test(compact) && /我(?:试|試)过|(?:试|試)过了|真的?很不错|身材(?:特棒|很好|不错)|特棒/.test(compact) },
     { id: 'short_dating_invite', label: '短句交友导流', weight: 3, test: (compact) => isShortDatingInviteCompact(compact) },
@@ -1669,6 +1676,7 @@ function detectSpamReply(text, options = {}) {
     const personaHit = signals.some((s) => s.id === 'persona_role');
     const exploreHit = signals.some((s) => s.id === 'explore_tease');
     const ageHit = signals.some((s) => s.id === 'age_tag');
+    const adultEndorsementHit = isAdultEndorsementContextCompact(compact);
     let match = score >= minScore;
     if (!match && templateHit) match = true;
     if (!match && driveHit && score >= 2) match = true;
@@ -1679,6 +1687,7 @@ function detectSpamReply(text, options = {}) {
     if (!match && mentionHit && personaHit && (exploreHit || ageHit || lewdReactionHit || lewdSlangHit)) match = true;
     if (!match && mentionHit && exploreHit && personaHit) match = true;
     if (!match && mentionHit && ageHit && personaHit) match = true;
+    if (!match && mentionHit && exploreHit && adultEndorsementHit) match = true;
     return { match, score, signals, summary: signals.map((s) => s.label).join('、') };
 }
 function getTweetTextFromArticle(article) {

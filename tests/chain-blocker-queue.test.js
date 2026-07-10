@@ -10,7 +10,8 @@ function extractFunction(source, name) {
     const marker = `function ${name}(`;
     const start = source.indexOf(marker);
     if (start < 0) throw new Error(`Missing function ${name}`);
-    const braceStart = source.indexOf('{', start);
+    const signatureEnd = source.indexOf(') {', start);
+    const braceStart = signatureEnd >= 0 ? signatureEnd + 2 : source.indexOf('{', start);
     let depth = 0;
     for (let i = braceStart; i < source.length; i += 1) {
         const char = source[i];
@@ -61,6 +62,47 @@ function loadAutoBlockDecisionHelpers() {
     ].join('\n');
     vm.runInNewContext(code, sandbox);
     return sandbox.module.exports;
+}
+
+function loadSpamDetector() {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const constLine = (name) => {
+        const start = source.indexOf(`const ${name} = `);
+        if (start < 0) throw new Error(`Missing constant ${name}`);
+        return source.slice(start, source.indexOf('\n', start));
+    };
+    const signalStart = source.indexOf('const SPAM_SIGNAL_DEFS = [');
+    const signalEnd = source.indexOf('\n];', signalStart);
+    const helperNames = [
+        'isShortDatingInviteCompact',
+        'hasStandaloneDd',
+        'extractSpamEmojiChars',
+        'spamEmojiBucket',
+        'isEmojiOnlyBaitText',
+        'isShortLocationInviteCompact',
+        'isPetRoleInviteCompact',
+        'isAdultEndorsementContextCompact',
+        'isIncidentClipFunnelCompact',
+        'isAdultPlatformClipFunnelCompact',
+        'normalizeSpamText',
+        'compactSpamText',
+        'compactSpamTextVariants',
+        'detectSpamReply'
+    ];
+    const code = [
+        'const DEFAULT_SPAM_IDENTIFY_MIN_SCORE = 3;',
+        'const scriptConfig = { spamIdentifyMinScore: 3 };',
+        constLine('SPAM_ZERO_WIDTH_RE'),
+        constLine('SPAM_CJK_PUNCT_RE'),
+        constLine('SPAM_ASCII_NOISE_BETWEEN_CJK_RE'),
+        ...helperNames.slice(0, 10).map((name) => extractFunction(source, name)),
+        source.slice(signalStart, signalEnd + 3),
+        ...helperNames.slice(10).map((name) => extractFunction(source, name)),
+        'module.exports = { detectSpamReply };'
+    ].join('\n');
+    const sandbox = { module: { exports: {} } };
+    vm.runInNewContext(code, sandbox);
+    return sandbox.module.exports.detectSpamReply;
 }
 
 function loadManualCaptureHelpers() {
@@ -1008,6 +1050,21 @@ test('panel and toast dynamic values are escaped by default', () => {
     assert.match(showToastSource, /titleEl\.textContent/);
     assert.match(showToastSource, /statusEl\.textContent/);
     assert.doesNotMatch(showToastSource, /toast\.innerHTML/);
+});
+
+test('spam detection combines general links and adult endorsement context', () => {
+    const detectSpamReply = loadSpamDetector();
+    const linkFunnel = detectSpamReply('06女大真的花样多啊\n有点炸裂呢够劲嘻嘻\n\nhttp://t.cn/AXoHAs3g');
+    const mentionFunnel = detectSpamReply('应该没人比她玩的开了吧 Pj真极品 2W @clarab198013');
+    const genericLink = detectSpamReply('女高花样不少，点开看看 https://example.org/a');
+
+    assert.equal(linkFunnel.match, true);
+    assert.ok(Array.from(linkFunnel.signals, (signal) => signal.id).includes('external_link'));
+    assert.equal(mentionFunnel.match, true);
+    assert.equal(genericLink.match, true);
+    assert.equal(detectSpamReply('女大学生分享社团活动，花样很多，这场比赛很炸裂').match, false);
+    assert.equal(detectSpamReply('这个开源项目玩法多，真极品 @developer').match, false);
+    assert.equal(detectSpamReply('123').match, false);
 });
 
 test('tweet detail user extraction unwraps visibility result tweets', () => {
