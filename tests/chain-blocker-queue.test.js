@@ -519,7 +519,7 @@ test('manual detected execution batches page hiding and restores its viewport an
     assert.match(captureSource, /!options\.deferPageHide/);
 });
 
-test('panel toggle remains available with a panel and shifts above the manual button', () => {
+test('manual button sits above the panel toggle', () => {
     const { getUnifiedToastPanelToggleLabel } = loadHelpers([
         'getUnifiedToastPanelToggleLabel'
     ]);
@@ -528,7 +528,8 @@ test('panel toggle remains available with a panel and shifts above the manual bu
 
     assert.equal(getUnifiedToastPanelToggleLabel(false), '收起队列面板');
     assert.equal(getUnifiedToastPanelToggleLabel(true), '展开队列面板');
-    assert.match(source, /#nuke-toast-panel-toggle-button\.nuke-toast-panel-toggle-with-manual\{bottom:213px\}/);
+    assert.match(source, /#nuke-manual-detected-nuke-button\{bottom:213px\}/);
+    assert.match(source, /#nuke-toast-panel-toggle-button\.nuke-toast-panel-toggle-with-manual\{bottom:146px\}/);
     assert.match(source, /#nuke-toast-panel\.nuke-toast-panel-collapsed\{display:none!important\}/);
     assert.match(source, /#nuke-toast-panel\{[^}]*z-index:10/);
     assert.match(source, /#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button\{[^}]*z-index:10/);
