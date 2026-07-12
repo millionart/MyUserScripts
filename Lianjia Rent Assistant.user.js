@@ -2,7 +2,7 @@
 // @name         Lianjia Rent Assistant
 // @name:zh-CN   链家租房助手
 // @namespace    http://tampermonkey.net/
-// @version      0.5.34
+// @version      0.5.39
 // @description  Enhance Lianjia rent pages with helper controls and listing tools.
 // @description:zh-CN 增强链家租房列表页，提供筛选辅助和房源工具。
 // @author       codex
@@ -22,7 +22,7 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '0.5.34';
+const SCRIPT_VERSION = '0.5.39';
 const STORAGE_KEY = 'LIANJIA_RENT_CONTENT_FILTER_STATE';
 const MAP_CACHE_STORAGE_KEY = 'LIANJIA_RENT_MAP_LISTING_CACHE';
 const AUTO_FETCH_STORAGE_KEY = 'LIANJIA_RENT_MAP_AUTO_FETCH_STATE';
@@ -39,6 +39,7 @@ const MAP_DETAIL_FETCH_LIMIT = 1;
 const MAP_DETAIL_FETCH_DELAY_MS = 4000;
 const MAP_DETAIL_FETCH_TIMEOUT_MS = 10000;
 const MAP_OVERLAY_BATCH_SIZE = 40;
+const MAP_CLUSTER_MIN_RECORDS = 40;
 const DEFAULT_MAP_HEIGHT = 360;
 const MIN_MAP_HEIGHT = 240;
 const MAX_MAP_HEIGHT = 1200;
@@ -269,6 +270,52 @@ function normalizeNextPageFetchMode(value) {
 
 function normalizeShowAllFetchedOnMap(value) {
     return value === true || value === 1 || String(value || '').trim() === 'true' || String(value || '').trim() === '1';
+}
+
+function normalizePriceRange(value) {
+    const min = Number(value?.min);
+    const max = Number(value?.max);
+    const range = {};
+    if (Number.isFinite(min) && min >= 0) range.min = min;
+    if (Number.isFinite(max) && max >= 0) range.max = max;
+    return range.min !== undefined || range.max !== undefined ? range : null;
+}
+
+function normalizeNativeMapFilterState(value) {
+    const priceRanges = Array.isArray(value?.priceRanges)
+        ? value.priceRanges.map(normalizePriceRange).filter(Boolean)
+        : [];
+    return { priceRanges };
+}
+
+function parseListingPriceAmount(value) {
+    const match = /(\d+(?:\.\d+)?)/.exec(String(value || '').replace(/,/g, ''));
+    return match ? Number(match[1]) : 0;
+}
+
+function parsePriceRangeText(value) {
+    const text = String(value || '').replace(/\s+/g, '');
+    const between = /(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)/.exec(text);
+    if (between) return normalizePriceRange({ min: between[1], max: between[2] });
+    const max = /(?:≤|<=|<)(\d+(?:\.\d+)?)/.exec(text);
+    if (max) return normalizePriceRange({ max: max[1] });
+    const min = /(?:≥|>=|>)(\d+(?:\.\d+)?)/.exec(text);
+    return min ? normalizePriceRange({ min: min[1] }) : null;
+}
+
+function matchesPriceRanges(record, priceRanges) {
+    if (!priceRanges.length) return true;
+    const price = parseListingPriceAmount(record?.price);
+    if (!price) return false;
+    return priceRanges.some((range) => {
+        return (range.min === undefined || price >= range.min)
+            && (range.max === undefined || price <= range.max);
+    });
+}
+
+function filterMapRecordsByNativeState(records, nativeFilterState) {
+    const filters = normalizeNativeMapFilterState(nativeFilterState);
+    return records.filter((record) => matchesPriceRanges(record, filters.priceRanges));
 }
 
 function getAutoFetchNextPage(state, searchKey, currentPage, totalPage) {
@@ -511,8 +558,11 @@ function getSearchCacheRecords(cache, searchKey, filterState) {
     });
 }
 
-function getAllFetchedMapRecords(cache) {
-    return Object.values(parseStoredMapCache(cache).listings).filter((record) => normalizeMapPoint(record.point));
+function getAllFetchedMapRecords(cache, filterState, nativeFilterState) {
+    return filterMapRecordsByNativeState(filterMapRecordsByState(
+        Object.values(parseStoredMapCache(cache).listings).filter((record) => normalizeMapPoint(record.point)),
+        filterState
+    ), nativeFilterState);
 }
 
 function formatShowAllFetchedText(count) {
@@ -582,6 +632,30 @@ function groupMapRecordsByPoint(records, precision = getMapPointGroupPrecision(r
         groupMap.get(groupKey).records.push({ ...record, point });
     });
     return groups;
+}
+
+function getSingleMapRecordGroups(records) {
+    return records.map((record, index) => {
+        const point = normalizeMapPoint(record?.point);
+        if (!point) return null;
+        const key = String(record?.key || '').trim() || `index:${index}`;
+        return {
+            key: `single:${key}`,
+            point,
+            records: [{ ...record, point }]
+        };
+    }).filter(Boolean);
+}
+
+function shouldClusterMapRecords(total) {
+    return Math.max(0, Math.round(Number(total) || 0)) > MAP_CLUSTER_MIN_RECORDS;
+}
+
+function getMapRenderGroups(records, zoom, showAllFetched) {
+    if (!shouldClusterMapRecords(records?.length)) {
+        return getSingleMapRecordGroups(records || []);
+    }
+    return groupMapRecordsByPoint(records || [], getMapRenderGroupPrecision(records.length, zoom, showAllFetched));
 }
 
 function filterMapRecordsByState(records, filterState) {
@@ -849,6 +923,26 @@ function getCurrentFilterState(row) {
         beikePreferred: row.querySelector('[data-lj-content-filter-option="beikePreferred"]')?.checked,
         apartment: row.querySelector('[data-lj-content-filter-option="apartment"]')?.checked,
         guessYouLike: row.querySelector('[data-lj-content-filter-option="guessYouLike"]')?.checked
+    });
+}
+
+function getSelectedCheckboxTexts(row) {
+    const labels = Array.from(row?.querySelectorAll?.('label') || []);
+    const items = labels.length ? labels : Array.from(row?.querySelectorAll?.('li') || []);
+    return items.map((item) => {
+        const input = item.querySelector?.('input[type="checkbox"]');
+        if (!input?.checked) return '';
+        const clone = item.cloneNode?.(true);
+        clone?.querySelectorAll?.('input')?.forEach((node) => node.remove());
+        return (clone.textContent || '').replace(/\s+/g, '').trim();
+    }).filter(Boolean);
+}
+
+function getCurrentNativeMapFilterState() {
+    const priceRow = Array.from(document.querySelectorAll('#filter .filter__ul'))
+        .find((row) => getAsideText(row) === '租金');
+    return normalizeNativeMapFilterState({
+        priceRanges: getSelectedCheckboxTexts(priceRow).map(parsePriceRangeText).filter(Boolean)
     });
 }
 
@@ -1148,7 +1242,7 @@ function mergeMapRecordsByKey(records) {
 function getCurrentMapRecords() {
     const cache = ensureMapCache();
     if (getShowAllFetchedOnMap()) {
-        const allRecords = getAllFetchedMapRecords(cache);
+        const allRecords = getAllFetchedMapRecords(cache, getCurrentMapFilterState(), getCurrentNativeMapFilterState());
         allRecords.forEach((record) => {
             mapState.fetchedListings.set(record.key, record);
         });
@@ -1160,12 +1254,13 @@ function getCurrentMapRecords() {
         ...getSearchCacheRecords(cache, searchKey, getCurrentMapFilterState()),
         ...getVisibleMapRecords()
     ]), cache);
-    records.forEach((record) => {
+    const filteredRecords = filterMapRecordsByNativeState(records, getCurrentNativeMapFilterState());
+    filteredRecords.forEach((record) => {
         if (record.point) {
             mapState.fetchedListings.set(record.key, record);
         }
     });
-    return records;
+    return filteredRecords;
 }
 
 function findResultTitle() {
@@ -1468,7 +1563,7 @@ function buildShowAllFetchedControl() {
 
     const text = document.createElement('span');
     text.dataset.ljRentShowAllFetchedText = 'true';
-    text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache()).length);
+    text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache(), getCurrentMapFilterState(), getCurrentNativeMapFilterState()).length);
 
     input.addEventListener('change', () => {
         saveShowAllFetchedOnMap(input.checked);
@@ -1482,7 +1577,7 @@ function buildShowAllFetchedControl() {
 function updateShowAllFetchedText() {
     const text = document.querySelector('[data-lj-rent-show-all-fetched-text="true"]');
     if (text) {
-        text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache()).length);
+        text.textContent = formatShowAllFetchedText(getAllFetchedMapRecords(ensureMapCache(), getCurrentMapFilterState(), getCurrentNativeMapFilterState()).length);
     }
 }
 
@@ -1814,6 +1909,10 @@ function scheduleMapOverlayBatch(callback) {
     window.setTimeout(callback, 0);
 }
 
+function getBackgroundMapRenderOptions(map) {
+    return map ? { preserveViewport: true } : {};
+}
+
 function getMapGroupInfoRecord(group) {
     const records = Array.isArray(group?.records) ? group.records : [];
     return records[0];
@@ -1940,7 +2039,7 @@ function renderListingMap(options = {}) {
         clearMapOverlaysIfPresent(map);
         const visibleRecords = options.preserveViewport ? filterRecordsByMapBounds(mappedRecords, map, BMap) : mappedRecords;
         const zoom = typeof map.getZoom === 'function' ? map.getZoom() : 0;
-        const markerGroups = groupMapRecordsByPoint(visibleRecords, getMapRenderGroupPrecision(visibleRecords.length, zoom, getShowAllFetchedOnMap()));
+        const markerGroups = getMapRenderGroups(visibleRecords, zoom, getShowAllFetchedOnMap());
         if (!markerGroups.length) {
             updateMapStatus(records);
             return;
@@ -2312,7 +2411,7 @@ function processMapQueue() {
             mapState.activeFetches -= 1;
             mapState.lastMapFetchFinishedAt = Date.now();
             mapState.queuedKeys.delete(record.key);
-            renderListingMap();
+            renderListingMap(getBackgroundMapRenderOptions(mapState.map));
             if (!mapState.blocked) {
                 processMapQueue();
             }
@@ -2396,7 +2495,7 @@ function refreshMapAfterAutoFetchStep() {
     enqueueMapRecords(currentRecords);
     updateMapStatus(currentRecords);
     processMapQueue();
-    renderListingMap();
+    renderListingMap(getBackgroundMapRenderOptions(mapState.map));
 }
 
 function pauseForCaptchaRetry() {
@@ -2464,6 +2563,7 @@ function refreshListingMap() {
 
     const searchKey = getCurrentSearchKey();
     rememberMapRecords(filterMapRecordsByState(getLoadedMapRecords(), getCurrentMapFilterState()), searchKey);
+    updateShowAllFetchedText();
     const records = getCurrentMapRecords();
     enqueueMapRecords(records);
     updateMapStatus(records);
@@ -2694,6 +2794,7 @@ const api = {
     extractMapPointFromDetailHtml,
     extractPreviewImageFromDetailHtml,
     fetchWithTimeout,
+    filterMapRecordsByNativeState,
     filterMapRecordsByState,
     filterNewListingKeys,
     formatShowAllFetchedText,
@@ -2702,6 +2803,7 @@ const api = {
     getAutoFetchRetryDelay,
     getAutoFetchRetryStatusText,
     getAllFetchedMapRecords,
+    getBackgroundMapRenderOptions,
     getMapClusterSplitZoom,
     getCoordinateSourceSequence,
     getListingDetailUrl,
@@ -2709,11 +2811,13 @@ const api = {
     getListingKey,
     getMapOverlayBatchSize,
     getMapPointGroupPrecision,
+    getMapRenderGroups,
     getMapRenderGroupPrecision,
     isSubwaySwitchLinkText,
     insertMapPanel,
     getMapQueueWaitMs,
     getMapRenderProgressText,
+    getSelectedCheckboxTexts,
     getSearchCacheRecords,
     groupMapRecordsByPoint,
     hydrateMapRecordsFromCache,
@@ -2723,6 +2827,7 @@ const api = {
     normalizeAutoFetchState,
     normalizeCoordinateSource,
     normalizeMapHeight,
+    normalizeNativeMapFilterState,
     normalizeNextPageFetchMode,
     normalizePreviewImageUrl,
     normalizeShowAllFetchedOnMap,

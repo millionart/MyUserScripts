@@ -37,6 +37,7 @@ const {
     getAutoFetchPageDelay,
     getAllFetchedMapRecords,
     getMapClusterSplitZoom,
+    getBackgroundMapRenderOptions,
     getCoordinateSourceSequence,
     getListingDetailUrl,
     getListingKeyFromDetailUrl,
@@ -44,8 +45,10 @@ const {
     getMapQueueWaitMs,
     getMapOverlayBatchSize,
     getMapPointGroupPrecision,
+    getMapRenderGroups,
     getMapRenderGroupPrecision,
     getMapRenderProgressText,
+    getSelectedCheckboxTexts,
     groupMapRecordsByPoint,
     isSubwaySwitchLinkText,
     getSearchCacheRecords,
@@ -57,6 +60,7 @@ const {
     normalizeAutoFetchState,
     normalizeCoordinateSource,
     normalizeMapHeight,
+    normalizeNativeMapFilterState,
     normalizeNextPageFetchMode,
     normalizePreviewImageUrl,
     normalizeShowAllFetchedOnMap,
@@ -68,7 +72,8 @@ const {
     releaseQueuedMapRecordKeys,
     resetAutoFetchRetry,
     serializeFilterState,
-    shouldShowListing
+    shouldShowListing,
+    filterMapRecordsByNativeState
 } = require('../Lianjia Rent Assistant.user.js');
 
 const script = fs.readFileSync(path.join(__dirname, '..', 'Lianjia Rent Assistant.user.js'), 'utf8');
@@ -154,6 +159,44 @@ test('show-all map grouping gets finer as the user zooms in', () => {
     assert.equal(getMapRenderGroupPrecision(791, 17, true), 5);
     assert.equal(getMapRenderGroupPrecision(791, 12, false), 2);
     assert.equal(getMapRenderGroupPrecision(791, 16, false), 5);
+});
+
+test('small visible map record sets render as individual markers', () => {
+    const groups = getMapRenderGroups([{
+        key: 'house:SH1',
+        point: { longitude: 121.4001, latitude: 31.2001 }
+    }, {
+        key: 'house:SH2',
+        point: { longitude: 121.4001, latitude: 31.2001 }
+    }], 12, true);
+
+    assert.deepEqual(groups.map((group) => ({
+        key: group.key,
+        count: group.records.length
+    })), [{
+        key: 'single:house:SH1',
+        count: 1
+    }, {
+        key: 'single:house:SH2',
+        count: 1
+    }]);
+});
+
+test('large visible map record sets still use clustered markers', () => {
+    const records = Array.from({ length: 41 }, (_, index) => ({
+        key: `house:SH${index}`,
+        point: { longitude: 121.4001, latitude: 31.2001 }
+    }));
+
+    const groups = getMapRenderGroups(records, 12, true);
+
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].records.length, 41);
+});
+
+test('background map refreshes preserve viewport after map exists', () => {
+    assert.deepEqual(getBackgroundMapRenderOptions(null), {});
+    assert.deepEqual(getBackgroundMapRenderOptions({}), { preserveViewport: true });
 });
 
 test('cluster marker clicks zoom in until the maximum split level', () => {
@@ -803,6 +846,130 @@ test('all fetched map records return every cached listing with coordinates', () 
         getAllFetchedMapRecords(cache).map((record) => record.key),
         ['house:SH1', 'house:SH2']
     );
+});
+
+test('all fetched map records respect current content filters', () => {
+    const cache = mergeMapCacheRecords(parseStoredMapCache(null), [{
+        key: 'house:SH1',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
+        title: '普通房源',
+        price: '3000 元/月',
+        point: { longitude: 121.4, latitude: 31.2 },
+        kinds: { beikePreferred: false, apartment: false, guessYouLike: false }
+    }, {
+        key: 'house:SH2',
+        detailUrl: 'https://sh.lianjia.com/apartment/SH2.html',
+        title: '公寓房源',
+        price: '2500 元/月',
+        point: { longitude: 121.5, latitude: 31.3 },
+        kinds: { beikePreferred: false, apartment: true, guessYouLike: false }
+    }, {
+        key: 'house:SH3',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH3.html',
+        title: '猜你喜欢房源',
+        price: '2800 元/月',
+        point: { longitude: 121.6, latitude: 31.4 },
+        kinds: { beikePreferred: false, apartment: false, guessYouLike: true }
+    }], 99, '/ditiezufang/pg{page}/');
+
+    assert.deepEqual(
+        getAllFetchedMapRecords(cache, { beikePreferred: true, apartment: false, guessYouLike: false }).map((record) => record.key),
+        ['house:SH1']
+    );
+});
+
+test('all fetched map records respect selected price ranges', () => {
+    const nativeFilters = {
+        priceRanges: [{ min: 2500, max: 3500 }]
+    };
+    const cache = mergeMapCacheRecords(parseStoredMapCache(null), [{
+        key: 'house:SH1',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH1.html',
+        title: '整租·普通小区 1室1厅 南',
+        price: '3000 元/月',
+        point: { longitude: 121.4, latitude: 31.2 }
+    }, {
+        key: 'house:SH2',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH2.html',
+        title: '整租·太贵小区 1室1厅 南',
+        price: '4500 元/月',
+        point: { longitude: 121.5, latitude: 31.3 }
+    }, {
+        key: 'house:SH3',
+        detailUrl: 'https://sh.lianjia.com/zufang/SH3.html',
+        title: '价格缺失旧缓存',
+        point: { longitude: 121.6, latitude: 31.4 }
+    }], 99, '/ditiezufang/pg{page}/');
+
+    assert.deepEqual(
+        getAllFetchedMapRecords(cache, DEFAULT_FILTER_STATE, nativeFilters).map((record) => record.key),
+        ['house:SH1']
+    );
+});
+
+test('native checkbox filter text is read from list items', () => {
+    const checkedInput = {
+        checked: true,
+        remove() {}
+    };
+    const uncheckedInput = {
+        checked: false,
+        remove() {}
+    };
+    const checkedItem = {
+        textContent: '2500-3500元',
+        querySelector(selector) {
+            return selector === 'input[type="checkbox"]' ? checkedInput : null;
+        },
+        cloneNode() {
+            return {
+                textContent: this.textContent,
+                querySelectorAll(selector) {
+                    return selector === 'input' ? [checkedInput] : [];
+                }
+            };
+        }
+    };
+    const uncheckedItem = {
+        textContent: '3500-4500元',
+        querySelector(selector) {
+            return selector === 'input[type="checkbox"]' ? uncheckedInput : null;
+        },
+        cloneNode() {
+            return {
+                textContent: this.textContent,
+                querySelectorAll(selector) {
+                    return selector === 'input' ? [uncheckedInput] : [];
+                }
+            };
+        }
+    };
+    const row = {
+        querySelectorAll(selector) {
+            return selector === 'label' ? [] : [checkedItem, uncheckedItem];
+        }
+    };
+
+    assert.deepEqual(getSelectedCheckboxTexts(row), ['2500-3500元']);
+});
+
+test('native price filters can be applied to current map records', () => {
+    const records = [{
+        key: 'house:SH1',
+        price: '3000 元/月'
+    }, {
+        key: 'house:SH2',
+        price: '4500 元/月'
+    }];
+
+    assert.deepEqual(
+        filterMapRecordsByNativeState(records, normalizeNativeMapFilterState({ priceRanges: [{ min: 2500, max: 3500 }] })).map((record) => record.key),
+        ['house:SH1']
+    );
+});
+
+test('current map records are filtered by native price state before rendering', () => {
+    assert.match(script, /filterMapRecordsByNativeState\(records,\s*getCurrentNativeMapFilterState\(\)\)/);
 });
 
 test('auto fetch skips map records hidden by current content filters', () => {
