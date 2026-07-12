@@ -123,8 +123,8 @@ function loadManualCaptureHelpers() {
         buildManualDetectedNukeTrigger: (article) => ({ triggerId: article.id }),
         getArticleEngagementCounts: () => ({ replies: 0, retweets: 0, likes: 0 }),
         getChainExemptHandlesForTarget: () => [],
-        captureNukeTargetForImmediateHide: (article, trigger) => {
-            sandbox.calls.push(`capture:${article.id}:${trigger.triggerId}`);
+        captureNukeTargetForImmediateHide: (article, trigger, userData, options) => {
+            sandbox.calls.push(`capture:${article.id}:${trigger.triggerId}:${options?.deferPageHide ? 'deferred' : 'immediate'}`);
             return { authorHandle: article.id, trigger };
         }
     };
@@ -473,9 +473,9 @@ test('manual detected nuke captures every detected target before background reso
     ];
     const userData = {};
 
-    const jobs = captureManualDetectedNukeTargets(articles, userData);
+    const jobs = captureManualDetectedNukeTargets(articles, userData, { deferPageHide: true });
 
-    assert.deepEqual(calls, ['capture:first:first', 'capture:second:second']);
+    assert.deepEqual(calls, ['capture:first:first:deferred', 'capture:second:second:deferred']);
     assert.deepEqual(Array.from(jobs, (job) => job.article.id), ['first', 'second']);
     assert.equal(articles[0].dataset.autoblockTriggered, 'true');
     assert.equal(articles[1].dataset.autoblockTriggered, 'true');
@@ -490,6 +490,35 @@ test('manual detected button is disabled only during capture or when no targets 
     assert.equal(shouldDisableManualDetectedNukeButton(false, 2), false);
 });
 
+test('manual batch hide anchors the viewport to the nearest unaffected tweet', () => {
+    const { selectManualDetectedViewportAnchor } = loadHelpers([
+        'getManualDetectedViewportAnchorDistance',
+        'selectManualDetectedViewportAnchor'
+    ]);
+    const article = (id, handle, rect) => ({ id, handle, isConnected: true, getBoundingClientRect: () => rect });
+    const articles = [
+        article('hidden', 'target', { top: 10, bottom: 110, height: 100 }),
+        article('near', 'safe', { top: 140, bottom: 240, height: 100 }),
+        article('far', 'other', { top: 900, bottom: 1000, height: 100 })
+    ];
+
+    const anchor = selectManualDetectedViewportAnchor(articles, new Set(['target']), 800, (item) => item.handle);
+
+    assert.equal(anchor.id, 'near');
+});
+
+test('manual detected execution batches page hiding and restores its viewport anchor', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const executeSource = extractFunction(source, 'executeManualNukeForDetectedTargets');
+    const captureSource = extractFunction(source, 'captureNukeTargetForImmediateHide');
+
+    assert.match(executeSource, /deferPageHide: true/);
+    assert.match(executeSource, /captureManualDetectedViewportState\(hiddenHandles\)/);
+    assert.match(executeSource, /hideArticlesByHandles\(hiddenHandles\)/);
+    assert.match(executeSource, /restoreManualDetectedViewportState\(viewportState\)/);
+    assert.match(captureSource, /!options\.deferPageHide/);
+});
+
 test('panel toggle remains available with a panel and shifts above the manual button', () => {
     const { getUnifiedToastPanelToggleLabel } = loadHelpers([
         'getUnifiedToastPanelToggleLabel'
@@ -501,10 +530,34 @@ test('panel toggle remains available with a panel and shifts above the manual bu
     assert.equal(getUnifiedToastPanelToggleLabel(true), '展开队列面板');
     assert.match(source, /#nuke-toast-panel-toggle-button\.nuke-toast-panel-toggle-with-manual\{bottom:213px\}/);
     assert.match(source, /#nuke-toast-panel\.nuke-toast-panel-collapsed\{display:none!important\}/);
+    assert.match(source, /#nuke-toast-panel\{[^}]*z-index:10/);
+    assert.match(source, /#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button\{[^}]*z-index:10/);
+    assert.match(source, /body:has\(\[role="dialog"\]\[aria-modal="true"\]\)[^}]*visibility:hidden!important;pointer-events:none!important/);
     assert.match(toggleSource, /nuke-manual-detected-nuke-button/);
     assert.match(toggleSource, /!manualButton && !panel/);
     assert.match(toggleSource, /nuke-toast-panel-toggle-with-manual/);
     assert.match(toggleSource, /aria-controls/);
+});
+
+test('manual task panel is hidden after both list-building stages reach zero', () => {
+    const { shouldShowManualDetectedNukeTaskToast } = loadHelpers([
+        'getManualDetectedNukeTaskTweetIds',
+        'getManualDetectedNukeTaskStats',
+        'shouldShowManualDetectedNukeTaskToast'
+    ]);
+    const userData = { queue: [], blockedLog: [] };
+    const pendingTask = {
+        status: 'running',
+        captures: [{ status: 'pending', tweetContext: { tweetId: 'pending' }, engagementCounts: { replies: 1, retweets: 0 } }]
+    };
+    const transferredTask = {
+        status: 'queued',
+        collectedTweetIds: ['done'],
+        captures: [{ status: 'resolved', tweetContext: { tweetId: 'done' }, engagementCounts: { replies: 1, retweets: 0 } }]
+    };
+
+    assert.equal(shouldShowManualDetectedNukeTaskToast(pendingTask, userData), true);
+    assert.equal(shouldShowManualDetectedNukeTaskToast(transferredTask, userData), false);
 });
 
 test('manual detected nuke task status leaves queue execution progress to the global status', () => {
@@ -1132,15 +1185,22 @@ test('unified toast entries update by id inside one panel list', () => {
     assert.equal(entries[0].updatedAt, 300);
 });
 
-test('unified toast panel placement follows right sidebar width and edge', () => {
+test('unified toast panel keeps sidebar width and anchors beside its toggle', () => {
     const { getUnifiedToastPanelPlacement } = loadHelpers([
         'getUnifiedToastPanelPlacement'
     ]);
 
-    const placement = getUnifiedToastPanelPlacement({ width: 350, right: 1220 }, 1280);
+    const placement = getUnifiedToastPanelPlacement(
+        { width: 350, right: 1220 },
+        1280,
+        { left: 1205, bottom: 600 },
+        813
+    );
 
-    assert.equal(placement.right, 60);
+    assert.equal(placement.right, 87);
+    assert.equal(placement.bottom, 213);
     assert.equal(placement.width, 350);
+    assert.match(extractFunction(fs.readFileSync(sourcePath, 'utf8'), 'syncUnifiedToastPanelPlacement'), /document\.documentElement\.clientWidth/);
 });
 
 test('queue countdown uses block pacing api limits and entry retries', () => {

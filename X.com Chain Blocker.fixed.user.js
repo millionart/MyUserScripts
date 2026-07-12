@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.77
+// @version      2.15.80
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.77';
+const SPAM_SCANNER_BUILD = '2.15.80';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1064,8 +1064,8 @@ GM_addStyle(`.nuke-toast{position:fixed;top:20px;right:20px;z-index:100000;backg
 GM_addStyle(`.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-fill{fill:#00ba7c}.nuke-ocr-engine-status--ready .nuke-ocr-engine-done-check{fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}`);
 GM_addStyle(`.nuke-settings-module{border-top:1px solid #253341;padding-top:14px;margin-top:14px}.nuke-settings-module:first-child{border-top:0;padding-top:0;margin-top:0}.nuke-settings-module-title{font-size:13px;font-weight:700;color:#eff3f4;margin:0 0 10px}`);
 GM_addStyle(`.nuke-aggregated-toast-summary{font-weight:700;margin-bottom:4px}.nuke-aggregated-toast-line{color:#d7dbdc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}`);
-GM_addStyle(`#nuke-toast-panel{position:fixed;right:var(--nuke-toast-panel-right,20px);bottom:20px;z-index:100000;width:var(--nuke-toast-panel-width,min(360px,calc(100vw - 40px)));max-height:min(420px,calc(100vh - 40px));box-sizing:border-box;background:rgb(22,24,28);color:#e7e9ea;border:1px solid rgb(47,51,54);border-radius:16px;box-shadow:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow:hidden}#nuke-toast-panel.nuke-toast-panel-empty{display:none}.nuke-toast-panel-list{display:flex;flex-direction:column;gap:0;max-height:min(420px,calc(100vh - 40px));overflow-y:auto}#nuke-toast-panel .nuke-toast{position:relative;top:auto!important;right:auto;z-index:auto;background:transparent;color:inherit;padding:10px 15px;border:0;border-radius:0;box-shadow:none;width:auto;max-width:none;transform:none;border-bottom:1px solid rgb(47,51,54)}#nuke-toast-panel .nuke-toast:last-child{border-bottom:0}#nuke-toast-panel .nuke-toast.fading-out{opacity:0;transform:translateX(12px)}#nuke-toast-panel #nuke-api-limit-toast{background:rgba(217,161,0,.18);color:#fff;border-color:rgb(47,51,54)}@media(max-width:1000px){#nuke-toast-panel{right:12px;bottom:12px;width:min(360px,calc(100vw - 24px))}}`);
-GM_addStyle(`#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button{position:fixed;right:20px;bottom:146px;z-index:100002;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-toast-panel-toggle-button.nuke-toast-panel-toggle-with-manual{bottom:213px}#nuke-manual-detected-nuke-button:hover:not(:disabled),#nuke-toast-panel-toggle-button:hover{background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg,#nuke-toast-panel-toggle-button svg{width:32px;height:32px;display:block}#nuke-toast-panel.nuke-toast-panel-collapsed{display:none!important}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
+GM_addStyle(`#nuke-toast-panel{position:fixed;right:var(--nuke-toast-panel-right,20px);bottom:var(--nuke-toast-panel-bottom,20px);z-index:10;width:var(--nuke-toast-panel-width,min(360px,calc(100vw - 40px)));max-height:min(420px,calc(100vh - var(--nuke-toast-panel-bottom,20px) - 12px));box-sizing:border-box;background:rgb(22,24,28);color:#e7e9ea;border:1px solid rgb(47,51,54);border-radius:16px;box-shadow:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow:hidden}#nuke-toast-panel.nuke-toast-panel-empty{display:none}.nuke-toast-panel-list{display:flex;flex-direction:column;gap:0;max-height:inherit;overflow-y:auto}#nuke-toast-panel .nuke-toast{position:relative;top:auto!important;right:auto;z-index:auto;background:transparent;color:inherit;padding:10px 15px;border:0;border-radius:0;box-shadow:none;width:auto;max-width:none;transform:none;border-bottom:1px solid rgb(47,51,54)}#nuke-toast-panel .nuke-toast:last-child{border-bottom:0}#nuke-toast-panel .nuke-toast.fading-out{opacity:0;transform:translateX(12px)}#nuke-toast-panel #nuke-api-limit-toast{background:rgba(217,161,0,.18);color:#fff;border-color:rgb(47,51,54)}`);
+GM_addStyle(`#nuke-manual-detected-nuke-button,#nuke-toast-panel-toggle-button{position:fixed;right:20px;bottom:146px;z-index:10;width:55px;height:55px;border-radius:16px;border:1px solid rgb(75,78,82);background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;justify-content:center;padding:0;box-sizing:border-box;box-shadow:rgba(255,255,255,.2) 0 0 15px 0,rgba(255,255,255,.15) 0 0 3px 1px;cursor:pointer;transition:background-color .2s,border-color .2s,opacity .2s}#nuke-toast-panel-toggle-button.nuke-toast-panel-toggle-with-manual{bottom:213px}#nuke-manual-detected-nuke-button:hover:not(:disabled),#nuke-toast-panel-toggle-button:hover{background:rgba(29,155,240,.82);border-color:rgb(29,155,240);color:#fff}#nuke-manual-detected-nuke-button:disabled{opacity:.45;cursor:default}#nuke-manual-detected-nuke-button svg,#nuke-toast-panel-toggle-button svg{width:32px;height:32px;display:block}#nuke-toast-panel.nuke-toast-panel-collapsed{display:none!important}body:has([role="dialog"][aria-modal="true"]) #nuke-manual-detected-nuke-button,body:has([role="dialog"][aria-modal="true"]) #nuke-toast-panel-toggle-button,body:has([role="dialog"][aria-modal="true"]) #nuke-toast-panel{visibility:hidden!important;pointer-events:none!important}.nuke-manual-detected-count{position:absolute;right:-5px;top:-6px;min-width:18px;height:18px;padding:0 4px;border-radius:9999px;background:#f4212e;color:#fff;border:2px solid #000;font:700 11px/18px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}`);
 
 // --- CONFIGURATION MANAGEMENT ---
 async function loadConfig() {
@@ -2752,6 +2752,7 @@ function ensureUnifiedToastPanelToggleButton() {
     }
     button.classList.toggle('nuke-toast-panel-toggle-with-manual', Boolean(manualButton));
     updateUnifiedToastPanelToggleButton();
+    if (panel) syncUnifiedToastPanelPlacement(panel);
 }
 function ensureManualDetectedNukeButton() {
     const existing = document.getElementById('nuke-manual-detected-nuke-button');
@@ -2776,14 +2777,14 @@ function ensureManualDetectedNukeButton() {
     updateManualDetectedNukeButton();
     ensureUnifiedToastPanelToggleButton();
 }
-function captureManualDetectedNukeTargets(articles, userData) {
+function captureManualDetectedNukeTargets(articles, userData, options = {}) {
     const capturedTargets = [];
     for (const article of articles) {
         if (!isDetectedNukeTargetArticle(article)) continue;
         article.dataset.autoblockTriggered = 'true';
         article.dataset.autoblockChecked = 'complete';
         const trigger = buildManualDetectedNukeTrigger(article);
-        const capture = captureNukeTargetForImmediateHide(article, trigger, userData);
+        const capture = captureNukeTargetForImmediateHide(article, trigger, userData, options);
         capturedTargets.push({
             article,
             trigger,
@@ -2796,6 +2797,37 @@ function captureManualDetectedNukeTargets(articles, userData) {
         });
     }
     return capturedTargets;
+}
+function getManualDetectedViewportAnchorDistance(rect, viewportHeight) {
+    if (rect.bottom <= 0) return viewportHeight + Math.abs(rect.bottom);
+    if (rect.top >= viewportHeight) return rect.top;
+    return Math.abs(rect.top);
+}
+function selectManualDetectedViewportAnchor(articles, hiddenHandles, viewportHeight, getHandle = getArticleAuthorHandle) {
+    return Array.from(articles || [])
+        .filter((article) => article?.isConnected !== false && !hiddenHandles.has(normalizePromoHandle(getHandle(article))))
+        .map((article) => ({ article, rect: article.getBoundingClientRect() }))
+        .filter(({ rect }) => rect.height > 0)
+        .sort((left, right) => getManualDetectedViewportAnchorDistance(left.rect, viewportHeight) - getManualDetectedViewportAnchorDistance(right.rect, viewportHeight))[0]?.article || null;
+}
+function captureManualDetectedViewportState(hiddenHandles) {
+    const anchor = selectManualDetectedViewportAnchor(document.querySelectorAll('article[data-testid="tweet"]'), hiddenHandles, window.innerHeight);
+    const scrollElement = document.scrollingElement || document.documentElement;
+    return { anchor, anchorTop: anchor?.getBoundingClientRect().top ?? null, scrollTop: scrollElement.scrollTop };
+}
+function restoreManualDetectedViewportState(state) {
+    if (!state) return;
+    const restore = () => {
+        const scrollElement = document.scrollingElement || document.documentElement;
+        if (state.anchor?.isConnected && Number.isFinite(state.anchorTop)) {
+            const delta = state.anchor.getBoundingClientRect().top - state.anchorTop;
+            if (Number.isFinite(delta)) scrollElement.scrollTop += delta;
+        } else {
+            scrollElement.scrollTop = state.scrollTop;
+        }
+    };
+    restore();
+    window.requestAnimationFrame(restore);
 }
 function shouldDisableManualDetectedNukeButton(isCaptureRunning, count) {
     return !!isCaptureRunning || count === 0;
@@ -3122,8 +3154,16 @@ function getManualDetectedNukeTaskTitle(status) {
     };
     return titleByStatus[status] || '后台九族进度';
 }
+function shouldShowManualDetectedNukeTaskToast(task, userData) {
+    if (!task) return false;
+    const stats = getManualDetectedNukeTaskStats(task, userData || {});
+    return stats.pendingTargetCount > 0 || stats.pendingExpectedBlockCount > 0;
+}
 function showManualDetectedNukeTaskToast(task, userData, duration = null) {
-    if (!task) return;
+    if (!shouldShowManualDetectedNukeTaskToast(task, userData)) {
+        dismissToast('nuke-manual-detected-toast');
+        return;
+    }
     showToast('nuke-manual-detected-toast', getManualDetectedNukeTaskTitle(task.status), trustedToastHtml(formatManualDetectedNukeTaskStatus(task, userData)), duration);
 }
 function showManualDetectedNukeProgressToast(userData, duration = null) {
@@ -3416,7 +3456,14 @@ async function executeManualNukeForDetectedTargets() {
     try {
         const userData = await loadUserData();
         if (!userData) throw new Error("无法加载用户数据");
-        const capturedTargets = captureManualDetectedNukeTargets(articles, userData);
+        const capturedTargets = captureManualDetectedNukeTargets(articles, userData, { deferPageHide: true });
+        const hiddenHandles = new Set(capturedTargets
+            .filter((item) => !item.capture?.isProtectedRoot)
+            .map((item) => normalizePromoHandle(item.capture?.authorHandle))
+            .filter(Boolean));
+        const viewportState = captureManualDetectedViewportState(hiddenHandles);
+        hideArticlesByHandles(hiddenHandles);
+        restoreManualDetectedViewportState(viewportState);
         await saveUserData(userData);
         await updateStatusToast();
         updateManualDetectedNukeButton();
@@ -5168,14 +5215,22 @@ function upsertUnifiedToastEntry(entries, entry, now = Date.now()) {
     return [nextEntry, ...(entries || []).filter((item) => item?.id !== entry?.id)]
         .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
 }
-function getUnifiedToastPanelPlacement(sidebarRect, viewportWidth = (typeof window !== 'undefined' ? window.innerWidth : 0)) {
+function getUnifiedToastPanelPlacement(sidebarRect, viewportWidth = (typeof window !== 'undefined' ? window.innerWidth : 0), toggleRect = null, viewportHeight = (typeof window !== 'undefined' ? window.innerHeight : 0)) {
     const fallbackWidth = Math.min(360, Math.max(0, viewportWidth - 40));
-    const fallback = { right: 20, width: fallbackWidth };
+    let placement = { right: 20, bottom: 20, width: fallbackWidth };
     const width = Number(sidebarRect?.width);
     const right = Number(sidebarRect?.right);
-    if (!Number.isFinite(width) || !Number.isFinite(right) || !Number.isFinite(viewportWidth)) return fallback;
-    if (width < 280 || width > 460 || right <= viewportWidth * 0.5) return fallback;
-    return { right: Math.max(12, Math.round(viewportWidth - right)), width: Math.round(width) };
+    if (Number.isFinite(width) && Number.isFinite(right) && Number.isFinite(viewportWidth) && width >= 280 && width <= 460 && right > viewportWidth * 0.5) {
+        placement = { ...placement, right: Math.max(12, Math.round(viewportWidth - right)), width: Math.round(width) };
+    }
+    const toggleLeft = Number(toggleRect?.left);
+    const toggleBottom = Number(toggleRect?.bottom);
+    if (Number.isFinite(toggleLeft) && Number.isFinite(toggleBottom) && Number.isFinite(viewportWidth) && Number.isFinite(viewportHeight)) {
+        placement.right = Math.max(12, Math.round(viewportWidth - toggleLeft + 12));
+        placement.bottom = Math.max(12, Math.round(viewportHeight - toggleBottom));
+        placement.width = Math.min(placement.width, Math.max(0, viewportWidth - placement.right - 12));
+    }
+    return placement;
 }
 function getUnifiedToastSidebarRect() {
     const candidates = [];
@@ -5189,8 +5244,11 @@ function getUnifiedToastSidebarRect() {
 }
 function syncUnifiedToastPanelPlacement(panel = document.getElementById('nuke-toast-panel')) {
     if (!panel) return;
-    const placement = getUnifiedToastPanelPlacement(getUnifiedToastSidebarRect(), window.innerWidth);
+    const toggleRect = document.getElementById('nuke-toast-panel-toggle-button')?.getBoundingClientRect() || null;
+    const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+    const placement = getUnifiedToastPanelPlacement(getUnifiedToastSidebarRect(), viewportWidth, toggleRect, window.innerHeight);
     panel.style.setProperty('--nuke-toast-panel-right', `${placement.right}px`);
+    panel.style.setProperty('--nuke-toast-panel-bottom', `${placement.bottom}px`);
     panel.style.setProperty('--nuke-toast-panel-width', `${placement.width}px`);
 }
 function bindUnifiedToastPanelPlacement() {
@@ -5791,7 +5849,7 @@ function mergeUserIdSets(sets = []) {
     });
     return merged;
 }
-function captureNukeTargetForImmediateHide(targetArticle, trigger, userData) {
+function captureNukeTargetForImmediateHide(targetArticle, trigger, userData, options = {}) {
     const userLink = targetArticle?.querySelector?.('div[data-testid="User-Name"] a[role="link"]');
     const authorHandle = getArticleAuthorHandle(targetArticle) || getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/').pop()?.split('?')[0];
     const authorUserNameText = targetArticle?.querySelector?.('div[data-testid="User-Name"] a[role="link"] span')?.textContent?.trim() || authorHandle;
@@ -5812,7 +5870,7 @@ function captureNukeTargetForImmediateHide(targetArticle, trigger, userData) {
             blockReason: trigger?.autoReason || trigger?.triggerMode || 'nuke_capture',
             blockNote: `待拉黑·@${authorHandle}${formatTweetContextSuffix(tweetContext)}`
         }, tweetContext)]);
-        hideArticlesByHandles(new Set([normalizePromoHandle(authorHandle)]));
+        if (!options.deferPageHide) hideArticlesByHandles(new Set([normalizePromoHandle(authorHandle)]));
     }
     return { capture, authorHandle, authorUserNameText, tweetContext, isProtectedRoot };
 }
