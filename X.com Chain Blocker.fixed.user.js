@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.81
+// @version      2.15.83
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -105,7 +105,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.81';
+const SPAM_SCANNER_BUILD = '2.15.83';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1544,6 +1544,19 @@ function isEmojiOnlyBaitText(text) {
     const mentionRandomLayout = hasLeadingMention && emojis.length >= 5 && new Set(emojis).size >= 4 && clusters.length >= 4 && bucketCount >= 3;
     return newlineLayout || mentionRandomLayout;
 }
+function isSparseHighRetweetBaitText(text, retweets, displayName = '') {
+    const retweetCount = Number(retweets);
+    if (!Number.isFinite(retweetCount) || retweetCount < 5) return false;
+    const source = String(text || '').replace(/\r\n?/g, '\n').trim();
+    if (!source) return false;
+    const emojis = extractSpamEmojiChars(source);
+    const nonEmoji = source.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\u200b-\u200d\u2060\ufeff\u00ad\ufe0f\s]/g, '');
+    const lines = source.split(/\n+/).map((part) => part.trim()).filter(Boolean);
+    const sparseEmoji = emojis.length >= 1 && emojis.length <= 3 && !nonEmoji;
+    const randomTokenLayout = lines.length === 3 && /^[^a-z0-9\u4e00-\u9fff]{1,3}$/i.test(lines[0]) && lines.slice(1).every((line) => /^[a-z]{2}$/i.test(line));
+    if (!sparseEmoji && !randomTokenLayout) return false;
+    return retweetCount >= 10 || extractSpamEmojiChars(displayName).length >= 2;
+}
 function isShortLocationInviteCompact(compact) {
     const text = String(compact || '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '');
     if (text.length > 18) return false;
@@ -1655,10 +1668,15 @@ function detectSpamReply(text, options = {}) {
     const compactVariants = compactSpamTextVariants(raw);
     const shortDatingInvite = isShortDatingInviteCompact(compact);
     const emojiOnlyBait = isEmojiOnlyBaitText(rawInput);
-    if (!raw || (raw.length < 8 && !shortDatingInvite && !emojiOnlyBait)) return { match: false, score: 0, signals: [], summary: '' };
-    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw) && !emojiOnlyBait) return { match: false, score: 0, signals: [], summary: '' };
+    const sparseRetweetBait = isSparseHighRetweetBaitText(rawInput, options.retweets, options.displayName);
+    if (!raw || (raw.length < 8 && !shortDatingInvite && !emojiOnlyBait && !sparseRetweetBait)) return { match: false, score: 0, signals: [], summary: '' };
+    if (!/[\u4e00-\u9fff]/.test(raw) && !/pan\.quark|drive\.uc/i.test(raw) && !emojiOnlyBait && !sparseRetweetBait) return { match: false, score: 0, signals: [], summary: '' };
     const signals = [];
     let score = 0;
+    if (sparseRetweetBait) {
+        signals.push({ id: 'sparse_retweet_bait', label: '稀疏回复/异常转推', weight: 3 });
+        score += 3;
+    }
     for (const def of SPAM_SIGNAL_DEFS) {
         if (compactVariants.some((candidate) => def.test(candidate, raw, rawInput))) {
             signals.push({ id: def.id, label: def.label, weight: def.weight });
@@ -4024,14 +4042,19 @@ async function pumpAvatarOcrQueue() {
 async function processSpamArticle(article) {
     if (shouldSkipSpamArticleScan(article)) return;
     const tweetText = getTweetTextFromArticle(article);
-    const textDetection = tweetText ? detectSpamReply(tweetText) : null;
+    const userLink = article.querySelector('div[data-testid="User-Name"] a[role="link"]');
+    const textDetectionOptions = {
+        retweets: getArticleEngagementCounts(article).retweets,
+        displayName: getDisplayNameFromUserLink(userLink)
+    };
+    const textDetection = tweetText ? detectSpamReply(tweetText, textDetectionOptions) : null;
     if (shouldSkipSpamIdentifyForArticle(article, textDetection)) {
         clearSpamIdentifyTextBadge(article);
         finalizeSpamArticleScan(article);
         return;
     }
     if (tweetText) {
-        const detection = textDetection || detectSpamReply(tweetText);
+        const detection = textDetection || detectSpamReply(tweetText, textDetectionOptions);
         article.dataset.spamTextScannedBuild = SPAM_SCANNER_BUILD;
         if (detection.match) {
             let trustedExempt = false;
@@ -4878,7 +4901,8 @@ function matchesStandardKeywords(userNameText, patterns) {
 function matchesBuiltInDisplayNameSpam(userNameText) {
     const normalized = String(userNameText || '').replace(/\s+/g, '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '').toLowerCase();
     if (!normalized) return false;
-    return /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized) || ((/赚钱|挣钱|搞钱|网赚|兼职|副业|快钱|日结/.test(normalized) && /跑分|灰产|偏门|洗钱|返佣|外汇|区块链|币圈/.test(normalized)) || /跑分灰产|灰产副业|网赚兼职|快钱日结/.test(normalized));
+    const explicitAdultSpam = /炮友|固炮|约炮|性伴侣|骚货|反差婊|免费破处/.test(normalized) || /巨乳.{0,10}(?:线下|滴滴)/.test(normalized) || /大奶.{0,20}(?:想被|[操艹])/.test(normalized);
+    return explicitAdultSpam || /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized) || ((/赚钱|挣钱|搞钱|网赚|兼职|副业|快钱|日结/.test(normalized) && /跑分|灰产|偏门|洗钱|返佣|外汇|区块链|币圈/.test(normalized)) || /跑分灰产|灰产副业|网赚兼职|快钱日结/.test(normalized));
 }
 function getUsernameRuleFollowerExemptThreshold() {
     return scriptConfig.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;

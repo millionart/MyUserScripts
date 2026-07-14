@@ -88,6 +88,7 @@ function loadSpamDetector() {
         'extractSpamEmojiChars',
         'spamEmojiBucket',
         'isEmojiOnlyBaitText',
+        'isSparseHighRetweetBaitText',
         'isShortLocationInviteCompact',
         'isPetRoleInviteCompact',
         'isAdultEndorsementContextCompact',
@@ -104,9 +105,9 @@ function loadSpamDetector() {
         constLine('SPAM_ZERO_WIDTH_RE'),
         constLine('SPAM_CJK_PUNCT_RE'),
         constLine('SPAM_ASCII_NOISE_BETWEEN_CJK_RE'),
-        ...helperNames.slice(0, 10).map((name) => extractFunction(source, name)),
+        ...helperNames.slice(0, 11).map((name) => extractFunction(source, name)),
         source.slice(signalStart, signalEnd + 3),
-        ...helperNames.slice(10).map((name) => extractFunction(source, name)),
+        ...helperNames.slice(11).map((name) => extractFunction(source, name)),
         'module.exports = { detectSpamReply };'
     ].join('\n');
     const sandbox = { module: { exports: {} } };
@@ -219,6 +220,19 @@ test('username keyword match is exempt only when visible or cached follower coun
     assert.equal(exemptDecision.followerCount, 1001);
     assert.equal(exemptDecision.exemptThreshold, 1000);
     assert.equal(getAutoBlockDecision('真实 幂幂（腰软 主人看我主页简介', 1000).block, true);
+});
+
+test('built-in display name rules catch explicit adult funnels without broad persona matching', () => {
+    const { getAutoBlockDecision } = loadAutoBlockDecisionHelpers();
+
+    for (const name of ['寻男固炮🚗瑾萱', '骚货学姐🍑', '晶晶宝宝🍑反差婊', '巨乳大柚子🍑线下滴滴', '大奶倩倩🍑想被超过十二厘米的人操']) {
+        const decision = getAutoBlockDecision(name, null);
+        assert.equal(decision.block, true, name);
+        assert.equal(decision.reason, 'display_name_spam', name);
+    }
+    assert.equal(getAutoBlockDecision('清纯小学妹', null).block, false);
+    assert.equal(getAutoBlockDecision('摄影学姐记录日常', null).block, false);
+    assert.equal(getAutoBlockDecision('寻男固炮瑾萱', 1001).reason, 'follower_exempt');
 });
 
 test('chain list collection is skipped when visible engagement count is zero', () => {
@@ -1271,6 +1285,22 @@ test('spam detection combines general links and adult endorsement context', () =
     assert.equal(detectSpamReply('女大学生分享社团活动，花样很多，这场比赛很炸裂').match, false);
     assert.equal(detectSpamReply('这个开源项目玩法多，真极品 @developer').match, false);
     assert.equal(detectSpamReply('123').match, false);
+});
+
+test('sparse high-retweet bait requires both unreadable content and visible engagement', () => {
+    const detectSpamReply = loadSpamDetector();
+    const emojiBait = detectSpamReply('🤣', { retweets: 19 });
+    const randomTokenBait = detectSpamReply('☆\nfz\nga', { retweets: 27 });
+    const emojiNameBait = detectSpamReply('🐯', { retweets: 5, displayName: '☝️玉琪大兄妹🍅' });
+
+    assert.equal(emojiBait.match, true);
+    assert.ok(Array.from(emojiBait.signals, (signal) => signal.id).includes('sparse_retweet_bait'));
+    assert.equal(randomTokenBait.match, true);
+    assert.equal(emojiNameBait.match, true);
+    assert.equal(detectSpamReply('🤣', { retweets: 0 }).match, false);
+    assert.equal(detectSpamReply('🤣', { retweets: 9 }).match, false);
+    assert.equal(detectSpamReply('🐯', { retweets: 5, displayName: '普通用户🙂' }).match, false);
+    assert.equal(detectSpamReply('地铁开通后房租确实会涨', { retweets: 20 }).match, false);
 });
 
 test('tweet detail user extraction unwraps visibility result tweets', () => {
