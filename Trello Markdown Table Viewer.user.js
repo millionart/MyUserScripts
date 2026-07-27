@@ -2,7 +2,7 @@
 // @name         Trello Markdown Table Viewer
 // @name:zh-CN   Trello Markdown 表格查看器
 // @namespace    https://github.com/millionart
-// @version      1.2.0
+// @version      1.3.1
 // @description  Render Markdown table source in Trello card descriptions as accessible, theme-aware HTML tables.
 // @description:zh-CN 将 Trello 卡片描述中的 Markdown 表格源码渲染为可读、可横向滚动且适配主题的表格。
 // @author       codex
@@ -17,7 +17,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '1.2.0';
+    const SCRIPT_VERSION = '1.3.1';
     const GLOBAL_STATE_KEY = '__trelloMarkdownTableViewer';
     const STYLE_ID = 'trello-markdown-table-viewer-styles';
     const DESCRIPTION_SELECTOR = '[data-testid="description-content-area"]';
@@ -25,6 +25,10 @@
     const SOURCE_ATTRIBUTE = 'data-tmtv-source';
     const RENDERED_ATTRIBUTE = 'data-tmtv-rendered';
     const EDITOR_PREVIEW_ATTRIBUTE = 'data-tmtv-editor-preview';
+    const LINE_BREAK_TOGGLE_ATTRIBUTE = 'data-tmtv-line-break-toggle';
+    const LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE = 'data-tmtv-line-break-toggle-wrapper';
+    const LINE_BREAK_TOGGLE_LABEL = '切换换行形式';
+    const EDITOR_BLOCK_SELECTOR = 'p,h1,h2,h3,h4,h5,h6,li,pre,blockquote';
     const COMPACT_COLUMN_CHARACTER_LIMIT = 4;
     const TABLE_SEPARATOR_CELL_PATTERN = /^:?-{3,}:?$/;
 
@@ -208,6 +212,46 @@
         return values.every((value) => getCellMaximumLineWidth(value) <= limit);
     }
 
+    function normalizeSelectedLines(text) {
+        const lines = String(text ?? '')
+            .replace(/\r\n?/g, '\n')
+            .split(/\n+/);
+        while (lines.length && lines[0] === '') lines.shift();
+        while (lines.length && lines[lines.length - 1] === '') lines.pop();
+        return lines;
+    }
+
+    function getLineBreakSelectionLines(selectionText, rangeText) {
+        const selectionLines = normalizeSelectedLines(selectionText);
+        if (selectionLines.length >= 2) return selectionLines;
+        return normalizeSelectedLines(rangeText);
+    }
+
+    function getLineBreakToggleTarget(hasBlockBreaks, hasSoftBreaks) {
+        if (hasBlockBreaks) return 'soft';
+        if (hasSoftBreaks) return 'paragraph';
+        return null;
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function buildLineBreakReplacementHtml(lines, target) {
+        const safeLines = Array.isArray(lines) ? lines.map((line) => escapeHtml(line)) : [];
+        if (!safeLines.length) return '';
+        if (target === 'soft') return safeLines.join('<br>');
+        if (target === 'paragraph') {
+            return safeLines.map((line) => `<p>${line || '<br>'}</p>`).join('');
+        }
+        return '';
+    }
+
     function readElementLines(element) {
         const clone = element.cloneNode(true);
         for (const breakElement of clone.querySelectorAll('br')) {
@@ -353,6 +397,25 @@
         return preview;
     }
 
+    function createLineBreakToggleIcon(documentObject) {
+        const namespace = 'http://www.w3.org/2000/svg';
+        const icon = documentObject.createElementNS(namespace, 'svg');
+        icon.setAttribute('viewBox', '0 0 24 24');
+        icon.setAttribute('aria-hidden', 'true');
+        icon.setAttribute('focusable', 'false');
+
+        const lines = documentObject.createElementNS(namespace, 'path');
+        lines.setAttribute('fill', 'currentColor');
+        lines.setAttribute('d', 'M4 5h12v2H4V5Zm0 6h7v2H4v-2Zm0 6h12v2H4v-2Z');
+
+        const returnArrow = documentObject.createElementNS(namespace, 'path');
+        returnArrow.setAttribute('fill', 'currentColor');
+        returnArrow.setAttribute('d', 'M18 8v3a3 3 0 0 1-3 3h-1v2l-3-3 3-3v2h1a1 1 0 0 0 1-1V8h2Z');
+
+        icon.append(lines, returnArrow);
+        return icon;
+    }
+
     function installStyles(documentObject) {
         if (documentObject.getElementById(STYLE_ID)) return;
 
@@ -405,6 +468,24 @@
 
             .tmtv-editor-preview .tmtv-table-region:last-child {
                 margin-bottom: 0;
+            }
+
+            [${LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE}="true"] {
+                display: flex;
+                align-items: center;
+            }
+
+            [${LINE_BREAK_TOGGLE_ATTRIBUTE}="true"] {
+                width: 24px !important;
+                min-width: 24px !important;
+                height: 24px !important;
+                padding: 0 !important;
+            }
+
+            [${LINE_BREAK_TOGGLE_ATTRIBUTE}="true"] svg {
+                width: 20px;
+                height: 20px;
+                pointer-events: none;
             }
 
             .tmtv-table-region {
@@ -539,6 +620,9 @@
         for (const preview of documentObject.querySelectorAll(`[${EDITOR_PREVIEW_ATTRIBUTE}="true"]`)) {
             preview.remove();
         }
+        for (const wrapper of documentObject.querySelectorAll(`[${LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE}="true"]`)) {
+            wrapper.remove();
+        }
         documentObject.documentElement.removeAttribute('data-tmtv-version');
         documentObject.documentElement.removeAttribute('data-tmtv-table-count');
         documentObject.documentElement.removeAttribute('data-tmtv-editor-table-count');
@@ -547,6 +631,7 @@
     function createRuntime(documentObject, windowObject) {
         let sourceRecords = new WeakMap();
         let editorRecords = new WeakMap();
+        let lineBreakButtonEditors = new WeakMap();
         let observer = null;
         let renderTimer = 0;
 
@@ -610,6 +695,160 @@
             const controls = saveButton?.parentElement;
             if (!controls?.parentElement || !controls.parentElement.contains(editor)) return null;
             return controls;
+        }
+
+        function getLineBreakSelectionForEditor(editor) {
+            const selection = windowObject.getSelection?.();
+            if (!selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
+            const range = selection.getRangeAt(0);
+            if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
+            return {
+                range: range.cloneRange(),
+                text: selection.toString()
+            };
+        }
+
+        function findEditorBlock(node, editor) {
+            const element = node?.nodeType === 1 ? node : node?.parentElement;
+            const block = element?.closest?.(EDITOR_BLOCK_SELECTOR);
+            return block && editor.contains(block) ? block : null;
+        }
+
+        function analyzeLineBreakSelection(editor, selectionRecord) {
+            const range = selectionRecord?.range;
+            if (!range || range.collapsed) return null;
+            const fragment = range.cloneContents();
+            const startBlock = findEditorBlock(range.startContainer, editor);
+            const endBlock = findEditorBlock(range.endContainer, editor);
+            const fragmentBlockCount = fragment.querySelectorAll?.(EDITOR_BLOCK_SELECTOR).length || 0;
+            const hasBlockBreaks = fragmentBlockCount > 1 || !!(startBlock && endBlock && startBlock !== endBlock);
+            const hasSoftBreaks = !!fragment.querySelector?.('br');
+            const target = getLineBreakToggleTarget(hasBlockBreaks, hasSoftBreaks);
+            const lines = getLineBreakSelectionLines(selectionRecord.text, range.toString());
+            if (!target || lines.length < 2) return null;
+            return { lines, target };
+        }
+
+        function applyLineBreakToggle(editor, selectionRecord) {
+            const range = selectionRecord?.range;
+            const analysis = analyzeLineBreakSelection(editor, selectionRecord);
+            if (!analysis || typeof documentObject.execCommand !== 'function') {
+                return { changed: false, target: null };
+            }
+
+            const replacementHtml = buildLineBreakReplacementHtml(analysis.lines, analysis.target);
+            if (!replacementHtml) return { changed: false, target: analysis.target };
+
+            const selection = windowObject.getSelection?.();
+            if (!selection) return { changed: false, target: analysis.target };
+            editor.focus({ preventScroll: true });
+            selection.removeAllRanges();
+            selection.addRange(range);
+
+            let changed = false;
+            try {
+                changed = documentObject.execCommand('insertHTML', false, replacementHtml) === true;
+            } catch {
+                changed = false;
+            }
+            return {
+                changed,
+                lineCount: analysis.lines.length,
+                target: analysis.target
+            };
+        }
+
+        function getLineBreakToggleTitle(editor) {
+            const selectionRecord = getLineBreakSelectionForEditor(editor);
+            const analysis = selectionRecord ? analyzeLineBreakSelection(editor, selectionRecord) : null;
+            if (analysis?.target === 'soft') return '将选中的多个段落合并为段内换行';
+            if (analysis?.target === 'paragraph') return '将选中的段内换行拆分为多个段落';
+            return '请选择包含多个段落或段内换行的内容';
+        }
+
+        function updateLineBreakToggleButton(button, editor) {
+            const selectionRecord = getLineBreakSelectionForEditor(editor);
+            const analysis = selectionRecord ? analyzeLineBreakSelection(editor, selectionRecord) : null;
+            button.disabled = !analysis;
+            button.title = getLineBreakToggleTitle(editor);
+        }
+
+        function createLineBreakToggleButton(editor, insertButton) {
+            const insertWrapper = insertButton.parentElement;
+            if (!insertWrapper) return null;
+
+            const wrapper = insertWrapper.cloneNode(false);
+            wrapper.setAttribute(LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE, 'true');
+            wrapper.setAttribute('data-tmtv-version', SCRIPT_VERSION);
+
+            const button = insertButton.cloneNode(false);
+            button.removeAttribute('aria-expanded');
+            button.removeAttribute('aria-haspopup');
+            button.removeAttribute('aria-keyshortcuts');
+            button.setAttribute('aria-label', LINE_BREAK_TOGGLE_LABEL);
+            button.setAttribute(LINE_BREAK_TOGGLE_ATTRIBUTE, 'true');
+            button.setAttribute('data-tmtv-version', SCRIPT_VERSION);
+            button.append(createLineBreakToggleIcon(documentObject));
+
+            let savedSelection = null;
+            button.addEventListener('mousedown', (event) => {
+                if (event.button !== 0) return;
+                const selectionRecord = getLineBreakSelectionForEditor(editor);
+                if (!selectionRecord) return;
+                savedSelection = selectionRecord;
+                event.preventDefault();
+            });
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const selectionRecord = savedSelection || getLineBreakSelectionForEditor(editor);
+                savedSelection = null;
+                if (!selectionRecord) return;
+
+                const result = applyLineBreakToggle(editor, selectionRecord);
+                button.setAttribute('data-tmtv-last-result', result.changed ? result.target : 'failed');
+                scheduleRender();
+            });
+
+            wrapper.append(button);
+            insertWrapper.after(wrapper);
+            lineBreakButtonEditors.set(button, editor);
+            updateLineBreakToggleButton(button, editor);
+            return button;
+        }
+
+        function syncLineBreakToggleButtons() {
+            const activeWrappers = new Set();
+            for (const editor of getDescriptionEditors()) {
+                const section = editor.closest('section');
+                const toolbar = section
+                    ? Array.from(section.querySelectorAll('[role="toolbar"]'))
+                        .find((candidate) => candidate.getAttribute('aria-label') === '编辑器')
+                    : null;
+                const insertButton = toolbar
+                    ? Array.from(toolbar.querySelectorAll('button'))
+                        .find((candidate) => candidate.getAttribute('aria-label') === '插入元素')
+                    : null;
+                if (!toolbar || !insertButton?.parentElement) continue;
+
+                let button = toolbar.querySelector(`[${LINE_BREAK_TOGGLE_ATTRIBUTE}="true"]`);
+                if (!button) {
+                    button = createLineBreakToggleButton(editor, insertButton);
+                } else {
+                    lineBreakButtonEditors.set(button, editor);
+                    const wrapper = button.closest(`[${LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE}="true"]`);
+                    if (wrapper && wrapper.previousElementSibling !== insertButton.parentElement) {
+                        insertButton.parentElement.after(wrapper);
+                    }
+                    updateLineBreakToggleButton(button, editor);
+                }
+                const wrapper = button?.closest(`[${LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE}="true"]`);
+                if (wrapper) activeWrappers.add(wrapper);
+            }
+
+            for (const wrapper of documentObject.querySelectorAll(`[${LINE_BREAK_TOGGLE_WRAPPER_ATTRIBUTE}="true"]`)) {
+                if (!activeWrappers.has(wrapper)) wrapper.remove();
+            }
         }
 
         function syncEditorPreview(editor) {
@@ -692,6 +931,7 @@
                 }
             }
 
+            syncLineBreakToggleButtons();
             const editorTableCount = syncEditorPreviews();
             const tableCount = documentObject.querySelectorAll('.tmtv-table-region').length;
             documentObject.documentElement.setAttribute('data-tmtv-version', SCRIPT_VERSION);
@@ -710,6 +950,10 @@
             if (target?.closest?.(EDITOR_SELECTOR)) scheduleRender();
         }
 
+        function onSelectionChange() {
+            scheduleRender();
+        }
+
         function start() {
             renderAll();
             observer = new MutationObserver(scheduleRender);
@@ -719,11 +963,13 @@
                 subtree: true
             });
             documentObject.addEventListener('input', onDocumentInput, true);
+            documentObject.addEventListener('selectionchange', onSelectionChange);
         }
 
         function destroy() {
             observer?.disconnect();
             documentObject.removeEventListener('input', onDocumentInput, true);
+            documentObject.removeEventListener('selectionchange', onSelectionChange);
             if (renderTimer) windowObject.clearTimeout(renderTimer);
             renderTimer = 0;
 
@@ -734,6 +980,7 @@
             }
             sourceRecords = new WeakMap();
             editorRecords = new WeakMap();
+            lineBreakButtonEditors = new WeakMap();
             documentObject.getElementById(STYLE_ID)?.remove();
             resetGeneratedDom(documentObject);
         }
@@ -744,12 +991,17 @@
     const api = {
         SCRIPT_VERSION,
         COMPACT_COLUMN_CHARACTER_LIMIT,
+        LINE_BREAK_TOGGLE_LABEL,
+        buildLineBreakReplacementHtml,
         findMarkdownTableSegments,
         getCellMaximumLineWidth,
         getColumnAlignment,
         getMarkdownTablePreviewModel,
+        getLineBreakSelectionLines,
         isCompactTableColumn,
         measureTextInChineseCharacterUnits,
+        getLineBreakToggleTarget,
+        normalizeSelectedLines,
         normalizeRow,
         parseMarkdownTableAt,
         parseMarkdownTableText,

@@ -5,13 +5,18 @@ const path = require('node:path');
 
 const {
     COMPACT_COLUMN_CHARACTER_LIMIT,
+    LINE_BREAK_TOGGLE_LABEL,
     SCRIPT_VERSION,
+    buildLineBreakReplacementHtml,
     findMarkdownTableSegments,
     getCellMaximumLineWidth,
     getColumnAlignment,
+    getLineBreakSelectionLines,
     getMarkdownTablePreviewModel,
     isCompactTableColumn,
     measureTextInChineseCharacterUnits,
+    getLineBreakToggleTarget,
+    normalizeSelectedLines,
     normalizeRow,
     parseMarkdownTableAt,
     parseMarkdownTableText,
@@ -22,12 +27,14 @@ const scriptPath = path.join(__dirname, '..', 'Trello Markdown Table Viewer.user
 const script = fs.readFileSync(scriptPath, 'utf8');
 
 test('userscript metadata targets Trello and exposes an unambiguous version', () => {
-    assert.equal(SCRIPT_VERSION, '1.2.0');
+    assert.equal(SCRIPT_VERSION, '1.3.1');
     assert.equal(COMPACT_COLUMN_CHARACTER_LIMIT, 4);
+    assert.equal(LINE_BREAK_TOGGLE_LABEL, '切换换行形式');
     assert.match(script, /@name\s+Trello Markdown Table Viewer/);
     assert.match(script, /@match\s+https:\/\/trello\.com\/\*/);
-    assert.match(script, /@version\s+1\.2\.0/);
+    assert.match(script, /@version\s+1\.3\.1/);
     assert.match(script, /data-tmtv-editor-preview/);
+    assert.match(script, /data-tmtv-line-break-toggle/);
     assert.match(script, /addEventListener\('input', onDocumentInput, true\)/);
 });
 
@@ -153,4 +160,36 @@ test('only columns whose header and every cell fit four Chinese characters are c
     assert.equal(isCompactTableColumn(tableModel, 2), false);
     assert.equal(isCompactTableColumn(tableModel, 3), false);
     assert.equal(isCompactTableColumn(tableModel, -1), false);
+});
+
+test('normalizes selected paragraph and soft-break text into logical lines', () => {
+    assert.deepEqual(normalizeSelectedLines('A\n\nB\r\nC'), ['A', 'B', 'C']);
+    assert.deepEqual(normalizeSelectedLines('\nA\nB\n'), ['A', 'B']);
+    assert.deepEqual(normalizeSelectedLines(''), []);
+});
+
+test('uses Selection text because Range text omits paragraph boundaries', () => {
+    assert.deepEqual(
+        getLineBreakSelectionLines('A\n\nB\n\nC', 'ABC'),
+        ['A', 'B', 'C']
+    );
+    assert.deepEqual(getLineBreakSelectionLines('', 'A\nB'), ['A', 'B']);
+});
+
+test('toggles block breaks to soft breaks and soft breaks back to paragraphs', () => {
+    assert.equal(getLineBreakToggleTarget(true, false), 'soft');
+    assert.equal(getLineBreakToggleTarget(true, true), 'soft');
+    assert.equal(getLineBreakToggleTarget(false, true), 'paragraph');
+    assert.equal(getLineBreakToggleTarget(false, false), null);
+});
+
+test('builds safe replacement HTML for both line-break forms', () => {
+    const lines = ['A & B', '<row>'];
+    assert.equal(buildLineBreakReplacementHtml(lines, 'soft'), 'A &amp; B<br>&lt;row&gt;');
+    assert.equal(
+        buildLineBreakReplacementHtml(lines, 'paragraph'),
+        '<p>A &amp; B</p><p>&lt;row&gt;</p>'
+    );
+    assert.equal(buildLineBreakReplacementHtml([], 'soft'), '');
+    assert.equal(buildLineBreakReplacementHtml(lines, 'unknown'), '');
 });
