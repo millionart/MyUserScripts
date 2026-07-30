@@ -73,6 +73,17 @@ function loadAutoBlockDecisionHelpers() {
     return sandbox.module.exports;
 }
 
+function loadMenuCloseHelper() {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const sandbox = { module: { exports: {} } };
+    const code = [
+        extractFunction(source, 'closeMenuFromEvent'),
+        'module.exports = { closeMenuFromEvent };'
+    ].join('\n');
+    vm.runInNewContext(code, sandbox);
+    return sandbox.module.exports;
+}
+
 function loadSpamDetector() {
     const source = fs.readFileSync(sourcePath, 'utf8');
     const constLine = (name) => {
@@ -414,6 +425,26 @@ test('closing a dialog releases its resize and drag resources', () => {
     closeDialogSurface(surface);
 
     assert.deepEqual(calls, ['cleanup', 'close', 'remove']);
+});
+
+test('custom menu actions close their own popup without dispatching a global Escape key', () => {
+    const { closeMenuFromEvent } = loadMenuCloseHelper();
+    const calls = [];
+    const dropdown = { remove: () => calls.push('dropdown') };
+    const menu = { remove: () => calls.push('menu') };
+    const target = {
+        closest(selector) {
+            if (selector === 'div[data-testid="Dropdown"]') return dropdown;
+            if (selector === 'div[role="menu"]') return menu;
+            return null;
+        }
+    };
+
+    assert.equal(closeMenuFromEvent({ target }), true);
+    assert.deepEqual(calls, ['dropdown']);
+
+    const closeMenuSource = extractFunction(fs.readFileSync(sourcePath, 'utf8'), 'closeMenuFromEvent');
+    assert.doesNotMatch(closeMenuSource, /KeyboardEvent|dispatchEvent|document\.dispatchEvent/);
 });
 
 test('manual detected author resolution puts zero-engagement targets first', () => {
