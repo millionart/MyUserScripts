@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.94
+// @version      2.15.96
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -50,6 +50,7 @@ const CONFIG_STORAGE_KEY = 'CHAIN_BLOCKER_CONFIG';
 const API_RATE_LIMIT_STATE_KEY = 'CHAIN_BLOCKER_API_RATE_LIMIT_STATE';
 const API_LAST_OPERATION_STARTED_KEY = 'CHAIN_BLOCKER_API_LAST_OPERATION_STARTED';
 const API_CROSS_TAB_LOCK_NAME = 'chain-blocker-api-operation';
+const USER_DATA_STORAGE_LOCK_PREFIX = 'chain-blocker-user-data';
 const BACKGROUND_WORKER_LOCK_PREFIX = 'chain-blocker-background-worker';
 const BLOCK_INTERVAL_MS = 60 * 1000;
 const API_OPERATION_INTERVAL_MS = 5 * 1000;
@@ -107,7 +108,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.94';
+const SPAM_SCANNER_BUILD = '2.15.96';
 const PROFILE_HOVER_CARD_SELECTOR = '[data-testid="HoverCard"], [data-testid="hoverCard"], [data-testid="UserHoverCard"]';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
@@ -1050,7 +1051,7 @@ const DETECTION_SCAN_DELAY_MS = 160;
 const DETECTION_VIEWPORT_REPRIORITIZE_MS = 90;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
-let isProcessingQueue = false, processIntervalId = null, queueStatusCountdownInterval = null, queueStatusWasActive = false, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
+let isProcessingQueue = false, processIntervalId = null, queueStatusCountdownInterval = null, queueStatusWasActive = false, passiveQueueStateSyncIntervalId = null, passiveQueueStateSyncRunning = false, passiveQueueVisibilitySyncBound = false, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
 let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, manualDetectedNukeResumeTimeoutId = null;
 let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
@@ -1839,13 +1840,29 @@ function queueHiddenUserRelease(userData, entry, now = Date.now()) {
     userData.hiddenReleaseQueue = mergePendingHiddenUserEntries(releases, [next], now).slice(0, limit);
     return true;
 }
+function getHiddenUserExclusionKeys(userData) {
+    const entries = [
+        ...(userData?.releasedHiddenUsers || []),
+        ...(userData?.blockedLog || [])
+    ];
+    return new Set(entries.flatMap(getHiddenUserStorageKeys).filter(Boolean));
+}
+function pruneReleasedPendingHiddenUsers(userData) {
+    if (!userData || !Array.isArray(userData.pendingHiddenUsers)) return 0;
+    const exclusionKeys = getHiddenUserExclusionKeys(userData);
+    if (!exclusionKeys.size) return 0;
+    const before = userData.pendingHiddenUsers.length;
+    userData.pendingHiddenUsers = userData.pendingHiddenUsers.filter((entry) => !getHiddenUserStorageKeys(entry).some((key) => exclusionKeys.has(key)));
+    return before - userData.pendingHiddenUsers.length;
+}
 function applyHiddenUserReleaseQueue(userData) {
     if (!userData || !Array.isArray(userData.hiddenReleaseQueue) || userData.hiddenReleaseQueue.length === 0) return 0;
-    const releaseKeys = new Set(userData.hiddenReleaseQueue.flatMap(getHiddenUserStorageKeys).filter(Boolean));
-    const before = userData.pendingHiddenUsers?.length || 0;
-    userData.pendingHiddenUsers = (userData.pendingHiddenUsers || []).filter((entry) => !getHiddenUserStorageKeys(entry).some((key) => releaseKeys.has(key)));
+    const now = Date.now();
+    const releases = userData.hiddenReleaseQueue;
+    const limit = typeof HIDDEN_RELEASE_QUEUE_LIMIT === 'number' ? HIDDEN_RELEASE_QUEUE_LIMIT : 2000;
+    userData.releasedHiddenUsers = mergePendingHiddenUserEntries(userData.releasedHiddenUsers || [], releases, now).slice(0, limit);
     userData.hiddenReleaseQueue = [];
-    return before - userData.pendingHiddenUsers.length;
+    return pruneReleasedPendingHiddenUsers(userData);
 }
 function extractMentionHandlesFromText(text, excludeHandles = []) {
     const exclude = new Set((excludeHandles || []).map(normalizePromoHandle).filter(Boolean));
@@ -3031,6 +3048,13 @@ function getActiveManualDetectedNukeTasks(userData) {
     return (userData?.manualDetectedNukeTasks || [])
         .filter((task) => task && !['complete', 'failed'].includes(task.status));
 }
+function recordCompletedManualDetectedNukeTask(userData, task) {
+    if (!userData || !task?.taskId) return;
+    userData.completedManualDetectedNukeTaskIds = mergeNukeTaskIds(
+        userData.completedManualDetectedNukeTaskIds,
+        task.taskId
+    ).slice(-MANUAL_DETECTED_NUKE_TASK_LIMIT);
+}
 function shouldRetryQueuedManualDetectedNukeTask(task, now = Date.now()) {
     if (!task || task.status !== 'running') return false;
     if (task.status === 'running' && typeof manualDetectedNukeTaskRunning !== 'undefined' && manualDetectedNukeTaskRunning) return false;
@@ -3039,7 +3063,15 @@ function shouldRetryQueuedManualDetectedNukeTask(task, now = Date.now()) {
 }
 function normalizeManualDetectedNukeTasks(userData) {
     if (!userData || !Array.isArray(userData.manualDetectedNukeTasks)) return 0;
-    const retainedTasks = userData.manualDetectedNukeTasks.filter((task) => task?.status !== 'complete');
+    const completedTaskIds = new Set(normalizeNukeTaskIds(userData.completedManualDetectedNukeTaskIds));
+    const completedTasks = userData.manualDetectedNukeTasks.filter((task) => task?.status === 'complete');
+    if (completedTasks.length) {
+        userData.completedManualDetectedNukeTaskIds = mergeNukeTaskIds(
+            userData.completedManualDetectedNukeTaskIds,
+            completedTasks.map((task) => task.taskId)
+        ).slice(-MANUAL_DETECTED_NUKE_TASK_LIMIT);
+    }
+    const retainedTasks = userData.manualDetectedNukeTasks.filter((task) => task?.status !== 'complete' && !completedTaskIds.has(String(task?.taskId || '')));
     let changed = userData.manualDetectedNukeTasks.length - retainedTasks.length;
     userData.manualDetectedNukeTasks = retainedTasks;
     for (const task of userData.manualDetectedNukeTasks) {
@@ -3219,13 +3251,17 @@ function completeFinishedManualDetectedNukeTasks(userData) {
     let completedTask = null;
     const retainedTasks = [];
     for (const task of userData?.manualDetectedNukeTasks || []) {
-        if (task?.status === 'complete') continue;
+        if (task?.status === 'complete') {
+            recordCompletedManualDetectedNukeTask(userData, task);
+            continue;
+        }
         if (task?.status === 'queued') {
             const stats = getManualDetectedNukeTaskStats(task, userData);
             if (stats.pendingTargetCount === 0 && stats.pendingExpectedBlockCount === 0 && stats.queuedCount === 0) {
                 task.status = 'complete';
                 task.updatedAt = Date.now();
                 completedTask = task;
+                recordCompletedManualDetectedNukeTask(userData, task);
                 continue;
             }
         }
@@ -5325,6 +5361,172 @@ async function blockUserById(userId, onStart = null) { return makeApiRequest("ht
 async function unblockUserById(userId) { return makeApiRequest("https://x.com/i/api/1.1/blocks/destroy.json", "POST", `user_id=${userId}`); }
 
 // --- DATA & QUEUE MANAGEMENT ---
+function getUserDataStorageLockName(userId = currentUserId) {
+    return `${USER_DATA_STORAGE_LOCK_PREFIX}:${String(userId || 'unknown')}`;
+}
+function getUserDataEntryStorageKey(entry, fallbackPrefix = 'entry') {
+    const userId = entry?.userId || entry?.rest_id;
+    if (userId) return `id:${String(userId)}`;
+    const screenName = normalizePromoHandle(entry?.screenName || entry?.authorHandle);
+    if (screenName) return `handle:${screenName}`;
+    const taskId = entry?.taskId;
+    if (taskId) return `task:${String(taskId)}`;
+    const captureId = entry?.captureId;
+    if (captureId) return `capture:${String(captureId)}`;
+    return `${fallbackPrefix}:${JSON.stringify(entry || {})}`;
+}
+function getUserDataEntryTimestamp(entry) {
+    return Math.max(
+        Number(entry?.updatedAt) || 0,
+        Number(entry?.blockTimestamp) || 0,
+        Number(entry?.lastSeenAt) || 0,
+        Number(entry?.capturedAt) || 0,
+        Number(entry?.queuedAt) || 0,
+        Number(entry?.addedAt) || 0,
+        Number(entry?.createdAt) || 0
+    );
+}
+function mergeUserDataEntries(existing = [], incoming = [], getKey = getUserDataEntryStorageKey, limit = Infinity) {
+    const byKey = new Map();
+    const add = (entry) => {
+        if (!entry || typeof entry !== 'object') return;
+        const key = getKey(entry);
+        if (!key) return;
+        const previous = byKey.get(key);
+        if (!previous) {
+            byKey.set(key, { ...entry });
+            return;
+        }
+        const incomingIsNewer = getUserDataEntryTimestamp(entry) >= getUserDataEntryTimestamp(previous);
+        const primary = incomingIsNewer ? entry : previous;
+        const secondary = incomingIsNewer ? previous : entry;
+        byKey.set(key, {
+            ...secondary,
+            ...primary,
+            userId: primary.userId || secondary.userId || null,
+            screenName: normalizePromoHandle(primary.screenName || secondary.screenName),
+            nukeTaskIds: mergeNukeTaskIds(secondary.nukeTaskIds, primary.nukeTaskIds)
+        });
+    };
+    (existing || []).forEach(add);
+    (incoming || []).forEach(add);
+    return Array.from(byKey.values())
+        .sort((left, right) => getUserDataEntryTimestamp(right) - getUserDataEntryTimestamp(left))
+        .slice(0, limit);
+}
+function mergeQueueEntriesForStorage(existing = [], incoming = []) {
+    const byKey = new Map();
+    const add = (entry) => {
+        if (!entry || typeof entry !== 'object') return;
+        const key = getUserDataEntryStorageKey(entry, 'queue');
+        const previous = byKey.get(key);
+        if (!previous) {
+            byKey.set(key, { ...entry });
+            return;
+        }
+        const incomingIsNewer = getUserDataEntryTimestamp(entry) >= getUserDataEntryTimestamp(previous);
+        const primary = incomingIsNewer ? entry : previous;
+        const secondary = incomingIsNewer ? previous : entry;
+        const queuedAtValues = [primary.queuedAt, secondary.queuedAt].map(Number).filter((value) => value > 0);
+        byKey.set(key, {
+            ...secondary,
+            ...primary,
+            userId: primary.userId || secondary.userId || null,
+            screenName: normalizePromoHandle(primary.screenName || secondary.screenName),
+            userNameText: primary.userNameText || secondary.userNameText || '',
+            nukeTaskIds: mergeNukeTaskIds(secondary.nukeTaskIds, primary.nukeTaskIds),
+            queuedAt: queuedAtValues.length ? Math.min(...queuedAtValues) : 0,
+            retryAfter: Math.max(Number(primary.retryAfter) || 0, Number(secondary.retryAfter) || 0),
+            blockAttempts: Math.max(Number(primary.blockAttempts) || 0, Number(secondary.blockAttempts) || 0)
+        });
+    };
+    (existing || []).forEach(add);
+    (incoming || []).forEach(add);
+    return Array.from(byKey.values()).sort((left, right) => {
+        const priorityDiff = (Number(left.queuePriority) || 10) - (Number(right.queuePriority) || 10);
+        if (priorityDiff) return priorityDiff;
+        return (Number(left.queuedAt) || 0) - (Number(right.queuedAt) || 0);
+    });
+}
+function mergeManualDetectedNukeTaskEntries(existing = [], incoming = []) {
+    const byTaskId = new Map();
+    const mergeTask = (task) => {
+        if (!task?.taskId) return;
+        const previous = byTaskId.get(String(task.taskId));
+        if (!previous) {
+            byTaskId.set(String(task.taskId), { ...task });
+            return;
+        }
+        const incomingIsNewer = getUserDataEntryTimestamp(task) >= getUserDataEntryTimestamp(previous);
+        const primary = incomingIsNewer ? task : previous;
+        const secondary = incomingIsNewer ? previous : task;
+        const captureById = new Map();
+        [...(secondary.captures || []), ...(primary.captures || [])].forEach((capture, index) => {
+            const key = String(capture?.captureId || `${capture?.tweetContext?.tweetId || capture?.authorHandle || 'capture'}:${index}`);
+            const priorCapture = captureById.get(key);
+            if (!priorCapture || getUserDataEntryTimestamp(capture) >= getUserDataEntryTimestamp(priorCapture)) captureById.set(key, capture);
+        });
+        byTaskId.set(String(task.taskId), {
+            ...secondary,
+            ...primary,
+            taskId: String(task.taskId),
+            captures: Array.from(captureById.values()),
+            targetTweetIds: [...new Set([...(secondary.targetTweetIds || []), ...(primary.targetTweetIds || [])].map(String).filter(Boolean))],
+            collectedTweetIds: [...new Set([...(secondary.collectedTweetIds || []), ...(primary.collectedTweetIds || [])].map(String).filter(Boolean))],
+            apiUserIds: mergeNukeTaskIds(secondary.apiUserIds, primary.apiUserIds),
+            queuedUserIds: mergeNukeTaskIds(secondary.queuedUserIds, primary.queuedUserIds),
+            blockedUserIds: mergeNukeTaskIds(secondary.blockedUserIds, primary.blockedUserIds),
+            failedUserIds: mergeNukeTaskIds(secondary.failedUserIds, primary.failedUserIds),
+            skippedUserIds: mergeNukeTaskIds(secondary.skippedUserIds, primary.skippedUserIds),
+            discardedUserIds: mergeNukeTaskIds(secondary.discardedUserIds, primary.discardedUserIds)
+        });
+    };
+    (existing || []).forEach(mergeTask);
+    (incoming || []).forEach(mergeTask);
+    return Array.from(byTaskId.values())
+        .sort((left, right) => getUserDataEntryTimestamp(right) - getUserDataEntryTimestamp(left))
+        .slice(0, MANUAL_DETECTED_NUKE_TASK_LIMIT);
+}
+function isQueueEntryDiscardedForStoredTasks(entry, tasks = []) {
+    const userId = String(entry?.userId || '');
+    const taskIds = getEntryNukeTaskIds(entry);
+    if (!userId || !taskIds.length) return false;
+    const taskById = new Map((tasks || []).map((task) => [String(task?.taskId || ''), task]));
+    return taskIds.every((taskId) => normalizeNukeTaskIds(taskById.get(taskId)?.discardedUserIds).includes(userId));
+}
+function mergeUserDataForSave(storedData = {}, localData = {}, now = Date.now()) {
+    const stored = storedData && typeof storedData === 'object' ? storedData : {};
+    const local = localData && typeof localData === 'object' ? localData : {};
+    const blockLogLimit = Number(scriptConfig?.blockLogLimit) || 500;
+    const completedManualDetectedNukeTaskIds = mergeNukeTaskIds(
+        stored.completedManualDetectedNukeTaskIds,
+        local.completedManualDetectedNukeTaskIds
+    ).slice(-MANUAL_DETECTED_NUKE_TASK_LIMIT);
+    const completedTaskIdSet = new Set(completedManualDetectedNukeTaskIds);
+    const merged = {
+        ...stored,
+        ...local,
+        whitelist: mergeUserDataEntries(stored.whitelist, local.whitelist, (entry) => getUserDataEntryStorageKey(entry, 'whitelist')),
+        promoTargets: mergeUserDataEntries(stored.promoTargets, local.promoTargets, (entry) => `handle:${normalizePromoHandle(entry?.screenName)}`),
+        blockedLog: mergeUserDataEntries(stored.blockedLog, local.blockedLog, (entry) => getUserDataEntryStorageKey(entry, 'blocked')).slice(0, blockLogLimit),
+        nukeCaptures: mergeUserDataEntries(stored.nukeCaptures, local.nukeCaptures, (entry) => `capture:${String(entry?.captureId || '')}`, NUKE_CAPTURE_LOG_LIMIT),
+        manualDetectedNukeTasks: mergeManualDetectedNukeTaskEntries(stored.manualDetectedNukeTasks, local.manualDetectedNukeTasks)
+            .filter((task) => !completedTaskIdSet.has(String(task?.taskId || '')) && task?.status !== 'complete'),
+        completedManualDetectedNukeTaskIds,
+        pendingHiddenUsers: mergePendingHiddenUserEntries(stored.pendingHiddenUsers, local.pendingHiddenUsers, now),
+        releasedHiddenUsers: mergePendingHiddenUserEntries(stored.releasedHiddenUsers, local.releasedHiddenUsers, now).slice(0, HIDDEN_RELEASE_QUEUE_LIMIT),
+        hiddenReleaseQueue: mergePendingHiddenUserEntries(stored.hiddenReleaseQueue, local.hiddenReleaseQueue, now).slice(0, HIDDEN_RELEASE_QUEUE_LIMIT),
+        lastBlockTimestamp: Math.max(Number(stored.lastBlockTimestamp) || 0, Number(local.lastBlockTimestamp) || 0)
+    };
+    applyHiddenUserReleaseQueue(merged);
+    pruneReleasedPendingHiddenUsers(merged);
+    const excludedQueueKeys = getHiddenUserExclusionKeys(merged);
+    merged.queue = mergeQueueEntriesForStorage(stored.queue, local.queue).filter((entry) => {
+        if (getHiddenUserStorageKeys(entry).some((key) => excludedQueueKeys.has(key))) return false;
+        return !isQueueEntryDiscardedForStoredTasks(entry, merged.manualDetectedNukeTasks);
+    });
+    return merged;
+}
 async function loadUserData() {
     if (!currentUserId) return null;
     const allData = await GM_getValue(STORAGE_KEY, {});
@@ -5336,28 +5538,32 @@ async function loadUserData() {
     if (!Array.isArray(userData.promoTargets)) userData.promoTargets = [];
     if (!Array.isArray(userData.pendingHiddenUsers)) userData.pendingHiddenUsers = [];
     if (!Array.isArray(userData.hiddenReleaseQueue)) userData.hiddenReleaseQueue = [];
+    if (!Array.isArray(userData.releasedHiddenUsers)) userData.releasedHiddenUsers = [];
     if (!Array.isArray(userData.nukeCaptures)) userData.nukeCaptures = [];
     if (!Array.isArray(userData.manualDetectedNukeTasks)) userData.manualDetectedNukeTasks = [];
+    if (!Array.isArray(userData.completedManualDetectedNukeTaskIds)) userData.completedManualDetectedNukeTaskIds = [];
     if (!Number.isFinite(Number(userData.lastBlockTimestamp))) userData.lastBlockTimestamp = 0;
     const releasedHiddenUsers = applyHiddenUserReleaseQueue(userData);
+    const prunedReleasedHiddenUsers = pruneReleasedPendingHiddenUsers(userData);
     const normalizedManualTasks = normalizeManualDetectedNukeTasks(userData);
     const discardedTerminalFailures = discardTerminalManualDetectedNukeFailures(userData);
     const backfilledRootProtection = backfillQueueRootAuthorProtection(userData);
     if (userData.spamIdentifyLog) {
         delete userData.spamIdentifyLog;
-        allData[currentUserId] = userData;
-        await GM_setValue(STORAGE_KEY, allData);
-    } else if (releasedHiddenUsers > 0 || normalizedManualTasks > 0 || discardedTerminalFailures > 0 || backfilledRootProtection > 0) {
-        allData[currentUserId] = userData;
-        await GM_setValue(STORAGE_KEY, allData);
+        await saveUserData(userData);
+    } else if (releasedHiddenUsers > 0 || prunedReleasedHiddenUsers > 0 || normalizedManualTasks > 0 || discardedTerminalFailures > 0 || backfilledRootProtection > 0) {
+        await saveUserData(userData);
     }
     return userData;
 }
 async function saveUserData(data) {
     if (!currentUserId) return;
-    const allData = await GM_getValue(STORAGE_KEY, {});
-    allData[currentUserId] = data;
-    await GM_setValue(STORAGE_KEY, allData);
+    const userId = currentUserId;
+    await withCrossTabLock(getUserDataStorageLockName(userId), async () => {
+        const allData = await GM_getValue(STORAGE_KEY, {});
+        allData[userId] = mergeUserDataForSave(allData[userId], data);
+        await GM_setValue(STORAGE_KEY, allData);
+    });
 }
 
 // --- UI & FEEDBACK ---
@@ -5578,6 +5784,34 @@ async function updateStatusToast() {
         delete activeToast.dataset.nukeQueueCompletion;
     }
     startQueueStatusCountdown(nextActionAt);
+}
+async function syncPassiveQueueStateFromStorage() {
+    if (!currentUserId || passiveQueueStateSyncRunning) return;
+    passiveQueueStateSyncRunning = true;
+    try {
+        const userData = await loadUserData();
+        if (userData) applyPendingHiddenUsersToPage(userData);
+        await updateStatusToast();
+        updateManualDetectedNukeButton();
+    } catch (error) {
+        console.warn('[CB] 同步跨标签队列状态失败', error);
+    } finally {
+        passiveQueueStateSyncRunning = false;
+    }
+}
+function ensurePassiveQueueStateSync() {
+    if (!passiveQueueStateSyncIntervalId) {
+        passiveQueueStateSyncIntervalId = window.setInterval(() => {
+            void syncPassiveQueueStateFromStorage();
+        }, PROCESS_CHECK_INTERVAL_MS);
+    }
+    if (!passiveQueueVisibilitySyncBound) {
+        passiveQueueVisibilitySyncBound = true;
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) void syncPassiveQueueStateFromStorage();
+        });
+    }
+    void syncPassiveQueueStateFromStorage();
 }
 function hideElement(element) {
     if (!element) return;
@@ -6528,6 +6762,7 @@ async function initialize() {
             dismissToast('nuke-api-limit-toast');
         }
         await updateStatusToast();
+        ensurePassiveQueueStateSync();
         ensureManualDetectedNukeButton();
         const debugConfigTriggerEnabled = shouldShowDebugConfigTrigger();
         if (debugConfigTriggerEnabled) {

@@ -32,12 +32,16 @@ function loadHelpers(names) {
         BLOCK_RETRY_BASE_MS: 30000,
         BLOCK_RETRY_MAX_MS: 300000,
         BLOCK_RETRY_MAX_ATTEMPTS: 4,
+        HIDDEN_RELEASE_QUEUE_LIMIT: 2000,
+        NUKE_CAPTURE_LOG_LIMIT: 300,
+        MANUAL_DETECTED_NUKE_TASK_LIMIT: 20,
         AVATAR_OCR_ENGINE_OFF: 'off',
         AVATAR_OCR_ENGINE_PADDLE: 'paddle',
         AVATAR_OCR_ENGINE_TESSERACT: 'tesseract',
         window: { innerHeight: 800 },
         currentUserId: 'self',
-        buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
+        buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' }),
+        scriptConfig: { blockLogLimit: 500 }
     };
     const baseNames = [
         'normalizeNukeTaskIds',
@@ -224,6 +228,8 @@ test('hidden release queue removes truly blocked users from pending hidden users
         'getHiddenUserStorageKeys',
         'mergePendingHiddenUserEntries',
         'queueHiddenUserRelease',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
         'applyHiddenUserReleaseQueue'
     ]);
     const userData = {
@@ -242,6 +248,7 @@ test('hidden release queue removes truly blocked users from pending hidden users
     assert.equal(released, 2);
     assert.deepEqual(JSON.parse(JSON.stringify(userData.pendingHiddenUsers)), [{ userId: '1', screenName: 'one' }]);
     assert.deepEqual(JSON.parse(JSON.stringify(userData.hiddenReleaseQueue)), []);
+    assert.deepEqual(Array.from(userData.releasedHiddenUsers, (entry) => entry.screenName).sort(), ['handleonly', 'two']);
 });
 
 test('hidden release queue can release handle-only pending entries after id is resolved', () => {
@@ -250,6 +257,8 @@ test('hidden release queue can release handle-only pending entries after id is r
         'getHiddenUserStorageKeys',
         'mergePendingHiddenUserEntries',
         'queueHiddenUserRelease',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
         'applyHiddenUserReleaseQueue'
     ]);
     const userData = {
@@ -265,6 +274,140 @@ test('hidden release queue can release handle-only pending entries after id is r
 
     assert.equal(released, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(userData.pendingHiddenUsers)), [{ screenName: 'still_pending' }]);
+    assert.deepEqual(Array.from(userData.releasedHiddenUsers, (entry) => entry.screenName), ['resolved_later']);
+});
+
+test('cross-tab saves preserve immediate hides and do not resurrect completed queue entries', () => {
+    const { mergeUserDataForSave } = loadHelpers([
+        'getHiddenUserStorageKey',
+        'getHiddenUserStorageKeys',
+        'mergePendingHiddenUserEntries',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
+        'applyHiddenUserReleaseQueue',
+        'getUserDataEntryStorageKey',
+        'getUserDataEntryTimestamp',
+        'mergeUserDataEntries',
+        'mergeQueueEntriesForStorage',
+        'mergeManualDetectedNukeTaskEntries',
+        'isQueueEntryDiscardedForStoredTasks',
+        'mergeUserDataForSave'
+    ]);
+    const storedByWorker = {
+        queue: [{ userId: 'still-queued', screenName: 'still_queued', queuedAt: 10 }],
+        blockedLog: [{ userId: 'already-blocked', screenName: 'already_blocked', blockTimestamp: 200 }],
+        pendingHiddenUsers: [],
+        releasedHiddenUsers: [],
+        hiddenReleaseQueue: [],
+        whitelist: [],
+        promoTargets: [],
+        nukeCaptures: [],
+        manualDetectedNukeTasks: [],
+        lastBlockTimestamp: 200
+    };
+    const staleManualPage = {
+        queue: [
+            { userId: 'already-blocked', screenName: 'already_blocked', queuedAt: 1 },
+            { userId: 'still-queued', screenName: 'still_queued', queuedAt: 10 }
+        ],
+        blockedLog: [],
+        pendingHiddenUsers: [{ screenName: 'newly_detected', addedAt: 300 }],
+        releasedHiddenUsers: [],
+        hiddenReleaseQueue: [],
+        whitelist: [],
+        promoTargets: [],
+        nukeCaptures: [],
+        manualDetectedNukeTasks: [],
+        lastBlockTimestamp: 0
+    };
+
+    const merged = mergeUserDataForSave(storedByWorker, staleManualPage, 400);
+
+    assert.deepEqual(Array.from(merged.pendingHiddenUsers, (entry) => entry.screenName), ['newly_detected']);
+    assert.deepEqual(Array.from(merged.queue, (entry) => entry.userId), ['still-queued']);
+    assert.equal(merged.lastBlockTimestamp, 200);
+});
+
+test('durable hidden-user releases win over a stale page snapshot', () => {
+    const { queueHiddenUserRelease, applyHiddenUserReleaseQueue, mergeUserDataForSave } = loadHelpers([
+        'getHiddenUserStorageKey',
+        'getHiddenUserStorageKeys',
+        'mergePendingHiddenUserEntries',
+        'queueHiddenUserRelease',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
+        'applyHiddenUserReleaseQueue',
+        'getUserDataEntryStorageKey',
+        'getUserDataEntryTimestamp',
+        'mergeUserDataEntries',
+        'mergeQueueEntriesForStorage',
+        'mergeManualDetectedNukeTaskEntries',
+        'isQueueEntryDiscardedForStoredTasks',
+        'mergeUserDataForSave'
+    ]);
+    const stored = {
+        pendingHiddenUsers: [{ screenName: 'released_later' }],
+        hiddenReleaseQueue: [],
+        releasedHiddenUsers: [],
+        queue: [],
+        blockedLog: [],
+        whitelist: [],
+        promoTargets: [],
+        nukeCaptures: [],
+        manualDetectedNukeTasks: []
+    };
+    queueHiddenUserRelease(stored, { userId: '42', screenName: 'released_later' }, 500);
+    assert.equal(applyHiddenUserReleaseQueue(stored), 1);
+
+    const stale = {
+        pendingHiddenUsers: [{ screenName: 'released_later' }],
+        hiddenReleaseQueue: [],
+        releasedHiddenUsers: [],
+        queue: [],
+        blockedLog: [],
+        whitelist: [],
+        promoTargets: [],
+        nukeCaptures: [],
+        manualDetectedNukeTasks: []
+    };
+    const merged = mergeUserDataForSave(stored, stale, 600);
+
+    assert.deepEqual(Array.from(merged.pendingHiddenUsers), []);
+    assert.deepEqual(Array.from(merged.releasedHiddenUsers, (entry) => entry.screenName), ['released_later']);
+});
+
+test('completed manual tasks cannot be restored by a stale cross-tab save', () => {
+    const { mergeUserDataForSave } = loadHelpers([
+        'getHiddenUserStorageKey',
+        'getHiddenUserStorageKeys',
+        'mergePendingHiddenUserEntries',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
+        'applyHiddenUserReleaseQueue',
+        'getUserDataEntryStorageKey',
+        'getUserDataEntryTimestamp',
+        'mergeUserDataEntries',
+        'mergeQueueEntriesForStorage',
+        'mergeManualDetectedNukeTaskEntries',
+        'isQueueEntryDiscardedForStoredTasks',
+        'mergeUserDataForSave'
+    ]);
+    const staleWorker = {
+        queue: [], blockedLog: [], whitelist: [], promoTargets: [], nukeCaptures: [],
+        pendingHiddenUsers: [], releasedHiddenUsers: [], hiddenReleaseQueue: [],
+        manualDetectedNukeTasks: [{ taskId: 'finished-task', status: 'queued', updatedAt: 100 }]
+    };
+    const completedPage = {
+        queue: [], blockedLog: [], whitelist: [], promoTargets: [], nukeCaptures: [],
+        pendingHiddenUsers: [], releasedHiddenUsers: [], hiddenReleaseQueue: [],
+        manualDetectedNukeTasks: [],
+        completedManualDetectedNukeTaskIds: ['finished-task']
+    };
+
+    const merged = mergeUserDataForSave(staleWorker, completedPage, 200);
+
+    assert.deepEqual(Array.from(merged.manualDetectedNukeTasks), []);
+    assert.deepEqual(Array.from(merged.completedManualDetectedNukeTaskIds), ['finished-task']);
 });
 
 test('username keyword match still blocks when follower count is unknown', () => {
@@ -1083,6 +1226,7 @@ test('manual detected nuke migration leaves queued tasks with zero api users alo
 test('manual detected nuke migration removes completed tasks', () => {
     const { normalizeManualDetectedNukeTasks } = loadHelpers([
         'getActiveManualDetectedNukeTasks',
+        'recordCompletedManualDetectedNukeTask',
         'shouldRetryQueuedManualDetectedNukeTask',
         'normalizeManualDetectedNukeTasks'
     ]);
@@ -1102,6 +1246,7 @@ test('manual detected nuke migration removes completed tasks', () => {
     assert.equal(normalizeManualDetectedNukeTasks(userData), 1);
 
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks, (task) => task.taskId), ['queued-task']);
+    assert.deepEqual(Array.from(userData.completedManualDetectedNukeTaskIds), ['complete-task']);
 });
 
 test('manual detected nuke migration reruns stale running tasks with zero api users', () => {
@@ -1157,6 +1302,7 @@ test('manual detected nuke completion removes terminal tasks from storage', () =
         'getManualDetectedNukeTaskTweetIds',
         'sumManualDetectedExpectedBlockCount',
         'getManualDetectedNukeTaskStats',
+        'recordCompletedManualDetectedNukeTask',
         'completeFinishedManualDetectedNukeTasks'
     ]);
     const userData = {
@@ -1172,6 +1318,7 @@ test('manual detected nuke completion removes terminal tasks from storage', () =
     assert.equal(completed.taskId, 'finished');
     assert.equal(completed.status, 'complete');
     assert.deepEqual(Array.from(userData.manualDetectedNukeTasks), []);
+    assert.deepEqual(Array.from(userData.completedManualDetectedNukeTaskIds), ['finished']);
 });
 
 test('manual detected chain collection can continue without resolved author id', () => {
