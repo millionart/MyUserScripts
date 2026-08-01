@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.84
+// @version      2.15.94
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -89,6 +89,8 @@ const profileBioFetchPending = new Map();
 const profileBioQueue = [];
 const deferredProfileBioArticles = new Set();
 const deferredProfileBioScreenNames = new WeakMap();
+const deferredProfileBioPriorities = new WeakMap();
+const profileHoverCardScanTimers = new WeakMap();
 let avatarOcrPumpRunning = false;
 let avatarOcrPumpRunId = 0;
 let avatarOcrActiveStartedAt = 0;
@@ -105,7 +107,8 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.83';
+const SPAM_SCANNER_BUILD = '2.15.94';
+const PROFILE_HOVER_CARD_SELECTOR = '[data-testid="HoverCard"], [data-testid="hoverCard"], [data-testid="UserHoverCard"]';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
 const TESSERACT_LANG_CACHE_KEY = './chi_sim.traineddata';
@@ -1044,9 +1047,10 @@ function shouldSkipSpamIdentifyForArticle(article, detection = null) {
 const FOLLOWER_COUNT_CACHE_MS = 10 * 60 * 1000;
 const DETECTION_SAFETY_INTERVAL_MS = 15000;
 const DETECTION_SCAN_DELAY_MS = 160;
+const DETECTION_VIEWPORT_REPRIORITIZE_MS = 90;
 const API_RETRY_DELAY_MS = 5 * 60 * 1000;
 let currentUserId = null, currentUserScreenName = null, activeTweetArticle = null;
-let isProcessingQueue = false, processIntervalId = null, queueStatusCountdownInterval = null, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
+let isProcessingQueue = false, processIntervalId = null, queueStatusCountdownInterval = null, queueStatusWasActive = false, apiLimitCountdownInterval = null, apiLimitRetryTimeoutId = null, apiLimitRetryAt = 0;
 let apiOperationTail = Promise.resolve(), apiLastOperationStartedAt = 0;
 let manualDetectedNukeRunning = false, manualDetectedNukeTaskRunning = false, manualDetectedNukeResumeTimeoutId = null;
 let backgroundWorkerLeader = false, backgroundWorkerLeadershipPending = false, backgroundWorkerRelease = null, backgroundWorkerRetryTimeoutId = null, backgroundWorkerTickRunning = false;
@@ -1055,7 +1059,7 @@ let menuCommandRegistered = false, userscriptBootstrapPromise = null, initialize
 let statusRootTweetCache = { pageTweetId: '', rootTweetId: '', authorHandle: '' };
 const pendingDetectionArticles = new Set();
 let detectionScanTimeoutId = null, detectionScanIdleId = null, detectionScanRunning = false, detectionFullScanPending = false;
-let detectionScanRerunRequested = false, detectionScanRunCount = 0, detectionScanArticleCount = 0, detectionScanPath = '';
+let detectionScanRerunRequested = false, detectionViewportReprioritizeTimeoutId = null, detectionScanRunCount = 0, detectionScanArticleCount = 0, detectionScanPath = '';
 const aggregatedToastState = new Map();
 const followerCountCache = new Map();
 
@@ -1573,6 +1577,25 @@ function isAdultEndorsementContextCompact(compact) {
     const endorsement = '(?:极品|够劲|带劲|炸裂)';
     return new RegExp(`${subject}.{0,20}${endorsement}|${endorsement}.{0,20}${subject}`).test(text);
 }
+function isAdultBenefitBaitCompact(compact) {
+    const text = String(compact || '');
+    const lewdTease = /太涩|好涩|真涩|很涩|涩了|太色|好色|很色|色了/.test(text);
+    const exploreTease = /玩(?:得|的)?开|放得开|真会玩/.test(text);
+    const inviteBenefitReview = /(?:有人|谁).{0,4}(?:想|敢).{0,6}(?:锐评|点评|评价).{0,10}我(?:的)?福(?:利)?/.test(text);
+    const noFakeBenefitLure = /我(?:的)?福(?:利)?.{0,5}(?:不黑|不信|保真|可看).{0,6}(?:看|看看)/.test(text);
+    return (lewdTease && inviteBenefitReview) || (exploreTease && noFakeBenefitLure);
+}
+function isAdultComparisonBaitCompact(compact) {
+    const text = String(compact || '');
+    return /比我好看(?:的)?没我(?:骚|涩)/.test(text) && /比我(?:骚|涩)(?:的)?没我好看/.test(text);
+}
+function isAdultMentionBaitCompact(compact, raw) {
+    const text = String(compact || '').toLowerCase();
+    const hasMention = /@[a-z0-9_]{2,}/i.test(String(raw || ''));
+    const explicitWetness = /(?:下面|私处|穴|逼|b).{0,8}(?:湿|湿润)/.test(text);
+    const explicitSexAftereffect = /被\s*(?:c|操|艹|干|日).{0,12}(?:站不起来|起不来|走不动)/i.test(text);
+    return hasMention && explicitWetness && explicitSexAftereffect;
+}
 function isIncidentClipFunnelCompact(compact) {
     const text = String(compact || '').toLowerCase();
     const platform = '(?:快手|抖音|小红书|视频号|微博|b站|bilibili)';
@@ -1593,9 +1616,9 @@ function isAdultPlatformClipFunnelCompact(compact) {
     return accountDiscovery && adultContext && clipLure && spreadHook;
 }
 const PROFILE_BIO_SIGNAL_DEFS = [
-    { id: 'bio_adult_service', label: '成人服务简介', weight: 2, test: (compact, raw) => /(?:曰|日|约).{0,3}炮|同城.{0,8}(?:约|空降|上门)|附近.{0,8}(?:可加|加v|加微|加薇|约)|外围|楼凤|援交|约妹|约啪|约拍私房/i.test(compact) || /(?:曰|日|约)\s*炮|附近的?可加\s*v/i.test(raw) },
-    { id: 'bio_trust_pitch', label: '平台认证话术', weight: 1, test: (compact, raw) => /(?:已入驻|入驻).{0,10}平台|真人认证|隐私.{0,8}(?:保护|安全|保障)|平台.{0,10}(?:隐私|认证|保障|安全)/.test(compact) || /真人认证|隐私保护|隐私安全|上平台隐私安全有保障/.test(raw) },
-    { id: 'bio_contact_route', label: '简介联系方式', weight: 1, test: (compact, raw) => /https?:\/\/\s*[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)|[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)\b|加\s*[v微薇]|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)|@[a-z0-9_]{3,15}|电报|telegram|(?:^|[^a-z])tg(?:[^a-z]|$)/i.test(raw) || /加v|加微|加薇|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)/i.test(compact) }
+    { id: 'bio_adult_service', label: '成人服务简介', weight: 2, test: (compact, raw) => /(?:曰|日|约|寻).{0,4}(?:p|炮)|(?:涩播|涩涩).{0,18}(?:视频|照片|直播|平台)|直播.{0,12}(?:远程|控制).{0,12}玩具|同城.{0,12}(?:可加|加)(?:绿泡泡|v|微|薇)|同城.{0,8}(?:约|空降|上门)|附近.{0,8}(?:可加|加v|加微|加薇|约)|外围|楼凤|援交|约妹|约啪|约拍私房/i.test(compact) || /(?:曰|日|约|寻)\s*(?:p|炮)|涩播|涩涩.{0,18}(?:视频|照片|直播|平台)|附近的?可加\s*v/i.test(raw) },
+    { id: 'bio_trust_pitch', label: '平台认证话术', weight: 1, test: (compact, raw) => /(?:已入驻|入驻|已入住|入住).{0,10}平台|真人认证|隐私.{0,8}(?:保护|安全|保障)|平台.{0,10}(?:隐私|认证|保障|安全)/.test(compact) || /真人认证|隐私保护|隐私安全|上平台隐私安全有保障/.test(raw) },
+    { id: 'bio_contact_route', label: '简介联系方式', weight: 1, test: (compact, raw) => /https?:\/\/\s*[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)|[a-z0-9][a-z0-9.-]{2,}\.(?:top|xyz|cc|vip|lol|icu|com|net|org)\b|加\s*(?:[v微薇]|绿泡泡)|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)|@[a-z0-9_]{3,15}|电报|telegram|(?:^|[^a-z])tg(?:[^a-z]|$)/i.test(raw) || /加(?:v|微|薇|绿泡泡)|小号.{0,8}(?:禁言|被封|封了)|大号.{0,8}(?:在这|看这)/i.test(compact) }
 ];
 function detectProfileBioSpam(text) {
     const rawInput = String(text || '');
@@ -1639,6 +1662,9 @@ const SPAM_SIGNAL_DEFS = [
     { id: 'gray_money_funnel', label: '灰产/赚钱导流', weight: 3, test: (compact) => /交易所|okx|返佣|长期套利|收益空间|网赚|副业|偏门|跑分|灰产|日结|快钱|搞钱|洗钱|外汇/.test(compact) && /联系我|私聊|有兴趣了解|兴趣了解|可以联系|可以玩|稳定长期|每天都有收益|稳定执行|流程清晰|带你|稳赚/.test(compact) },
     { id: 'incident_clip_funnel', label: '事件视频导流', weight: 3, test: (compact) => isIncidentClipFunnelCompact(compact) },
     { id: 'adult_platform_clip_funnel', label: '成人偷拍视频导流', weight: 3, test: (compact) => isAdultPlatformClipFunnelCompact(compact) },
+    { id: 'adult_benefit_bait', label: '成人福利诱导', weight: 3, test: (compact) => isAdultBenefitBaitCompact(compact) },
+    { id: 'adult_comparison_bait', label: '成人比美诱导', weight: 3, test: (compact) => isAdultComparisonBaitCompact(compact) },
+    { id: 'adult_mention_bait', label: '露骨性内容@导流', weight: 3, test: (compact, raw) => isAdultMentionBaitCompact(compact, raw) },
     { id: 'emoji_only_bait', label: '纯 emoji 诱导', weight: 3, test: (compact, raw, source) => isEmojiOnlyBaitText(source) },
     { id: 'short_location_invite', label: '短句位置邀约', weight: 3, test: (compact) => isShortLocationInviteCompact(compact) },
     { id: 'pet_role_invite', label: '宠物角色邀约', weight: 3, test: (compact) => isPetRoleInviteCompact(compact) },
@@ -3530,7 +3556,7 @@ function removeProfileBioJobsForArticle(article) {
 function isProfileBioJobActiveForArticle(article) {
     return !!article && profileBioActiveArticle === article;
 }
-function enqueueProfileBioScan(article, screenName) {
+function enqueueProfileBioScan(article, screenName, priority = 0) {
     if (!article || !screenName) return;
     clearDeferredProfileBioArticle(article);
     const visible = isArticleInViewport(article);
@@ -3540,7 +3566,7 @@ function enqueueProfileBioScan(article, screenName) {
     article.dataset.profileBioQueued = 'true';
     article.dataset.profileBioPending = 'true';
     article.dataset.profileBioQueuedAt = String(Date.now());
-    const job = { article, screenName, priority: visible ? 1000 : 0 };
+    const job = { article, screenName, priority: Math.max(0, Number(priority) || 0) };
     if (visible) profileBioQueue.unshift(job);
     else profileBioQueue.push(job);
     void pumpProfileBioQueue();
@@ -3573,16 +3599,18 @@ function clearDeferredProfileBioArticle(article) {
     if (!article) return;
     deferredProfileBioArticles.delete(article);
     deferredProfileBioScreenNames.delete(article);
+    deferredProfileBioPriorities.delete(article);
     delete article.dataset.profileBioDeferred;
     profileBioVisibilityObserver?.unobserve(article);
 }
 function activateDeferredProfileBioArticle(article) {
     if (!article?.isConnected || document.hidden || !isArticleNearOcrViewport(article)) return false;
     const screenName = getArticleAuthorScreenName(article) || deferredProfileBioScreenNames.get(article);
+    const priority = Math.max(0, Number(deferredProfileBioPriorities.get(article)) || 0);
     clearDeferredProfileBioArticle(article);
     if (!screenName || scriptConfig.spamIdentifyEnabled === false) return false;
     delete article.dataset.spamScanned;
-    enqueueProfileBioScan(article, screenName);
+    enqueueProfileBioScan(article, screenName, priority);
     return true;
 }
 function ensureProfileBioVisibilityObserver() {
@@ -3594,22 +3622,23 @@ function ensureProfileBioVisibilityObserver() {
     }, { root: null, rootMargin: `${AVATAR_OCR_VIEWPORT_MARGIN}px 0px` });
     return profileBioVisibilityObserver;
 }
-function deferProfileBioUntilNearViewport(article, screenName) {
+function deferProfileBioUntilNearViewport(article, screenName, priority = 0) {
     if (!article?.isConnected || !screenName) return false;
     finalizeSpamArticleScan(article);
     article.dataset.profileBioDeferred = 'true';
     deferredProfileBioArticles.add(article);
     deferredProfileBioScreenNames.set(article, screenName);
+    deferredProfileBioPriorities.set(article, Math.max(0, Number(priority) || 0));
     ensureProfileBioVisibilityObserver()?.observe(article);
     return true;
 }
-function scheduleProfileBioScanForArticle(article, screenName) {
+function scheduleProfileBioScanForArticle(article, screenName, priority = 0) {
     if (!article?.isConnected || !screenName) return false;
     if (document.hidden || !isArticleNearOcrViewport(article)) {
-        return deferProfileBioUntilNearViewport(article, screenName);
+        return deferProfileBioUntilNearViewport(article, screenName, priority);
     }
     clearDeferredProfileBioArticle(article);
-    enqueueProfileBioScan(article, screenName);
+    enqueueProfileBioScan(article, screenName, priority);
     return true;
 }
 function resumeDeferredProfileBioArticles() {
@@ -3626,6 +3655,7 @@ function clearDeferredProfileBioArticles() {
     profileBioVisibilityObserver = null;
     deferredProfileBioArticles.forEach((article) => {
         deferredProfileBioScreenNames.delete(article);
+        deferredProfileBioPriorities.delete(article);
         if (article?.dataset) delete article.dataset.profileBioDeferred;
     });
     deferredProfileBioArticles.clear();
@@ -3734,9 +3764,22 @@ function shouldPromoteVisibleAvatarOcrPending(article) {
 function isArticleInViewport(article) {
     return isArticleNearOcrViewport(article, window.innerHeight, 0);
 }
+function getArticleViewportWorkPriority(article, viewportHeight = (typeof window !== 'undefined' ? window.innerHeight : 0)) {
+    if (!article?.isConnected || typeof article.getBoundingClientRect !== 'function') return 0;
+    const rect = article.getBoundingClientRect();
+    if (rect.bottom > 0 && rect.top < viewportHeight) return 3;
+    if (rect.top >= viewportHeight) return 2;
+    return 1;
+}
+function sortArticlesByViewportWorkPriority(articles = []) {
+    return [...new Set(articles || [])]
+        .map((article, index) => ({ article, index, priority: getArticleViewportWorkPriority(article) }))
+        .sort((left, right) => (right.priority - left.priority) || (left.index - right.index))
+        .map((entry) => entry.article);
+}
 function avatarOcrJobScore(job) {
     if (!job?.article?.isConnected) return -Infinity;
-    return (isArticleInViewport(job.article) ? 2000 : isArticleNearOcrViewport(job.article) ? 1000 : 0) + (Number(job.priority) || 0);
+    return getArticleViewportWorkPriority(job.article) * 1000 + (Number(job.priority) || 0);
 }
 function takeNextAvatarOcrJob() {
     let bestIndex = -1;
@@ -3821,6 +3864,14 @@ function shouldCheckProfileBioForArticle(article, tweetText) {
     const compact = compactSpamText(raw);
     return compact.length <= 28 || isShortDatingInviteCompact(compact) || isEmojiOnlyBaitText(raw);
 }
+function shouldSkipProfileBioForDetectedArticle(article, textDetection = null) {
+    if (textDetection?.match) return true;
+    return !!article?.querySelector?.('.nuke-spam-badge');
+}
+function getProfileBioJobPriority(textDetection = null) {
+    const score = Math.max(0, Number(textDetection?.score) || 0);
+    return Math.min(60, score * 20);
+}
 function continueSpamScanAfterProfileBio(article) {
     if (!article?.isConnected) return;
     delete article.dataset.profileBioPending;
@@ -3863,12 +3914,75 @@ function getUserDescriptionFromUserResult(userResult) {
 function shouldExemptProfileBioUserResult(userResult) {
     return isFollowerCountExempt(getFollowersCountFromUserResult(userResult));
 }
+function getProfileHoverCardScreenName(card) {
+    const ignored = new Set(['home', 'explore', 'notifications', 'messages', 'search', 'i', 'settings', 'compose', 'login', 'signup']);
+    for (const link of Array.from(card?.querySelectorAll?.('a[href]') || [])) {
+        const href = link.getAttribute?.('href') || link.href || '';
+        const screenName = getScreenNameFromProfileHref(href);
+        if (/^[a-z0-9_]{1,15}$/i.test(screenName) && !ignored.has(screenName.toLowerCase())) return screenName;
+    }
+    return '';
+}
+function getProfileHoverCardsFromNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return [];
+    const cards = new Set();
+    if (node.matches?.(PROFILE_HOVER_CARD_SELECTOR)) cards.add(node);
+    const closest = node.closest?.(PROFILE_HOVER_CARD_SELECTOR);
+    if (closest) cards.add(closest);
+    node.querySelectorAll?.(PROFILE_HOVER_CARD_SELECTOR).forEach((card) => cards.add(card));
+    return Array.from(cards);
+}
+function scanProfileHoverCard(card) {
+    if (!card?.isConnected || card.dataset.cbProfileHoverCardScannedBuild === SPAM_SCANNER_BUILD) return false;
+    const screenName = getProfileHoverCardScreenName(card);
+    const cardText = String(card.innerText || '').trim();
+    if (!screenName || cardText.length < 8) return false;
+    const detection = detectProfileBioSpam(cardText);
+    if (!detection.match) return false;
+    card.dataset.cbProfileHoverCardScannedBuild = SPAM_SCANNER_BUILD;
+    const normalizedScreenName = screenName.toLowerCase();
+    let marked = false;
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => {
+        if (isStatusRootTweetArticle(article) || getArticleAuthorScreenName(article).toLowerCase() !== normalizedScreenName) return;
+        removeProfileBioJobsForArticle(article);
+        clearDeferredProfileBioArticle(article);
+        article.dataset.profileBioScannedBuild = SPAM_SCANNER_BUILD;
+        if (shouldExemptArticleByBlueVerified(article, 'profile_hover') || isFollowerCountExempt(getVisibleOrCachedFollowerCount(article, screenName))) {
+            finalizeSpamArticleScan(article);
+            return;
+        }
+        ensureSpamBadge(article, detection, 'bio');
+        triggerAutoNukeForMarkedArticle(article, {
+            triggerMode: 'auto',
+            autoReason: 'profile_hover',
+            profileBioSummary: detection.summary
+        });
+        finalizeSpamArticleScan(article);
+        marked = true;
+    });
+    return marked;
+}
+function scheduleProfileHoverCardScan(card) {
+    if (!card?.isConnected) return;
+    const previousTimer = profileHoverCardScanTimers.get(card);
+    if (previousTimer) clearTimeout(previousTimer);
+    const timer = window.setTimeout(() => {
+        profileHoverCardScanTimers.delete(card);
+        scanProfileHoverCard(card);
+    }, 80);
+    profileHoverCardScanTimers.set(card, timer);
+}
+function scheduleProfileHoverCardScansFromNode(node) {
+    const cards = getProfileHoverCardsFromNode(node);
+    cards.forEach(scheduleProfileHoverCardScan);
+    return cards.length;
+}
 function takeNextProfileBioJob() {
     let bestIndex = -1;
     let bestScore = -Infinity;
     for (let i = 0; i < profileBioQueue.length; i += 1) {
         const job = profileBioQueue[i];
-        const score = (isArticleInViewport(job?.article) ? 1000 : 0) + (Number(job?.priority) || 0);
+        const score = getArticleViewportWorkPriority(job?.article) * 1000 + (Number(job?.priority) || 0);
         if (score > bestScore) {
             bestScore = score;
             bestIndex = i;
@@ -4084,8 +4198,8 @@ async function processSpamArticle(article) {
             }
         }
     }
-    if (shouldCheckProfileBioForArticle(article, tweetText)) {
-        scheduleProfileBioScanForArticle(article, getArticleAuthorScreenName(article));
+    if (!shouldSkipProfileBioForDetectedArticle(article, textDetection) && shouldCheckProfileBioForArticle(article, tweetText)) {
+        scheduleProfileBioScanForArticle(article, getArticleAuthorScreenName(article), getProfileBioJobPriority(textDetection));
         return;
     }
     const avatarUrl = getAvatarImageUrlFromArticle(article);
@@ -4119,7 +4233,7 @@ function shouldQueueArticleForDetection(article) {
 }
 function selectDetectionScanArticles(pendingArticles, fullArticles, fullScan = false) {
     const source = fullScan ? (fullArticles || []) : (pendingArticles || []);
-    return [...new Set(source)].filter(shouldQueueArticleForDetection);
+    return sortArticlesByViewportWorkPriority([...new Set(source)].filter(shouldQueueArticleForDetection));
 }
 function queueDetectionArticle(article) {
     if (!shouldQueueArticleForDetection(article)) return false;
@@ -4166,6 +4280,17 @@ function scheduleDetectionScan(fullScan = false, delay = DETECTION_SCAN_DELAY_MS
             run();
         }
     }, Math.max(0, delay));
+}
+function scheduleViewportWorkQueueReprioritization() {
+    if (detectionViewportReprioritizeTimeoutId) return;
+    detectionViewportReprioritizeTimeoutId = window.setTimeout(() => {
+        detectionViewportReprioritizeTimeoutId = null;
+        if (!shouldRunArticleDetectionScans()) return;
+        document.querySelectorAll('article[data-testid="tweet"]').forEach((article) => queueDetectionArticle(article));
+        avatarOcrQueue.sort((left, right) => avatarOcrJobScore(right) - avatarOcrJobScore(left));
+        if (pendingDetectionArticles.size) scheduleDetectionScan(false, 0);
+        if (avatarOcrQueue.length && !avatarOcrPumpRunning) void pumpAvatarOcrQueue();
+    }, DETECTION_VIEWPORT_REPRIORITIZE_MS);
 }
 async function runDetectionScanBatch() {
     if (detectionScanRunning) {
@@ -4261,7 +4386,8 @@ function scheduleSpamRescanDebounced() {
 async function scanSpamIdentifyContent(articles = []) {
     if (!shouldRunArticleDetectionScans() || !currentUserId || scriptConfig.spamIdentifyEnabled === false) return;
     if (profileBioQueue.length && !profileBioPumpRunning) void pumpProfileBioQueue();
-    await Promise.allSettled((articles || []).filter((article) => article?.isConnected).map((article) => processSpamArticle(article)));
+    const orderedArticles = sortArticlesByViewportWorkPriority((articles || []).filter((article) => article?.isConnected));
+    await Promise.allSettled(orderedArticles.map((article) => processSpamArticle(article)));
     try {
         const avatarBadges = document.querySelectorAll('article[data-testid="tweet"] .nuke-spam-badge');
         let avatarHits = 0;
@@ -4902,7 +5028,8 @@ function matchesBuiltInDisplayNameSpam(userNameText) {
     const normalized = String(userNameText || '').replace(/\s+/g, '').replace(/[^\u4e00-\u9fffa-z0-9]/gi, '').toLowerCase();
     if (!normalized) return false;
     const explicitAdultSpam = /炮友|固炮|约炮|性伴侣|骚货|反差婊|免费破处/.test(normalized) || /巨乳.{0,10}(?:线下|滴滴)/.test(normalized) || /大奶.{0,20}(?:想被|[操艹])/.test(normalized);
-    return explicitAdultSpam || /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized) || ((/赚钱|挣钱|搞钱|网赚|兼职|副业|快钱|日结/.test(normalized) && /跑分|灰产|偏门|洗钱|返佣|外汇|区块链|币圈/.test(normalized)) || /跑分灰产|灰产副业|网赚兼职|快钱日结/.test(normalized));
+    const networkAccessAd = /(?:科学上网|翻墙|机场).{0,12}(?:app|加速器|节点|订阅|代理|服务|官网|群|频道)/.test(normalized);
+    return explicitAdultSpam || networkAccessAd || /找个(?:搭子|单男)$/.test(normalized) || /附近的(?:dd|来)$/.test(normalized) || (/同城/.test(normalized) && /[上丄]门/.test(normalized) && /附近/.test(normalized)) || /裸聊/.test(normalized) || (/小姨子/.test(normalized) && /找姐夫/.test(normalized)) || /无线下$/.test(normalized) || ((/赚钱|挣钱|搞钱|网赚|兼职|副业|快钱|日结/.test(normalized) && /跑分|灰产|偏门|洗钱|返佣|外汇|区块链|币圈/.test(normalized)) || /跑分灰产|灰产副业|网赚兼职|快钱日结/.test(normalized));
 }
 function getUsernameRuleFollowerExemptThreshold() {
     return scriptConfig.usernameRuleFollowerExemptThreshold ?? DEFAULT_USERNAME_RULE_FOLLOWER_EXEMPT_THRESHOLD;
@@ -5418,17 +5545,38 @@ function startQueueStatusCountdown(nextActionAt) {
     renderQueueStatusCountdown(nextActionAt);
     queueStatusCountdownInterval = setInterval(() => renderQueueStatusCountdown(nextActionAt), 1000);
 }
+function getQueueStatusToastMode(queueLength = 0, hadActiveQueue = false) {
+    if (Math.max(0, Number(queueLength) || 0) > 0) return 'active';
+    return hadActiveQueue ? 'completed' : 'hidden';
+}
 async function updateStatusToast() {
     const userData = await loadUserData();
-    if (!userData || userData.queue.length === 0) {
+    const toast = document.getElementById('nuke-status-toast');
+    const queueStatusMode = getQueueStatusToastMode(userData?.queue?.length, queueStatusWasActive || toast?.dataset.nukeQueueActive === 'true');
+    if (queueStatusMode !== 'active') {
         clearQueueStatusCountdown();
-        let toast = document.getElementById('nuke-status-toast');
-        if (toast) { toast.classList.add('fading-out'); setTimeout(() => toast.remove(), 500); }
+        queueStatusWasActive = false;
+        if (queueStatusMode === 'completed') {
+            showToast('nuke-status-toast', '✅ 全部任务已完成', '队列已清空。', 4500);
+            const completionToast = document.getElementById('nuke-status-toast');
+            if (completionToast) {
+                delete completionToast.dataset.nukeQueueActive;
+                completionToast.dataset.nukeQueueCompletion = 'true';
+            }
+        } else if (toast && toast.dataset.nukeQueueCompletion !== 'true') {
+            dismissToast('nuke-status-toast');
+        }
         return;
     }
     const apiRateLimitState = await getActiveApiRateLimitState();
     const nextActionAt = getNextQueueActionAt(userData, apiRateLimitState);
+    queueStatusWasActive = true;
     showToast('nuke-status-toast', '🚀 九族拉黑队列', trustedToastHtml(`<b>待处理:</b> ${userData.queue.length}<span data-nuke-queue-countdown></span>`));
+    const activeToast = document.getElementById('nuke-status-toast');
+    if (activeToast) {
+        activeToast.dataset.nukeQueueActive = 'true';
+        delete activeToast.dataset.nukeQueueCompletion;
+    }
     startQueueStatusCountdown(nextActionAt);
 }
 function hideElement(element) {
@@ -6175,7 +6323,7 @@ async function scanAndProcessContent(articles = []) {
         return;
     }
     if (!currentUserId) return;
-    const connectedArticles = (articles || []).filter((article) => article?.isConnected);
+    const connectedArticles = sortArticlesByViewportWorkPriority((articles || []).filter((article) => article?.isConnected));
     const userData = await loadUserData();
     if (!userData) return;
     applyPendingHiddenUsersToPage(userData, connectedArticles);
@@ -6388,6 +6536,7 @@ async function initialize() {
             delete document.documentElement.dataset.cbSpamDebugMode;
         }
         scheduleDetectionScan(true, 0);
+        scheduleProfileHoverCardScansFromNode(document.body);
         void requestBackgroundWorkerLeadership();
     } catch (error) {
         if (isApiRateLimitError(error)) {
@@ -6410,6 +6559,7 @@ const observer = new MutationObserver(mutations => {
                         addVerificationButton(menu);
                         addSpamInspectButton(menu);
                     }
+                    scheduleProfileHoverCardScansFromNode(node);
                     if (shouldRunArticleDetectionScans()) queuedArticles += queueDetectionArticlesFromNode(node);
                 }
             });
@@ -6425,7 +6575,11 @@ document.addEventListener('click', e => {
 }, true);
 document.addEventListener('pointerdown', noteAvatarOcrUserActivity, { capture: true, passive: true });
 document.addEventListener('keydown', noteAvatarOcrUserActivity, true);
-window.addEventListener('scroll', noteAvatarOcrUserActivity, { capture: true, passive: true });
+window.addEventListener('scroll', () => {
+    noteAvatarOcrUserActivity();
+    scheduleViewportWorkQueueReprioritization();
+}, { capture: true, passive: true });
+window.addEventListener('resize', scheduleViewportWorkQueueReprioritization, { passive: true });
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         noteAvatarOcrUserActivity();
@@ -6433,6 +6587,7 @@ document.addEventListener('visibilitychange', () => {
     }
     resumeDeferredProfileBioArticles();
     resumeDeferredAvatarOcrArticles();
+    scheduleViewportWorkQueueReprioritization();
     scheduleAvatarOcrPumpResume(100);
 });
 observer.observe(document.body, { childList: true, subtree: true });

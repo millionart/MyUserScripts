@@ -35,6 +35,7 @@ function loadHelpers(names) {
         AVATAR_OCR_ENGINE_OFF: 'off',
         AVATAR_OCR_ENGINE_PADDLE: 'paddle',
         AVATAR_OCR_ENGINE_TESSERACT: 'tesseract',
+        window: { innerHeight: 800 },
         currentUserId: 'self',
         buildChainBlockNote: () => ({ blockReason: 'chain_mixed', blockNote: '' })
     };
@@ -103,6 +104,9 @@ function loadSpamDetector() {
         'isShortLocationInviteCompact',
         'isPetRoleInviteCompact',
         'isAdultEndorsementContextCompact',
+        'isAdultBenefitBaitCompact',
+        'isAdultComparisonBaitCompact',
+        'isAdultMentionBaitCompact',
         'isIncidentClipFunnelCompact',
         'isAdultPlatformClipFunnelCompact',
         'normalizeSpamText',
@@ -124,6 +128,56 @@ function loadSpamDetector() {
     const sandbox = { module: { exports: {} } };
     vm.runInNewContext(code, sandbox);
     return sandbox.module.exports.detectSpamReply;
+}
+
+function loadProfileBioDetector() {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const constLine = (name) => {
+        const start = source.indexOf(`const ${name} = `);
+        if (start < 0) throw new Error(`Missing constant ${name}`);
+        return source.slice(start, source.indexOf('\n', start));
+    };
+    const signalStart = source.indexOf('const PROFILE_BIO_SIGNAL_DEFS = [');
+    const signalEnd = source.indexOf('\n];', signalStart);
+    const code = [
+        constLine('SPAM_ZERO_WIDTH_RE'),
+        constLine('SPAM_CJK_PUNCT_RE'),
+        extractFunction(source, 'normalizeSpamText'),
+        extractFunction(source, 'compactSpamText'),
+        source.slice(signalStart, signalEnd + 3),
+        extractFunction(source, 'detectProfileBioSpam'),
+        'module.exports = { detectProfileBioSpam };'
+    ].join('\n');
+    const sandbox = { module: { exports: {} } };
+    vm.runInNewContext(code, sandbox);
+    return sandbox.module.exports.detectProfileBioSpam;
+}
+
+function loadProfileBioQueuePriorityHelper() {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const sandbox = { module: { exports: {} } };
+    const code = [
+        extractFunction(source, 'shouldSkipProfileBioForDetectedArticle'),
+        extractFunction(source, 'getProfileBioJobPriority'),
+        'module.exports = { shouldSkipProfileBioForDetectedArticle, getProfileBioJobPriority };'
+    ].join('\n');
+    vm.runInNewContext(code, sandbox);
+    return sandbox.module.exports;
+}
+
+function loadProfileHoverCardHelper() {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const sandbox = {
+        module: { exports: {} },
+        window: { location: { origin: 'https://x.com' } }
+    };
+    const code = [
+        extractFunction(source, 'getScreenNameFromProfileHref'),
+        extractFunction(source, 'getProfileHoverCardScreenName'),
+        'module.exports = { getProfileHoverCardScreenName };'
+    ].join('\n');
+    vm.runInNewContext(code, sandbox);
+    return sandbox.module.exports;
 }
 
 function loadManualCaptureHelpers() {
@@ -236,14 +290,16 @@ test('username keyword match is exempt only when visible or cached follower coun
 test('built-in display name rules catch explicit adult funnels without broad persona matching', () => {
     const { getAutoBlockDecision } = loadAutoBlockDecisionHelpers();
 
-    for (const name of ['寻男固炮🚗瑾萱', '骚货学姐🍑', '晶晶宝宝🍑反差婊', '巨乳大柚子🍑线下滴滴', '大奶倩倩🍑想被超过十二厘米的人操']) {
+    for (const name of ['寻男固炮🚗瑾萱', '骚货学姐🍑', '晶晶宝宝🍑反差婊', '巨乳大柚子🍑线下滴滴', '大奶倩倩🍑想被超过十二厘米的人操', '银狐科学上网APP']) {
         const decision = getAutoBlockDecision(name, null);
         assert.equal(decision.block, true, name);
         assert.equal(decision.reason, 'display_name_spam', name);
     }
     assert.equal(getAutoBlockDecision('清纯小学妹', null).block, false);
     assert.equal(getAutoBlockDecision('摄影学姐记录日常', null).block, false);
+    assert.equal(getAutoBlockDecision('科学上网安全研究社', null).block, false);
     assert.equal(getAutoBlockDecision('寻男固炮瑾萱', 1001).reason, 'follower_exempt');
+    assert.equal(getAutoBlockDecision('银狐科学上网APP', 1001).reason, 'follower_exempt');
 });
 
 test('chain list collection is skipped when visible engagement count is zero', () => {
@@ -268,6 +324,8 @@ test('completed articles are not requeued by unrelated page mutations', () => {
 test('incremental detection batches deduplicate and ignore detached articles', () => {
     const { selectDetectionScanArticles } = loadHelpers([
         'shouldQueueArticleForDetection',
+        'getArticleViewportWorkPriority',
+        'sortArticlesByViewportWorkPriority',
         'selectDetectionScanArticles'
     ]);
     const pending = { id: 'pending', isConnected: true, dataset: {} };
@@ -277,6 +335,29 @@ test('incremental detection batches deduplicate and ignore detached articles', (
 
     assert.deepEqual(Array.from(selectDetectionScanArticles([pending, pending, complete, detached], [], false), (item) => item.id), ['pending']);
     assert.deepEqual(Array.from(selectDetectionScanArticles([pending], [complete, extra, pending], true), (item) => item.id), ['extra', 'pending']);
+});
+
+test('detection and avatar work queues prioritize visible, below, then above articles', () => {
+    const { getArticleViewportWorkPriority, sortArticlesByViewportWorkPriority, avatarOcrJobScore } = loadHelpers([
+        'getArticleViewportWorkPriority',
+        'sortArticlesByViewportWorkPriority',
+        'avatarOcrJobScore'
+    ]);
+    const article = (id, top, bottom) => ({
+        id,
+        isConnected: true,
+        getBoundingClientRect: () => ({ top, bottom })
+    });
+    const above = article('above', -300, -80);
+    const visible = article('visible', 120, 420);
+    const below = article('below', 920, 1160);
+
+    assert.equal(getArticleViewportWorkPriority(visible), 3);
+    assert.equal(getArticleViewportWorkPriority(below), 2);
+    assert.equal(getArticleViewportWorkPriority(above), 1);
+    assert.deepEqual(Array.from(sortArticlesByViewportWorkPriority([above, below, visible]), (item) => item.id), ['visible', 'below', 'above']);
+    assert.ok(avatarOcrJobScore({ article: visible, priority: 0 }) > avatarOcrJobScore({ article: below, priority: 99 }));
+    assert.ok(avatarOcrJobScore({ article: below, priority: 0 }) > avatarOcrJobScore({ article: above, priority: 99 }));
 });
 
 test('detection safety scan no longer runs every two seconds', () => {
@@ -386,6 +467,25 @@ test('profile bio lookup waits for its real request instead of leaking it after 
     assert.doesNotMatch(source, /function withProfileBioTimeout/);
 });
 
+test('profile hover cards use their profile link and scan without a new user request', () => {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const { getProfileHoverCardScreenName } = loadProfileHoverCardHelper();
+    const scanSource = extractFunction(source, 'scanProfileHoverCard');
+    const observerSource = source.slice(source.indexOf('const observer = new MutationObserver'), source.indexOf("document.addEventListener('click'"));
+    const card = {
+        querySelectorAll: () => [
+            { getAttribute: () => '/PandoraHoouwzo' },
+            { getAttribute: () => '/PandoraHoouwzo/followers' }
+        ]
+    };
+
+    assert.equal(getProfileHoverCardScreenName(card), 'PandoraHoouwzo');
+    assert.match(scanSource, /detectProfileBioSpam\(cardText\)/);
+    assert.match(scanSource, /ensureSpamBadge\(article, detection, 'bio'\)/);
+    assert.doesNotMatch(scanSource, /getUserDataByScreenName/);
+    assert.match(observerSource, /scheduleProfileHoverCardScansFromNode\(node\)/);
+});
+
 test('automatic profile bio scans defer articles outside the nearby viewport', () => {
     const source = fs.readFileSync(sourcePath, 'utf8');
     const scheduleSource = extractFunction(source, 'scheduleProfileBioScanForArticle');
@@ -393,7 +493,10 @@ test('automatic profile bio scans defer articles outside the nearby viewport', (
 
     assert.match(scheduleSource, /document\.hidden \|\| !isArticleNearOcrViewport\(article\)/);
     assert.match(scheduleSource, /deferProfileBioUntilNearViewport/);
+    assert.match(scheduleSource, /priority = 0/);
     assert.match(processSource, /scheduleProfileBioScanForArticle/);
+    assert.match(processSource, /shouldSkipProfileBioForDetectedArticle\(article, textDetection\)/);
+    assert.match(processSource, /getProfileBioJobPriority\(textDetection\)/);
     assert.doesNotMatch(processSource, /enqueueProfileBioScan\(article/);
 });
 
@@ -1264,6 +1367,20 @@ test('queue countdown uses block pacing api limits and entry retries', () => {
     assert.equal(formatQueueCountdown(now, now), '00:00');
 });
 
+test('an emptied block queue shows a completion message instead of leaving a stale panel line', () => {
+    const { getQueueStatusToastMode } = loadHelpers(['getQueueStatusToastMode']);
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    const updateStatusSource = extractFunction(source, 'updateStatusToast');
+
+    assert.equal(getQueueStatusToastMode(3, false), 'active');
+    assert.equal(getQueueStatusToastMode(0, true), 'completed');
+    assert.equal(getQueueStatusToastMode(0, false), 'hidden');
+    assert.match(updateStatusSource, /全部任务已完成/);
+    assert.match(updateStatusSource, /nukeQueueCompletion/);
+    assert.match(updateStatusSource, /showToast\('nuke-status-toast', '✅ 全部任务已完成'/);
+    assert.doesNotMatch(updateStatusSource, /classList\.add\('fading-out'\); setTimeout\(\(\) => toast\.remove\(\), 500\)/);
+});
+
 test('every real block attempt starts the pacing countdown, including failed requests', () => {
     const { markBlockAttemptStarted } = loadHelpers(['markBlockAttemptStarted']);
     const source = fs.readFileSync(sourcePath, 'utf8');
@@ -1316,6 +1433,66 @@ test('spam detection combines general links and adult endorsement context', () =
     assert.equal(detectSpamReply('女大学生分享社团活动，花样很多，这场比赛很炸裂').match, false);
     assert.equal(detectSpamReply('这个开源项目玩法多，真极品 @developer').match, false);
     assert.equal(detectSpamReply('123').match, false);
+});
+
+test('spam detection catches adult benefit bait templates without matching ordinary welfare discussion', () => {
+    const detectSpamReply = loadSpamDetector();
+    const benefitReview = detectSpamReply('我果然太涩了，有人想锐评一下我的福嘛');
+    const noFakeBenefit = detectSpamReply('应该没人比我玩的开了吧，我福不黑不信你看');
+
+    assert.equal(benefitReview.match, true);
+    assert.ok(Array.from(benefitReview.signals, (signal) => signal.id).includes('adult_benefit_bait'));
+    assert.equal(noFakeBenefit.match, true);
+    assert.ok(Array.from(noFakeBenefit.signals, (signal) => signal.id).includes('adult_benefit_bait'));
+    assert.equal(detectSpamReply('公司福利很好，有人想锐评一下我的福利方案吗').match, false);
+    assert.equal(detectSpamReply('我果然太涩了，今晚不想出门').match, false);
+});
+
+test('spam detection catches the repeated adult comparison bait in reply bodies', () => {
+    const detectSpamReply = loadSpamDetector();
+    const detection = detectSpamReply('比我好看的没我骚 🚗 🐨 比我骚的没我好看');
+
+    assert.equal(detection.match, true);
+    assert.ok(Array.from(detection.signals, (signal) => signal.id).includes('adult_comparison_bait'));
+    assert.equal(detectSpamReply('她比我好看，但没我骚气；比我骚的舞步也没我好看').match, false);
+});
+
+test('spam detection catches the observed explicit sex mention bait without matching ordinary descriptions', () => {
+    const detectSpamReply = loadSpamDetector();
+    const detection = detectSpamReply('dvp下面这么湿，被c得站不起来了 @lalita55452726 👏🥰');
+
+    assert.equal(detection.match, true);
+    assert.ok(Array.from(detection.signals, (signal) => signal.id).includes('adult_mention_bait'));
+    assert.equal(detectSpamReply('刚游完泳，下面这么湿 @lalita55452726').match, false);
+    assert.equal(detectSpamReply('腿被擦伤得站不起来了 @lalita55452726').match, false);
+});
+
+test('detected articles skip profile lookups while unmatched near hits keep priority', () => {
+    const { shouldSkipProfileBioForDetectedArticle, getProfileBioJobPriority } = loadProfileBioQueuePriorityHelper();
+    const noBadgeArticle = { querySelector: () => null };
+    const markedArticle = { querySelector: () => ({}) };
+
+    assert.equal(shouldSkipProfileBioForDetectedArticle(noBadgeArticle, { match: true, score: 3 }), true);
+    assert.equal(shouldSkipProfileBioForDetectedArticle(markedArticle, { match: false, score: 0 }), true);
+    assert.equal(shouldSkipProfileBioForDetectedArticle(noBadgeArticle, { match: false, score: 2 }), false);
+    assert.equal(getProfileBioJobPriority(null), 0);
+    assert.equal(getProfileBioJobPriority({ match: false, score: 1 }), 20);
+    assert.equal(getProfileBioJobPriority({ match: false, score: 2 }), 40);
+    assert.equal(getProfileBioJobPriority({ match: true, score: 3 }), 60);
+});
+
+test('profile bios identify the observed adult-platform funnel template', () => {
+    const detectProfileBioSpam = loadProfileBioDetector();
+    const baitBio = '已入住约p平台 👉 d7n5.top 每晚准时涩播，只在平台上🈷️，本人全部涩涩的视频照片全部在里面，寻固炮必备！！（线上可远程指挥直播控制玩具 同城线下可加绿泡泡）';
+    const detection = detectProfileBioSpam(baitBio);
+
+    assert.equal(detection.match, true);
+    assert.ok(detection.score >= 3);
+    assert.deepEqual(
+        Array.from(detection.signals, (signal) => signal.id),
+        ['bio_adult_service', 'bio_trust_pitch', 'bio_contact_route']
+    );
+    assert.equal(detectProfileBioSpam('公司已入住共享办公平台，产品视频详见example.top').match, false);
 });
 
 test('sparse high-retweet bait requires both unreadable content and visible engagement', () => {

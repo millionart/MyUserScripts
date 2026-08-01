@@ -96,6 +96,14 @@ These notes define the mandatory workflow for testing Violentmonkey userscripts 
 - If the required site-specific verification path is unavailable, the agent MUST report that the auto-reload observation gate completed but target-page verification did not complete.
 - The agent MUST NOT use the words `ready`, `done`, `fixed`, `verified`, or equivalent completion claims unless static verification, the auto-reload observation gate, and the required target-page verification path all passed.
 
+### User-Reported Detection Misses
+
+- When a user reports an X detection miss, the agent MUST identify every applicable detection surface for the reported account or template: reply/body text, display name, profile bio, links, and avatar/OCR when applicable.
+- Unless the user explicitly requests a runtime performance exception, a hit from one surface MUST NOT be treated as evidence that the other applicable surfaces are covered. In particular, a profile-bio badge does not satisfy a request to cover the reply body or display name, and vice versa.
+- The agent MUST add or update regression tests with explicit assertions for every applicable requested surface, and target-page verification MUST separately report the result of each surface after asynchronous scanners have settled.
+- When a slow asynchronous scanner is involved, the agent MUST distinguish a queued/pending scan from a genuine rule miss, but MUST still close every requested detection surface before concluding the report.
+- If the user explicitly requests that an already detected article skip a redundant profile lookup, the runtime MUST skip only that profile API work while retaining independent detector coverage in regression tests and reporting the performance exception.
+
 ### Cleanup
 
 - The agent MUST remove temporary screenshots and crops after testing.
