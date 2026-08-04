@@ -32,6 +32,7 @@ function loadHelpers(names) {
         BLOCK_RETRY_BASE_MS: 30000,
         BLOCK_RETRY_MAX_MS: 300000,
         BLOCK_RETRY_MAX_ATTEMPTS: 4,
+        PENDING_HIDDEN_USERS_LIMIT: 2000,
         HIDDEN_RELEASE_QUEUE_LIMIT: 2000,
         NUKE_CAPTURE_LOG_LIMIT: 300,
         MANUAL_DETECTED_NUKE_TASK_LIMIT: 20,
@@ -193,9 +194,14 @@ function loadManualCaptureHelpers() {
         buildManualDetectedNukeTrigger: (article) => ({ triggerId: article.id }),
         getArticleEngagementCounts: () => ({ replies: 0, retweets: 0, likes: 0 }),
         getChainExemptHandlesForTarget: () => [],
+        createPendingHiddenUserEntry: (entry, context) => ({ ...entry, context }),
+        addManualDetectedHiddenUsers: (userData, entries) => {
+            sandbox.calls.push(`manual-hide:${entries.map((entry) => entry.screenName).join(',')}`);
+            userData.manualDetectedHiddenUsers = [...(userData.manualDetectedHiddenUsers || []), ...entries];
+        },
         captureNukeTargetForImmediateHide: (article, trigger, userData, options) => {
             sandbox.calls.push(`capture:${article.id}:${trigger.triggerId}:${options?.deferPageHide ? 'deferred' : 'immediate'}`);
-            return { authorHandle: article.id, trigger };
+            return { authorHandle: article.id, authorUserNameText: article.id, tweetContext: { tweetId: article.id }, trigger, isProtectedRoot: false };
         }
     };
     const code = [
@@ -220,6 +226,64 @@ test('pending hidden users are deduplicated and refreshed by id or handle', () =
     assert.equal(merged[0].addedAt, 10);
     assert.equal(merged[0].lastSeenAt, 99);
     assert.equal(merged[0].sourceTweetId, 'tweet-2');
+});
+
+test('manual detected hide ledger stays separate from queue release cleanup', () => {
+    const { getPendingHiddenHandleSet, queueHiddenUserRelease, applyHiddenUserReleaseQueue } = loadHelpers([
+        'getHiddenUserStorageKey',
+        'getHiddenUserStorageKeys',
+        'mergePendingHiddenUserEntries',
+        'queueHiddenUserRelease',
+        'getHiddenUserExclusionKeys',
+        'pruneReleasedPendingHiddenUsers',
+        'applyHiddenUserReleaseQueue',
+        'getPendingHiddenHandleSet'
+    ]);
+    const userData = {
+        pendingHiddenUsers: [{ screenName: 'queue_target' }],
+        manualDetectedHiddenUsers: [{ screenName: 'manual_target' }],
+        hiddenReleaseQueue: [],
+        releasedHiddenUsers: [],
+        blockedLog: []
+    };
+
+    queueHiddenUserRelease(userData, { screenName: 'queue_target' }, 100);
+    applyHiddenUserReleaseQueue(userData);
+
+    assert.deepEqual(Array.from(userData.pendingHiddenUsers), []);
+    assert.deepEqual(Array.from(getPendingHiddenHandleSet(userData)), ['manual_target']);
+});
+
+test('active manual tasks backfill durable hides after an older page refresh', () => {
+    const { backfillManualDetectedHiddenUsersFromTasks, getPendingHiddenHandleSet } = loadHelpers([
+        'getHiddenUserStorageKey',
+        'mergePendingHiddenUserEntries',
+        'addManualDetectedHiddenUsers',
+        'createPendingHiddenUserEntry',
+        'backfillManualDetectedHiddenUsersFromTasks',
+        'getPendingHiddenHandleSet'
+    ]);
+    const userData = {
+        manualDetectedHiddenUsers: [],
+        manualDetectedNukeTasks: [
+            {
+                taskId: 'active-task',
+                status: 'running',
+                captures: [
+                    { authorHandle: 'visible_hit', authorUserNameText: 'Visible', tweetContext: { tweetId: 'tweet-1', authorHandle: 'visible_hit' } },
+                    { authorHandle: 'protected_root', isProtectedRoot: true, tweetContext: { tweetId: 'root-1' } }
+                ]
+            },
+            {
+                taskId: 'completed-task',
+                status: 'complete',
+                captures: [{ authorHandle: 'old_hit', tweetContext: { tweetId: 'tweet-2' } }]
+            }
+        ]
+    };
+
+    assert.equal(backfillManualDetectedHiddenUsersFromTasks(userData), 1);
+    assert.deepEqual(Array.from(getPendingHiddenHandleSet(userData)), ['visible_hit']);
 });
 
 test('hidden release queue removes truly blocked users from pending hidden users', () => {
@@ -297,6 +361,7 @@ test('cross-tab saves preserve immediate hides and do not resurrect completed qu
         queue: [{ userId: 'still-queued', screenName: 'still_queued', queuedAt: 10 }],
         blockedLog: [{ userId: 'already-blocked', screenName: 'already_blocked', blockTimestamp: 200 }],
         pendingHiddenUsers: [],
+        manualDetectedHiddenUsers: [{ screenName: 'manual_already_hidden', addedAt: 250 }],
         releasedHiddenUsers: [],
         hiddenReleaseQueue: [],
         whitelist: [],
@@ -312,6 +377,7 @@ test('cross-tab saves preserve immediate hides and do not resurrect completed qu
         ],
         blockedLog: [],
         pendingHiddenUsers: [{ screenName: 'newly_detected', addedAt: 300 }],
+        manualDetectedHiddenUsers: [{ screenName: 'manual_newly_hidden', addedAt: 300 }],
         releasedHiddenUsers: [],
         hiddenReleaseQueue: [],
         whitelist: [],
@@ -324,6 +390,7 @@ test('cross-tab saves preserve immediate hides and do not resurrect completed qu
     const merged = mergeUserDataForSave(storedByWorker, staleManualPage, 400);
 
     assert.deepEqual(Array.from(merged.pendingHiddenUsers, (entry) => entry.screenName), ['newly_detected']);
+    assert.deepEqual(Array.from(merged.manualDetectedHiddenUsers, (entry) => entry.screenName).sort(), ['manual_already_hidden', 'manual_newly_hidden']);
     assert.deepEqual(Array.from(merged.queue, (entry) => entry.userId), ['still-queued']);
     assert.equal(merged.lastBlockTimestamp, 200);
 });
@@ -766,8 +833,9 @@ test('manual detected nuke captures every detected target before background reso
 
     const jobs = captureManualDetectedNukeTargets(articles, userData, { deferPageHide: true });
 
-    assert.deepEqual(calls, ['capture:first:first:deferred', 'capture:second:second:deferred']);
+    assert.deepEqual(calls, ['capture:first:first:deferred', 'manual-hide:first', 'capture:second:second:deferred', 'manual-hide:second']);
     assert.deepEqual(Array.from(jobs, (job) => job.article.id), ['first', 'second']);
+    assert.deepEqual(Array.from(userData.manualDetectedHiddenUsers, (entry) => entry.screenName), ['first', 'second']);
     assert.equal(articles[0].dataset.autoblockTriggered, 'true');
     assert.equal(articles[1].dataset.autoblockTriggered, 'true');
     assert.equal(articles[2].dataset.autoblockTriggered, undefined);

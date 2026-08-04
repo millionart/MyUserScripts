@@ -2,7 +2,7 @@
 // @name         X.com Chain Blocker
 // @name:zh-CN   X.com 九族拉黑
 // @namespace    http://tampermonkey.net/
-// @version      2.15.96
+// @version      2.15.97
 // @description  Block author, retweeters, repliers, and auto-block users based on rules (length, content, keywords, follower count). Manage block log, whitelist, and settings in a panel.
 // @description:zh-CN 当拉黑作者时，自动拉黑所有转推者和回复者。支持根据用户名关键词、粉丝数豁免、引流识别等规则自动拉黑，并提供黑/白名单管理面板。
 // @author       codex
@@ -108,7 +108,7 @@ let avatarOcrWorkerPromise = null;
 let paddleUserscriptInitPromise = null;
 let paddleUserscriptHandle = null;
 let avatarOcrInitSerial = Promise.resolve();
-const SPAM_SCANNER_BUILD = '2.15.96';
+const SPAM_SCANNER_BUILD = '2.15.97';
 const PROFILE_HOVER_CARD_SELECTOR = '[data-testid="HoverCard"], [data-testid="hoverCard"], [data-testid="UserHoverCard"]';
 const AUTO_BLOCK_NUKE_MODE_VERSION = 1;
 const TESSERACT_CHI_SIM_LANG_GZ = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim@1.0.0/4.0.0_best_int/chi_sim.traineddata.gz';
@@ -2846,6 +2846,14 @@ function captureManualDetectedNukeTargets(articles, userData, options = {}) {
         article.dataset.autoblockChecked = 'complete';
         const trigger = buildManualDetectedNukeTrigger(article);
         const capture = captureNukeTargetForImmediateHide(article, trigger, userData, options);
+        if (!capture.isProtectedRoot) {
+            addManualDetectedHiddenUsers(userData, [createPendingHiddenUserEntry({
+                screenName: capture.authorHandle,
+                userNameText: capture.authorUserNameText,
+                blockReason: 'manual_detected',
+                blockNote: `手动批量拉黑·@${capture.authorHandle}`
+            }, capture.tweetContext)]);
+        }
         capturedTargets.push({
             article,
             trigger,
@@ -5514,6 +5522,7 @@ function mergeUserDataForSave(storedData = {}, localData = {}, now = Date.now())
             .filter((task) => !completedTaskIdSet.has(String(task?.taskId || '')) && task?.status !== 'complete'),
         completedManualDetectedNukeTaskIds,
         pendingHiddenUsers: mergePendingHiddenUserEntries(stored.pendingHiddenUsers, local.pendingHiddenUsers, now),
+        manualDetectedHiddenUsers: mergePendingHiddenUserEntries(stored.manualDetectedHiddenUsers, local.manualDetectedHiddenUsers, now).slice(0, PENDING_HIDDEN_USERS_LIMIT),
         releasedHiddenUsers: mergePendingHiddenUserEntries(stored.releasedHiddenUsers, local.releasedHiddenUsers, now).slice(0, HIDDEN_RELEASE_QUEUE_LIMIT),
         hiddenReleaseQueue: mergePendingHiddenUserEntries(stored.hiddenReleaseQueue, local.hiddenReleaseQueue, now).slice(0, HIDDEN_RELEASE_QUEUE_LIMIT),
         lastBlockTimestamp: Math.max(Number(stored.lastBlockTimestamp) || 0, Number(local.lastBlockTimestamp) || 0)
@@ -5537,6 +5546,7 @@ async function loadUserData() {
     if (!Array.isArray(userData.whitelist)) userData.whitelist = [];
     if (!Array.isArray(userData.promoTargets)) userData.promoTargets = [];
     if (!Array.isArray(userData.pendingHiddenUsers)) userData.pendingHiddenUsers = [];
+    if (!Array.isArray(userData.manualDetectedHiddenUsers)) userData.manualDetectedHiddenUsers = [];
     if (!Array.isArray(userData.hiddenReleaseQueue)) userData.hiddenReleaseQueue = [];
     if (!Array.isArray(userData.releasedHiddenUsers)) userData.releasedHiddenUsers = [];
     if (!Array.isArray(userData.nukeCaptures)) userData.nukeCaptures = [];
@@ -5548,10 +5558,11 @@ async function loadUserData() {
     const normalizedManualTasks = normalizeManualDetectedNukeTasks(userData);
     const discardedTerminalFailures = discardTerminalManualDetectedNukeFailures(userData);
     const backfilledRootProtection = backfillQueueRootAuthorProtection(userData);
+    const backfilledManualDetectedHiddenUsers = backfillManualDetectedHiddenUsersFromTasks(userData);
     if (userData.spamIdentifyLog) {
         delete userData.spamIdentifyLog;
         await saveUserData(userData);
-    } else if (releasedHiddenUsers > 0 || prunedReleasedHiddenUsers > 0 || normalizedManualTasks > 0 || discardedTerminalFailures > 0 || backfilledRootProtection > 0) {
+    } else if (releasedHiddenUsers > 0 || prunedReleasedHiddenUsers > 0 || normalizedManualTasks > 0 || discardedTerminalFailures > 0 || backfilledRootProtection > 0 || backfilledManualDetectedHiddenUsers > 0) {
         await saveUserData(userData);
     }
     return userData;
@@ -6135,7 +6146,10 @@ function getArticleAuthorHandle(article) {
     return normalizePromoHandle(getScreenNameFromProfileHref(userLink?.href) || userLink?.href?.split('/')?.pop()?.split('?')?.[0] || '');
 }
 function getPendingHiddenHandleSet(userData) {
-    return new Set((userData?.pendingHiddenUsers || []).map((entry) => normalizePromoHandle(entry.screenName)).filter(Boolean));
+    return new Set([
+        ...(userData?.pendingHiddenUsers || []),
+        ...(userData?.manualDetectedHiddenUsers || [])
+    ].map((entry) => normalizePromoHandle(entry.screenName)).filter(Boolean));
 }
 function hideArticlesByHandles(handles, articles = null) {
     if (!handles?.size) return 0;
@@ -6163,6 +6177,32 @@ function addPendingHiddenUsers(userData, entries) {
     const before = new Set((userData.pendingHiddenUsers || []).map(getHiddenUserStorageKey).filter(Boolean));
     userData.pendingHiddenUsers = mergePendingHiddenUserEntries(userData.pendingHiddenUsers, entries);
     return userData.pendingHiddenUsers.filter((entry) => !before.has(getHiddenUserStorageKey(entry)));
+}
+function addManualDetectedHiddenUsers(userData, entries) {
+    if (!userData || !entries?.length) return [];
+    const before = new Set((userData.manualDetectedHiddenUsers || []).map(getHiddenUserStorageKey).filter(Boolean));
+    userData.manualDetectedHiddenUsers = mergePendingHiddenUserEntries(userData.manualDetectedHiddenUsers, entries);
+    return userData.manualDetectedHiddenUsers.filter((entry) => !before.has(getHiddenUserStorageKey(entry)));
+}
+function backfillManualDetectedHiddenUsersFromTasks(userData) {
+    if (!userData) return 0;
+    const captures = (userData.manualDetectedNukeTasks || [])
+        .filter((task) => task && !['complete', 'failed'].includes(task.status))
+        .flatMap((task) => (task.captures || []).map((capture) => ({ task, capture })));
+    const entries = captures
+        .filter(({ capture }) => capture && !capture.isProtectedRoot && normalizePromoHandle(capture.authorHandle || capture.tweetContext?.authorHandle))
+        .map(({ task, capture }) => {
+            const context = capture.tweetContext || {};
+            return createPendingHiddenUserEntry({
+                userId: capture.authorId || null,
+                screenName: capture.authorHandle || context.authorHandle,
+                userNameText: capture.authorUserNameText || capture.authorHandle || context.authorHandle || '',
+                nukeTaskIds: mergeNukeTaskIds(capture.nukeTaskIds, task.taskId),
+                blockReason: 'manual_detected',
+                blockNote: `手动批量拉黑·@${capture.authorHandle || context.authorHandle || ''}`
+            }, context);
+        });
+    return addManualDetectedHiddenUsers(userData, entries).length;
 }
 function recordNukeCapture(userData, capture) {
     if (!userData) return null;
